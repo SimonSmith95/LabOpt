@@ -220,7 +220,22 @@ def build_study(
             violations.append(max(0.0, v))
         return violations
 
-    if ineq_constraints:
+    # GP is handled first because GPSampler does not accept constraints_func.
+    # It is therefore always built without constraint awareness regardless of
+    # whether inequality constraints are present in the config.
+    if config.sampler_name == "GP":
+        try:
+            from optuna.samplers import GPSampler  # requires optuna >= 3.6
+            sampler: optuna.samplers.BaseSampler = GPSampler(seed=42)
+        except (ImportError, AttributeError):
+            import warnings as _warnings
+            _warnings.warn(
+                "GPSampler is not available in this Optuna version "
+                "(requires >= 3.6). Falling back to TPE.",
+                stacklevel=2,
+            )
+            sampler = optuna.samplers.TPESampler(seed=42, multivariate=True)
+    elif ineq_constraints:
         sampler_map: Dict[str, optuna.samplers.BaseSampler] = {
             "TPE":    optuna.samplers.TPESampler(
                           seed=42, multivariate=True,
@@ -229,13 +244,14 @@ def build_study(
                           seed=42, constraints_func=_constraints_fn),
             "Random": optuna.samplers.RandomSampler(seed=42),
         }
+        sampler = sampler_map.get(config.sampler_name, optuna.samplers.TPESampler(seed=42))
     else:
         sampler_map = {
             "TPE":    optuna.samplers.TPESampler(seed=42, multivariate=True),
             "NSGAII": optuna.samplers.NSGAIISampler(seed=42),
             "Random": optuna.samplers.RandomSampler(seed=42),
         }
-    sampler = sampler_map.get(config.sampler_name, optuna.samplers.TPESampler(seed=42))
+        sampler = sampler_map.get(config.sampler_name, optuna.samplers.TPESampler(seed=42))
 
     if len(config.objectives) == 1:
         study = optuna.create_study(
@@ -473,6 +489,10 @@ def load_historical_trials(
         trial_number = len(study.trials)
 
         # Optuna 4.x FrozenTrial requires trial_id; pass -1 so storage assigns one.
+        # Carry forward any user_attrs supplied in the trial dict (e.g. n_replicates).
+        user_attrs = {
+            str(k): v for k, v in data.get("user_attrs", {}).items()
+        }
         if len(values) == 1:
             frozen = FrozenTrial(
                 number=trial_number,
@@ -484,7 +504,7 @@ def load_historical_trials(
                 datetime_complete=datetime.now(),
                 params=trial_params,
                 distributions=trial_dists,
-                user_attrs={},
+                user_attrs=user_attrs,
                 system_attrs={},
                 intermediate_values={},
             )
@@ -499,7 +519,7 @@ def load_historical_trials(
                 datetime_complete=datetime.now(),
                 params=trial_params,
                 distributions=trial_dists,
-                user_attrs={},
+                user_attrs=user_attrs,
                 system_attrs={},
                 intermediate_values={},
             )
@@ -717,7 +737,9 @@ def get_pareto_front(study: optuna.Study) -> List[FrozenTrial]:
     """Return the best trial(s): Pareto front for multi-obj, best_trial for single-obj."""
     try:
         if hasattr(study, "directions") and len(study.directions) > 1:
-            return optuna.study.get_pareto_front_trials(study)
+            # study.best_trials is the standard Optuna 3.x+ API for the Pareto front.
+            # optuna.study.get_pareto_front_trials() was removed in newer versions.
+            return study.best_trials
         else:
             return [study.best_trial]
     except Exception:

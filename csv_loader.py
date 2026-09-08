@@ -13,15 +13,27 @@ from parameter_config import AllowedSubRange, ObjectiveConfig, ParameterConfig, 
 
 
 def load_csv(path: str) -> pd.DataFrame:
-    """Read a CSV file and return a cleaned DataFrame.
+    """Read a CSV or Excel data file and return a cleaned DataFrame.
 
-    Supports both ',' and ';' delimiters (auto-detected via csv.Sniffer).
-    Handles UTF-8 BOM produced by Excel / Windows tools.
+    Supported formats
+    -----------------
+    * ``.csv`` — both ``','`` and ``';'`` delimiters (auto-detected).
+      Handles UTF-8 BOM produced by Excel / Windows tools.
+    * ``.xlsx`` / ``.xls`` — read with ``openpyxl`` (Excel workbook,
+      first sheet).
+
+    The function intentionally uses the name ``load_csv`` for backward
+    compatibility; callers pass any supported path and receive a DataFrame.
     """
+    import os as _os
+    ext = _os.path.splitext(path)[1].lower()
     try:
-        df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+        if ext in (".xlsx", ".xls"):
+            df = pd.read_excel(path, engine="openpyxl")
+        else:
+            df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
     except Exception as exc:
-        raise ValueError(f"Cannot read CSV file '{path}': {exc}") from exc
+        raise ValueError(f"Cannot read file '{path}': {exc}") from exc
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
@@ -173,6 +185,106 @@ def load_trials_from_csv(df: pd.DataFrame, config: StudyConfig) -> List[dict]:
         results.append({"params": params, "values": values})
 
     return results
+
+
+def aggregate_replicates(
+    df: pd.DataFrame,
+    param_cols: List[str],
+    obj_cols: List[str],
+    tolerance: float = 1e-6,
+) -> pd.DataFrame:
+    """
+    Group rows where all *param_cols* values agree within *tolerance*.
+
+    Grouping rules
+    --------------
+    - **Numeric** parameter columns: rounded to the nearest ``tolerance`` grid
+      before grouping.  Two values ``a`` and ``b`` are considered identical when
+      ``round(a / tolerance) == round(b / tolerance)``.
+    - **Categorical / string** columns: must match exactly (tolerance has no
+      effect on them).
+    - **Objective** columns: mean of all rows in the group.
+    - An ``n_replicates`` column is added with the raw row count per group.
+
+    Special cases
+    -------------
+    ``tolerance <= 0``
+        Returns the original DataFrame unchanged except for adding an
+        ``n_replicates = 1`` column (no aggregation performed).
+    Empty DataFrame
+        Returns an empty copy with an integer ``n_replicates`` column.
+
+    Parameters
+    ----------
+    df         : Input DataFrame.
+    param_cols : Parameter column names used for grouping.
+    obj_cols   : Objective column names whose values are averaged within groups.
+    tolerance  : Absolute ± threshold for numeric parameters.
+                 Set to 0 to disable aggregation entirely.
+
+    Returns
+    -------
+    Aggregated DataFrame with the same columns as *df* plus ``n_replicates``.
+    """
+    if df.empty:
+        result = df.copy()
+        if "n_replicates" not in result.columns:
+            result["n_replicates"] = pd.Series(dtype=int)
+        return result
+
+    if tolerance <= 0:
+        # Aggregation disabled — return unchanged with n_replicates=1
+        result = df.copy()
+        result["n_replicates"] = 1
+        return result
+
+    # Separate numeric vs. categorical parameter columns
+    numeric_params = [
+        c for c in param_cols
+        if c in df.columns and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    cat_params = [c for c in param_cols if c in df.columns and c not in numeric_params]
+
+    # Work on a copy, rounding numeric params to the tolerance grid
+    work = df.copy()
+    for col in numeric_params:
+        work[col] = (work[col] / tolerance).round() * tolerance
+
+    # Only group by columns that actually exist in the DataFrame
+    group_cols = [c for c in param_cols if c in work.columns]
+    if not group_cols:
+        result = df.copy()
+        result["n_replicates"] = 1
+        return result
+
+    valid_obj_cols = [c for c in obj_cols if c in work.columns]
+
+    # Group and aggregate: mean for objectives, first for non-grouped remaining cols
+    grouped = work.groupby(group_cols, dropna=False, sort=False)
+
+    # Build per-column aggregation: mean for objectives, first for anything else
+    other_cols = [
+        c for c in work.columns
+        if c not in group_cols and c not in valid_obj_cols
+    ]
+    agg_spec = {c: "mean" for c in valid_obj_cols}
+    agg_spec.update({c: "first" for c in other_cols})
+
+    if agg_spec:
+        result = grouped.agg(agg_spec).reset_index()
+    else:
+        result = grouped.size().reset_index(name="_tmp_size_").drop(columns="_tmp_size_")
+
+    # Restore original (un-rounded) numeric param values from the source df
+    # by joining back on the rounded key — keeps the representative value clean.
+    # Simpler approach: just keep the rounded values (they're within ±tolerance/2 anyway).
+
+    # Attach replicate counts
+    counts = grouped.size().reset_index(name="n_replicates")
+    result = result.merge(counts, on=group_cols, how="left")
+    result["n_replicates"] = result["n_replicates"].astype(int)
+
+    return result
 
 
 def append_rows_to_csv(path: str, rows: List[dict]) -> None:

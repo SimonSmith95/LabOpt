@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDockWidget,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -43,8 +45,10 @@ from PySide6.QtWidgets import (
 )
 
 from batch_results_dialog import BatchResultsDialog
-from design_space_widget import DesignSpaceDialog
-from csv_loader import extract_param_defaults, load_csv, load_trials_from_csv
+from design_space_widget import ConvergenceWidget, DesignSpaceDialog, ParetoWidget
+from csv_loader import aggregate_replicates, extract_param_defaults, load_csv, load_trials_from_csv
+from report_generator import export_plots_as_png, generate_report, write_report
+from surrogate_quality import MIN_TRIALS, compute_surrogate_quality, predict_batch
 from optuna_builder import (
     build_study,
     get_pareto_front,
@@ -530,7 +534,17 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("BHOP — Lab Optimizer")
-        self.resize(1280, 820)
+        # Cap initial size to the available screen geometry so the window never
+        # opens larger than the display (common on 768-height laptops).
+        _screen = QApplication.primaryScreen()
+        if _screen is not None:
+            _avail = _screen.availableGeometry()
+            self.resize(
+                min(1280, _avail.width()  - 40),
+                min(820,  _avail.height() - 60),
+            )
+        else:
+            self.resize(1280, 820)
 
         # ── Application state ──────────────────────────────────────────────
         self._study: Optional[optuna.Study] = None
@@ -548,6 +562,9 @@ class MainWindow(QMainWindow):
         self._obj_col_rows: List[tuple] = []  # (col, QCheckBox, QComboBox)
         # User-defined parameter constraints (equality / inequality rules)
         self._constraints: List[ParameterConstraint] = []
+        # Replicate aggregation UI widgets (rebuilt when a CSV is loaded)
+        self._repl_cb: Optional[QCheckBox] = None
+        self._repl_tol_le: Optional[QLineEdit] = None
 
         self._build_menu()
         self._build_toolbar()
@@ -697,9 +714,21 @@ class MainWindow(QMainWindow):
 
         # ══════════════════════════════════════════════════════════════
         # Tab 1 — ⚙ Settings
+        # Outer widget: scroll area (top, flex) + buttons (bottom, fixed)
+        # This prevents the Ask button from being pushed off-screen when
+        # a CSV with many columns causes the objectives group to expand.
         # ══════════════════════════════════════════════════════════════
         settings_widget = QWidget()
-        vbox = QVBoxLayout(settings_widget)
+        settings_outer = QVBoxLayout(settings_widget)
+        settings_outer.setContentsMargins(0, 0, 0, 0)
+        settings_outer.setSpacing(0)
+
+        # ── Scrollable content area ────────────────────────────────────
+        _settings_scroll = QScrollArea()
+        _settings_scroll.setWidgetResizable(True)
+        _settings_scroll.setStyleSheet("QScrollArea { border: none; }")
+        _scroll_content = QWidget()
+        vbox = QVBoxLayout(_scroll_content)
         vbox.setSpacing(8)
         vbox.setContentsMargins(6, 6, 6, 6)
 
@@ -715,11 +744,14 @@ class MainWindow(QMainWindow):
         sampler_group = QGroupBox("Sampler")
         sf = QFormLayout(sampler_group)
         self._sampler_combo = QComboBox()
-        self._sampler_combo.addItems(["TPE", "NSGAII", "Random"])
+        self._sampler_combo.addItems(["TPE", "NSGAII", "Random", "GP"])
         self._sampler_combo.setToolTip(
             "TPE: good for single-objective, ≤8 parameters.\n"
             "NSGAII: recommended for multi-objective.\n"
-            "Random: baseline / exploration only."
+            "Random: baseline / exploration only.\n"
+            "GP (Gaussian Process): uncertainty-aware; best for smooth continuous\n"
+            "  spaces with < 200 trials. Tells you where the model does not know.\n"
+            "  May be slow for large datasets — switch to TPE above ~200 trials."
         )
         self._sampler_combo.currentIndexChanged.connect(self._update_warnings)
         sf.addRow("Sampler:", self._sampler_combo)
@@ -745,6 +777,60 @@ class MainWindow(QMainWindow):
 
         self._batches_done_label = QLabel("0 / 10")
         bf.addRow("Batches done:", self._batches_done_label)
+
+        # ── Auto-stop (Feature 12) ─────────────────────────────────────
+        self._auto_stop_cb = QCheckBox("Auto-stop when converged")
+        self._auto_stop_cb.setToolTip(
+            "When enabled, BHOP stops asking new batches as soon as the best\n"
+            "objective value has not improved by more than the threshold over\n"
+            "the last N consecutive batches.\n\n"
+            "Recommended: set n_batches to a large number (e.g. 50) and rely\n"
+            "on auto-stop to halt when the study has converged."
+        )
+        bf.addRow("", self._auto_stop_cb)
+
+        # Threshold row (greyed-out when checkbox is off)
+        _as_row = QWidget()
+        _as_hl  = QHBoxLayout(_as_row)
+        _as_hl.setContentsMargins(0, 0, 0, 0)
+        _as_hl.setSpacing(4)
+        _as_hl.addWidget(QLabel("Min improvement:"))
+        self._as_improve_spin = QDoubleSpinBox()
+        self._as_improve_spin.setRange(0.01, 100.0)
+        self._as_improve_spin.setDecimals(2)
+        self._as_improve_spin.setSingleStep(0.5)
+        self._as_improve_spin.setValue(1.0)
+        self._as_improve_spin.setSuffix(" %")
+        self._as_improve_spin.setToolTip(
+            "Minimum relative improvement required per batch to continue.\n"
+            "E.g. 1.0% means: stop if the best value changes by less than 1%\n"
+            "across all batches in the window."
+        )
+        self._as_improve_spin.setEnabled(False)
+        self._as_improve_spin.setFixedWidth(80)
+        _as_hl.addWidget(self._as_improve_spin)
+        _as_hl.addWidget(QLabel("  over"))
+        self._as_nbatches_spin = QSpinBox()
+        self._as_nbatches_spin.setRange(1, 50)
+        self._as_nbatches_spin.setValue(3)
+        self._as_nbatches_spin.setToolTip(
+            "Number of consecutive batches with no improvement before stopping."
+        )
+        self._as_nbatches_spin.setEnabled(False)
+        self._as_nbatches_spin.setFixedWidth(52)
+        _as_hl.addWidget(self._as_nbatches_spin)
+        _as_hl.addWidget(QLabel("batches"))
+        _as_hl.addStretch()
+        bf.addRow("", _as_row)
+
+        # Enable/disable sub-controls when checkbox is toggled
+        self._auto_stop_cb.toggled.connect(
+            lambda checked: (
+                self._as_improve_spin.setEnabled(checked),
+                self._as_nbatches_spin.setEnabled(checked),
+            )
+        )
+
         vbox.addWidget(batch_group)
 
         # ── Warning label ──────────────────────────────────────────────
@@ -753,7 +839,16 @@ class MainWindow(QMainWindow):
         self._warning_label.hide()
         vbox.addWidget(self._warning_label)
 
-        # ── Action buttons ─────────────────────────────────────────────
+        vbox.addStretch()
+        _settings_scroll.setWidget(_scroll_content)
+        settings_outer.addWidget(_settings_scroll, stretch=1)
+
+        # ── Action buttons — always visible below the scroll area ──────
+        _btn_container = QWidget()
+        _btn_vbox = QVBoxLayout(_btn_container)
+        _btn_vbox.setContentsMargins(6, 4, 6, 6)
+        _btn_vbox.setSpacing(4)
+
         self._ask_btn = QPushButton("Ask Next Batch")
         self._ask_btn.setEnabled(False)
         bold_big = QFont()
@@ -763,15 +858,15 @@ class MainWindow(QMainWindow):
         self._ask_btn.setMinimumHeight(42)
         self._ask_btn.setToolTip("Suggest the next batch of parameters from Optuna.")
         self._ask_btn.clicked.connect(self._action_ask_next_batch)
-        vbox.addWidget(self._ask_btn)
+        _btn_vbox.addWidget(self._ask_btn)
 
         self._pause_btn = QPushButton("Pause")
         self._pause_btn.setEnabled(False)
         self._pause_btn.setCheckable(True)
         self._pause_btn.clicked.connect(self._action_toggle_pause)
-        vbox.addWidget(self._pause_btn)
+        _btn_vbox.addWidget(self._pause_btn)
 
-        vbox.addStretch()
+        settings_outer.addWidget(_btn_container)
         self._left_tabs.addTab(settings_widget, "⚙  Settings")
 
         # ══════════════════════════════════════════════════════════════
@@ -796,7 +891,44 @@ class MainWindow(QMainWindow):
         export_btn.setToolTip("Export all completed trial results to a CSV file.")
         export_btn.clicked.connect(self._action_export_results)
         rbtn_row.addWidget(export_btn)
+        export_xlsx_btn = QPushButton("Export Excel")
+        export_xlsx_btn.setToolTip(
+            "Export all completed trial results to an Excel (.xlsx) file.\n"
+            "Numbers are stored as numbers — no formatting issues.\n"
+            "Requires openpyxl (included in requirements.txt)."
+        )
+        export_xlsx_btn.clicked.connect(self._action_export_results_excel)
+        rbtn_row.addWidget(export_xlsx_btn)
         rvbox.addLayout(rbtn_row)
+
+        # ── Export Report button (Feature 9) ──────────────────────────
+        rbtn_row2 = QHBoxLayout()
+        export_report_btn = QPushButton("📄  Export Report…")
+        export_report_btn.setToolTip(
+            "Generate a self-contained HTML report of the optimisation session.\n"
+            "Includes: session metadata, best results, all plots (embedded as\n"
+            "PNG images), and the full trials table.\n"
+            "The file works offline — no internet connection required."
+        )
+        export_report_btn.clicked.connect(self._action_export_report)
+        rbtn_row2.addWidget(export_report_btn)
+        rbtn_row2.addStretch()
+        rvbox.addLayout(rbtn_row2)
+
+        # ── Surrogate quality badge (Feature 2) ───────────────────────
+        self._quality_badge = QLabel("Surrogate quality: —")
+        self._quality_badge.setWordWrap(True)
+        self._quality_badge.setAlignment(Qt.AlignCenter)
+        self._quality_badge.setToolTip(
+            "Cross-validated R² of a Random Forest fitted on all completed trials.\n"
+            f"Green: R² > 0.85 (good)  |  Amber: R² 0.60–0.85 (moderate)\n"
+            f"Red: R² < 0.60 (poor)    |  Grey: fewer than {MIN_TRIALS} completed trials."
+        )
+        self._quality_badge.setStyleSheet(
+            "background-color: #45475a; color: #cdd6f4; "
+            "padding: 4px 8px; border-radius: 4px;"
+        )
+        rvbox.addWidget(self._quality_badge)
 
         self._results_tabs = QTabWidget()
 
@@ -811,6 +943,12 @@ class MainWindow(QMainWindow):
         self._pareto_table.horizontalHeader().setStretchLastSection(True)
         self._pareto_table.setAlternatingRowColors(True)
         self._results_tabs.addTab(self._pareto_table, "Best / Pareto")
+
+        self._convergence_widget = ConvergenceWidget()
+        self._results_tabs.addTab(self._convergence_widget, "\U0001f4c8  Convergence")
+
+        self._pareto_widget = ParetoWidget()
+        self._results_tabs.addTab(self._pareto_widget, "📈  Pareto")
 
         rvbox.addWidget(self._results_tabs, stretch=1)
         self._left_tabs.addTab(results_widget, "📊  Results")
@@ -891,7 +1029,10 @@ class MainWindow(QMainWindow):
 
     def _action_load_csv(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Experiment CSV", "", "CSV Files (*.csv)"
+            self, "Open Experiment Data File", "",
+            "Data files (*.csv *.xlsx *.xls);;"
+            "CSV files (*.csv);;"
+            "Excel files (*.xlsx *.xls)"
         )
         if path:
             self._do_load_csv(path)
@@ -943,6 +1084,39 @@ class MainWindow(QMainWindow):
             row_l.addWidget(dir_combo)
             self._obj_inner_layout.addWidget(row_w)
             self._obj_col_rows.append((col, cb, dir_combo))
+
+        # ── Replicate aggregation controls (Feature 8) ────────────────────
+        repl_row = QWidget()
+        repl_layout = QHBoxLayout(repl_row)
+        repl_layout.setContentsMargins(0, 4, 0, 2)
+        repl_layout.setSpacing(6)
+
+        self._repl_cb = QCheckBox("Aggregate replicates")
+        self._repl_cb.setToolTip(
+            "When enabled, rows with numeric parameter values that agree within\n"
+            "the ±tolerance are treated as replicate measurements of the same\n"
+            "experiment. Their objective values are averaged, and an n_replicates\n"
+            "column is added to the All Trials table.\n\n"
+            "Categorical/string parameters must always match exactly.\n"
+            "Tolerance is in the same units as your parameter columns.\n"
+            "  1e-6 = exact-match only (default)\n"
+            "  0.5  = merge rows within ±0.5 of each numeric param\n"
+            "  5    = merge rows within ±5 (e.g. temperatures in K)"
+        )
+        repl_layout.addWidget(self._repl_cb)
+        repl_layout.addWidget(QLabel("  ±"))
+
+        self._repl_tol_le = QLineEdit("1e-6")
+        self._repl_tol_le.setFixedWidth(80)
+        self._repl_tol_le.setEnabled(False)
+        self._repl_tol_le.setPlaceholderText("1e-6")
+        self._repl_tol_le.setToolTip("Absolute ±tolerance for numeric parameters.")
+        repl_layout.addWidget(self._repl_tol_le)
+        repl_layout.addStretch()
+
+        # Enable the tolerance field only when the checkbox is on
+        self._repl_cb.toggled.connect(self._repl_tol_le.setEnabled)
+        self._obj_inner_layout.addWidget(repl_row)
 
         apply_btn = QPushButton("Apply Objectives →")
         apply_btn.clicked.connect(self._action_apply_objectives)
@@ -1014,8 +1188,65 @@ class MainWindow(QMainWindow):
             self._session_state.study_name,
         )
 
-        # Seed historical trials from CSV
-        trial_dicts = load_trials_from_csv(self._df, config)
+        # ── Replicate aggregation (Feature 8) ─────────────────────────────
+        repl_enabled = (
+            self._repl_cb is not None and self._repl_cb.isChecked()
+        )
+        repl_tol = 1e-6
+        if repl_enabled and self._repl_tol_le is not None:
+            try:
+                repl_tol = float(self._repl_tol_le.text())
+            except ValueError:
+                repl_tol = 1e-6
+
+        # Persist replicate settings to config so they survive session save/load
+        config.replicate_aggregation = repl_enabled
+        config.replicate_tolerance   = repl_tol
+        self._session_state.study_config = config
+        SessionManager.save(self._session_state)
+
+        # Build the loading DataFrame (aggregated or raw)
+        param_col_names = [p.name for p in params if p.enabled]
+        obj_col_names   = [o.column_name for o in objectives]
+        n_raw = len(self._df)
+
+        if repl_enabled and repl_tol > 0:
+            df_to_load = aggregate_replicates(
+                self._df, param_col_names, obj_col_names, tolerance=repl_tol
+            )
+        else:
+            df_to_load = self._df.copy()
+            df_to_load["n_replicates"] = 1
+
+        n_agg = len(df_to_load)
+
+        # Seed historical trials from (potentially aggregated) DataFrame
+        trial_dicts = load_trials_from_csv(df_to_load, config)
+
+        # Inject n_replicates into each trial dict's user_attrs so the
+        # All Trials table can display it.  The injection aligns trial_dicts
+        # with the valid rows from df_to_load (same filter as load_trials_from_csv).
+        if "n_replicates" in df_to_load.columns:
+            param_names_enabled = [p.name for p in config.parameters if p.enabled]
+            filtered_rep_counts: list[int] = []
+            for _, row in df_to_load.iterrows():
+                if any(pd.isna(row.get(c)) for c in obj_col_names):
+                    continue
+                row_params = {
+                    name: row[name]
+                    for name in param_names_enabled
+                    if name in row.index and not pd.isna(row[name])
+                }
+                if len(row_params) < len([n for n in param_names_enabled if n in row.index]):
+                    continue
+                try:
+                    filtered_rep_counts.append(int(row["n_replicates"]))
+                except (TypeError, ValueError):
+                    filtered_rep_counts.append(1)
+            for i, td in enumerate(trial_dicts):
+                n_rep = filtered_rep_counts[i] if i < len(filtered_rep_counts) else 1
+                td.setdefault("user_attrs", {})["n_replicates"] = n_rep
+
         added, skipped = load_historical_trials(self._study, trial_dicts, config)
 
         # Build parameter cards
@@ -1026,7 +1257,17 @@ class MainWindow(QMainWindow):
         self._update_status_bar()
         self._refresh_recent_menu()
         self._refresh_design_space()   # show historical data, no suggestions yet
-        self._set_status(f"Ready — {added} historical trials loaded, {skipped} skipped.")
+
+        # Status message describes whether aggregation occurred
+        if repl_enabled and n_agg < n_raw:
+            self._set_status(
+                f"Ready — {n_agg} aggregated trials loaded from {n_raw} rows "
+                f"(tolerance ±{repl_tol}), {skipped} skipped."
+            )
+        else:
+            self._set_status(
+                f"Ready — {added} historical trials loaded, {skipped} skipped."
+            )
 
     # ══════════════════════════════════════════════════════════════════════
     # Constraint editor
@@ -1107,6 +1348,18 @@ class MainWindow(QMainWindow):
                 "TPE batch quality degrades without sufficient prior data."
             )
 
+        # GP performance warning: O(n³) cost becomes significant above ~200 trials
+        if sampler == "GP" and self._study:
+            n_completed = sum(
+                1 for t in self._study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+            )
+            if n_completed > 200:
+                warnings.append(
+                    f"⚠ GP may be slow for {n_completed} completed trials (> 200). "
+                    "Consider switching to TPE for faster suggestions."
+                )
+
         if warnings:
             self._warning_label.setText("\n\n".join(warnings))
             self._warning_label.show()
@@ -1164,6 +1417,10 @@ class MainWindow(QMainWindow):
         cfg.n_batches    = self._n_batches_spin.value()
         cfg.sampler_name = self._sampler_combo.currentText()
         cfg.parameters   = [c.get_config() for c in self._param_cards]
+        # Auto-stop settings (Feature 12)
+        cfg.auto_stop                = self._auto_stop_cb.isChecked()
+        cfg.auto_stop_min_improvement = self._as_improve_spin.value() / 100.0
+        cfg.auto_stop_n_batches      = self._as_nbatches_spin.value()
 
     # ── Worker callbacks ───────────────────────────────────────────────────
 
@@ -1176,20 +1433,59 @@ class MainWindow(QMainWindow):
         suggestions = [item["params"] for item in self._session_state.pending_batch]
         self._refresh_design_space(suggestions=suggestions)
 
+        from optuna.trial import TrialState as _TS
+        _existing = [
+            {"number": t.number, **t.params}
+            for t in self._study.trials if t.state == _TS.COMPLETE
+        ]
+        # Compute surrogate predictions for each suggestion so the dialog
+        # can show the expected value alongside the actual input field.
+        try:
+            _predictions = predict_batch(
+                self._study,
+                self._session_state.study_config,
+                suggestions,
+            )
+        except Exception:
+            _predictions = None
         dlg = BatchResultsDialog(
             self._session_state.pending_batch,
             self._session_state.study_config.objectives,
             self._session_state,
             parent=self,
+            existing_trials=_existing,
+            study=self._study,
+            predictions=_predictions,
         )
         dlg.results_submitted.connect(self._on_results_submitted)
-        if dlg.exec() != dlg.accepted:
-            # User cancelled — stop the worker, session is already saved
+        if dlg.exec() != QDialog.Accepted:
+            # User closed/cancelled the dialog without submitting results.
+            # The pending batch was already saved to disk by the worker
+            # (mark_batch_pending was called before batch_ready was emitted).
+            # We must unblock the worker so it can exit cleanly, but we do NOT
+            # re-enable "Ask Next Batch" — there are still WAITING trials in
+            # Optuna.  Instead we put the UI into the "pending" state so the
+            # user can enter results later via the toolbar button.
             if self._worker:
-                self._worker.cancel_results()
-            self._ask_btn.setEnabled(True)
+                self._worker.cancel_results()   # unblocks the worker thread
+            self._ask_btn.setEnabled(False)
             self._pause_btn.setEnabled(False)
-            self._set_status("Awaiting results — session saved. Reload to resume.")
+            # _on_optimization_done will fire next (worker exits); it will
+            # detect the pending batch and skip the "All done!" message.
+            # Pre-emptively update the UI so it is correct even before that signal.
+            self._update_pending_btn_state()
+            n_pending = (len(self._session_state.pending_batch)
+                         if self._session_state and self._session_state.pending_batch
+                         else 0)
+            self._resume_label.setText(
+                f"⚠  <b>{n_pending}</b> pending trial(s) awaiting lab results.\n"
+                "Click <b>📋 Enter Pending Results…</b> in the toolbar when you "
+                "have your measurements."
+            )
+            self._resume_banner.show()
+            self._set_status(
+                "Results not entered — use '📋 Enter Pending Results…' when ready."
+            )
 
     def _on_results_submitted(self, results: list) -> None:
         # Append actual compositions + results to the CSV before telling Optuna
@@ -1208,12 +1504,54 @@ class MainWindow(QMainWindow):
         self._left_tabs.setCurrentIndex(1)
         self._set_status(f"Batch {done}/{total} complete.")
 
-    def _on_optimization_done(self) -> None:
-        self._ask_btn.setEnabled(True)
+    def _on_optimization_done(self, reason: str = "completed") -> None:
+        """
+        Called when the worker loop ends.
+
+        Parameters
+        ----------
+        reason : str
+            "completed"  — all n_batches processed normally.
+            "converged"  — auto-stop triggered (no improvement in N batches).
+            "cancelled"  — stop() was called or the user cancelled results.
+        """
         self._pause_btn.setEnabled(False)
+        # Guard: if there is still a pending batch, the worker exited because
+        # the user closed the results dialog without submitting.  Don't show
+        # any "done" message or re-enable Ask.
+        if self._session_state and self._session_state.pending_batch:
+            self._ask_btn.setEnabled(False)
+            self._update_pending_btn_state()
+            return
+
+        self._ask_btn.setEnabled(True)
         self._refresh_results_tables()
-        self._set_status("Optimization complete.")
-        QMessageBox.information(self, "Done", "All batches complete!")
+
+        if reason == "converged":
+            cfg = self._session_state.study_config if self._session_state else None
+            n_window = cfg.auto_stop_n_batches if cfg else 3
+            pct      = (cfg.auto_stop_min_improvement * 100) if cfg else 1.0
+            self._set_status(
+                f"Converged after {self._batches_done} batch(es) — "
+                f"best value unchanged (< {pct:.1f}%) "
+                f"for {n_window} consecutive batches."
+            )
+            QMessageBox.information(
+                self,
+                "Auto-Stop: Converged",
+                f"Optimisation converged after {self._batches_done} batch(es).\n\n"
+                f"The best objective value has not improved by more than {pct:.1f}%\n"
+                f"in the last {n_window} consecutive batches.\n\n"
+                "You can continue by clicking 'Ask Next Batch' or review the results.",
+            )
+        elif reason == "cancelled":
+            self._set_status("Optimisation paused.")
+        else:   # "completed"
+            total = self._n_batches_spin.value()
+            self._set_status(
+                f"Optimisation complete ({self._batches_done}/{total} batches)."
+            )
+            QMessageBox.information(self, "Done", "All batches complete!")
 
     def _on_worker_error(self, msg: str) -> None:
         QMessageBox.critical(self, "Worker Error", msg)
@@ -1332,6 +1670,12 @@ class MainWindow(QMainWindow):
         self._sampler_combo.setCurrentText(cfg.sampler_name)
         self._batch_size_spin.setValue(cfg.batch_size)
         self._n_batches_spin.setValue(cfg.n_batches)
+        # Auto-stop settings (Feature 12)
+        self._auto_stop_cb.setChecked(cfg.auto_stop)
+        self._as_improve_spin.setValue(cfg.auto_stop_min_improvement * 100.0)
+        self._as_nbatches_spin.setValue(cfg.auto_stop_n_batches)
+        self._as_improve_spin.setEnabled(cfg.auto_stop)
+        self._as_nbatches_spin.setEnabled(cfg.auto_stop)
         self._build_param_cards(cfg.parameters)
         self._refresh_results_tables()
         self._update_warnings()
@@ -1347,6 +1691,12 @@ class MainWindow(QMainWindow):
                 self._csv_path = state.csv_path
                 self._csv_path_label.setText(f"  {os.path.basename(state.csv_path)}")
                 self._populate_objectives_selector(df)
+                # Restore replicate aggregation settings from saved config
+                if self._repl_cb is not None:
+                    self._repl_cb.setChecked(cfg.replicate_aggregation)
+                if self._repl_tol_le is not None:
+                    self._repl_tol_le.setText(str(cfg.replicate_tolerance))
+                    self._repl_tol_le.setEnabled(cfg.replicate_aggregation)
             except Exception:
                 pass
 
@@ -1410,11 +1760,15 @@ class MainWindow(QMainWindow):
 
     def _refresh_results_tables(self) -> None:
         if not self._study:
+            self._convergence_widget.clear()
+            self._pareto_widget.clear()
             return
         from optuna.trial import TrialState
 
         completed = [t for t in self._study.trials if t.state == TrialState.COMPLETE]
         if not completed:
+            self._convergence_widget.clear()
+            self._pareto_widget.clear()
             return
 
         obj_cols = (
@@ -1423,7 +1777,8 @@ class MainWindow(QMainWindow):
             else ["value"]
         )
         param_cols = list(completed[0].params.keys())
-        all_cols   = ["Trial #"] + param_cols + obj_cols
+        # Include n_replicates column so users can see how many raw rows were merged
+        all_cols   = ["Trial #"] + param_cols + obj_cols + ["n_replicates"]
 
         def _fill_table(table: QTableWidget, trials: list) -> None:
             table.setRowCount(len(trials))
@@ -1441,10 +1796,110 @@ class MainWindow(QMainWindow):
                     else:
                         val = ""
                     table.setItem(r, len(param_cols) + 1 + oi, QTableWidgetItem(str(val)))
+                # n_replicates: from user_attrs if set (historical trials with aggregation),
+                # otherwise 1 (live batch tells)
+                n_rep = 1
+                if trial.user_attrs:
+                    try:
+                        n_rep = int(trial.user_attrs.get("n_replicates", 1))
+                    except (TypeError, ValueError):
+                        n_rep = 1
+                table.setItem(
+                    r, len(param_cols) + 1 + len(obj_cols),
+                    QTableWidgetItem(str(n_rep)),
+                )
             table.resizeColumnsToContents()
 
         _fill_table(self._trials_table, completed)
         _fill_table(self._pareto_table, get_pareto_front(self._study))
+
+        # Refresh the convergence plot
+        objectives = (
+            self._session_state.study_config.objectives
+            if self._session_state
+            else []
+        )
+        if objectives:
+            self._convergence_widget.refresh(self._study, objectives)
+        else:
+            self._convergence_widget.clear()
+
+        # Refresh the Pareto scatter widget (multi-objective only)
+        if objectives and len(objectives) >= 2:
+            self._pareto_widget.refresh(self._study, objectives)
+        else:
+            self._pareto_widget.clear()
+
+        # Refresh surrogate quality badge
+        self._update_quality_badge()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Feature 2 — Surrogate quality badge
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _update_quality_badge(self) -> None:
+        """Recompute surrogate quality and update the badge label."""
+        if not self._study or not self._session_state:
+            self._quality_badge.setText("Surrogate quality: —")
+            self._quality_badge.setStyleSheet(
+                "background-color: #45475a; color: #cdd6f4; "
+                "padding: 4px 8px; border-radius: 4px;"
+            )
+            return
+
+        try:
+            result = compute_surrogate_quality(
+                self._study, self._session_state.study_config
+            )
+        except Exception:
+            # Never let a quality computation error surface to the user
+            self._quality_badge.setText("Surrogate quality: —")
+            self._quality_badge.setStyleSheet(
+                "background-color: #45475a; color: #cdd6f4; "
+                "padding: 4px 8px; border-radius: 4px;"
+            )
+            return
+
+        status = result["status"]
+        n      = result["n"]
+        r2     = result.get("r2")
+        rmse   = result.get("rmse")
+
+        pearson_r = result.get("pearson_r")
+        r2_str    = f"{r2:.2f}"        if r2        is not None else "n/a"
+        r_str     = f"{pearson_r:.2f}" if pearson_r is not None else "n/a"
+        rmse_str  = f"{rmse:.4g}"      if rmse      is not None else "n/a"
+
+        if status == "insufficient":
+            text  = f"Surrogate quality: Insufficient data ({n}/{MIN_TRIALS})"
+            style = (
+                "background-color: #45475a; color: #cdd6f4; "
+                "padding: 4px 8px; border-radius: 4px;"
+            )
+        elif status == "good":
+            text  = (f"✅ Surrogate: Good  "
+                     f"(CV R²={r2_str}, r={r_str}, RMSE={rmse_str}, n={n})")
+            style = (
+                "background-color: #2ecc71; color: #1e1e2e; "
+                "padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+            )
+        elif status == "moderate":
+            text  = (f"⚠ Surrogate: Moderate — more data recommended  "
+                     f"(CV R²={r2_str}, r={r_str}, n={n})")
+            style = (
+                "background-color: #f39c12; color: #1e1e2e; "
+                "padding: 4px 8px; border-radius: 4px;"
+            )
+        else:  # poor
+            text  = (f"🔴 Surrogate: Poor — suggestions less reliable  "
+                     f"(CV R²={r2_str}, r={r_str}, n={n})")
+            style = (
+                "background-color: #e74c3c; color: #ffffff; "
+                "padding: 4px 8px; border-radius: 4px;"
+            )
+
+        self._quality_badge.setText(text)
+        self._quality_badge.setStyleSheet(style)
 
     def _update_status_bar(self) -> None:
         if not self._study:
@@ -1500,6 +1955,262 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Exported", f"Results exported to:\n{path}")
 
     # ══════════════════════════════════════════════════════════════════════
+    # Feature 10 — Export as Excel (.xlsx)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _action_export_results_excel(self) -> None:
+        """Export all completed trial results to an Excel (.xlsx) file."""
+        if not self._study:
+            QMessageBox.warning(self, "No Study", "No study loaded.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Results as Excel", "",
+            "Excel files (*.xlsx);;All files (*)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        from optuna.trial import TrialState
+
+        rows = []
+        obj_cols = (
+            [o.column_name for o in self._session_state.study_config.objectives]
+            if self._session_state
+            else []
+        )
+        for t in self._study.trials:
+            if t.state != TrialState.COMPLETE:
+                continue
+            row: dict = {"trial_number": t.number}
+            row.update(t.params)
+            if t.values:
+                for i, v in enumerate(t.values):
+                    col = obj_cols[i] if i < len(obj_cols) else f"objective_{i}"
+                    row[col] = v
+            elif t.value is not None:
+                col = obj_cols[0] if obj_cols else "value"
+                row[col] = t.value
+            rows.append(row)
+
+        try:
+            pd.DataFrame(rows).to_excel(path, index=False, engine="openpyxl")
+            QMessageBox.information(self, "Exported", f"Results exported to:\n{path}")
+        except ImportError:
+            QMessageBox.critical(
+                self, "Export Error",
+                "openpyxl is required for Excel export.\n"
+                "Install it with:  pip install openpyxl"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", f"Failed to export:\n{exc}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Feature 9 — Export HTML report
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _action_export_report(self) -> None:
+        """
+        Generate a self-contained HTML report and open it in the browser.
+
+        Collects:
+          - Session metadata from _session_state
+          - Completed trials as a DataFrame
+          - Best/Pareto trial rows
+          - Matplotlib figures from the Results tab widgets and (if open)
+            the Design Space dialog widgets
+        Then calls generate_report() → write_report() and offers to open
+        the result in the system browser.
+        """
+        import datetime
+        import webbrowser
+
+        # ── Collect metadata ───────────────────────────────────────────────
+        if self._session_state:
+            cfg          = self._session_state.study_config
+            session_name = self._session_state.study_name
+            sampler      = cfg.sampler_name
+            n_batches    = self._batches_done
+            objectives   = [
+                f"{o.column_name} ({o.direction})"
+                for o in cfg.objectives
+            ]
+        else:
+            session_name = "Untitled Session"
+            sampler      = "—"
+            n_batches    = 0
+            objectives   = []
+
+        metadata = {
+            "session_name": session_name,
+            "date": datetime.date.today().isoformat(),
+            "sampler": sampler,
+            "n_batches": n_batches,
+            "objectives": objectives,
+        }
+
+        # ── Build trials DataFrame ─────────────────────────────────────────
+        trials_rows: list[dict] = []
+        best_rows:   list[dict] = []
+        if self._study:
+            from optuna.trial import TrialState
+            cfg      = self._session_state.study_config if self._session_state else None
+            obj_cols = [o.column_name for o in cfg.objectives] if cfg else []
+            completed = [t for t in self._study.trials if t.state == TrialState.COMPLETE]
+            for t in sorted(completed, key=lambda x: x.number):
+                row: dict = {"trial_number": t.number}
+                row.update(t.params)
+                if t.values:
+                    for i, v in enumerate(t.values):
+                        col = obj_cols[i] if i < len(obj_cols) else f"obj_{i}"
+                        row[col] = v
+                elif t.value is not None:
+                    col = obj_cols[0] if obj_cols else "value"
+                    row[col] = t.value
+                trials_rows.append(row)
+
+            # Best / Pareto rows
+            for t in get_pareto_front(self._study):
+                row = {"trial_number": t.number}
+                row.update(t.params)
+                if t.values:
+                    for i, v in enumerate(t.values):
+                        col = obj_cols[i] if i < len(obj_cols) else f"obj_{i}"
+                        row[col] = v
+                elif t.value is not None:
+                    col = obj_cols[0] if obj_cols else "value"
+                    row[col] = t.value
+                best_rows.append(row)
+
+        trials_df = pd.DataFrame(trials_rows)
+
+        # ── Collect figures ────────────────────────────────────────────────
+        # NOTE: We force-refresh each widget before collecting its figure.
+        # We do NOT use canvas.isVisible() because that returns False for any
+        # widget inside a QTabWidget whose tab is not currently selected —
+        # which would silently drop every plot that isn't on screen right now.
+        figures: dict = {}
+
+        if self._study and self._session_state:
+            from optuna.trial import TrialState as _TS_exp
+            _completed = [t for t in self._study.trials if t.state == _TS_exp.COMPLETE]
+            _objectives = self._session_state.study_config.objectives if self._session_state else []
+
+            # ── Convergence plot ───────────────────────────────────────────
+            if _completed and _objectives:
+                try:
+                    self._convergence_widget.refresh(self._study, _objectives)
+                    figures["convergence"] = self._convergence_widget._fig
+                except Exception:
+                    pass
+
+            # ── Pareto scatter (multi-objective only) ──────────────────────
+            if _completed and len(_objectives) >= 2:
+                try:
+                    self._pareto_widget.refresh(self._study, _objectives)
+                    figures["pareto"] = self._pareto_widget._fig
+                except Exception:
+                    pass
+
+        # ── Design Space, Correlation, Importance ─────────────────────────
+        # Create the dialog if the user never opened it, then force-refresh
+        # so all three canvases render fresh plots for the report.
+        if self._df is not None and self._session_state:
+            cfg = self._session_state.study_config
+            try:
+                if self._design_space_dlg is None:
+                    self._design_space_dlg = DesignSpaceDialog(parent=self)
+                # Refresh all tabs (pairplot, correlation, importance, profiler)
+                self._design_space_dlg.refresh(
+                    df=self._df,
+                    params=cfg.parameters,
+                    objectives=cfg.objectives,
+                    suggestions=None,
+                )
+                # Collect each sub-widget figure if its canvas was drawn
+                # (placeholder hidden means data exists and figure was rendered)
+                ds_w = self._design_space_dlg._widget
+                if not ds_w._placeholder.isHidden() or ds_w._canvas.isHidden() is False:
+                    figures["design_space"] = ds_w._fig
+
+                corr_w = self._design_space_dlg._corr_widget
+                if not corr_w._placeholder.isVisible():
+                    figures["correlation"] = corr_w._fig
+
+                imp_w = self._design_space_dlg._importance_widget
+                if not imp_w._placeholder.isVisible():
+                    figures["importance"] = imp_w._fig
+            except Exception:
+                pass
+
+        # ── Generate and write ─────────────────────────────────────────────
+        try:
+            html = generate_report(metadata, trials_df, figures, best_rows)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Report Error",
+                f"Failed to generate report:\n{exc}"
+            )
+            return
+
+        # Save to the session directory (same folder as the .db file)
+        report_dir = (
+            os.path.dirname(self._session_state.storage_path)
+            if self._session_state
+            else (os.path.dirname(self._csv_path) if self._csv_path else os.getcwd())
+        )
+        try:
+            report_path = write_report(html, report_dir)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Report Save Error",
+                f"Failed to save report:\n{exc}"
+            )
+            return
+
+        # ── Export individual PNGs (200 dpi, PowerPoint-ready) ─────────────
+        plots_dir = ""
+        try:
+            plots_dir = export_plots_as_png(figures, report_path, dpi=200)
+        except Exception:
+            pass   # non-fatal — HTML report is still valid
+
+        n_pngs = len([f for f in os.listdir(plots_dir) if f.endswith(".png")]) \
+            if plots_dir and os.path.isdir(plots_dir) else 0
+
+        self._set_status(
+            f"Report saved: {os.path.basename(report_path)}"
+            + (f"  |  {n_pngs} PNG(s) in …_plots/" if n_pngs else "")
+        )
+
+        # ── Offer to open in browser ───────────────────────────────────────
+        png_note = (
+            f"\n\n📁 Individual plots (200 dpi PNG) saved to:\n"
+            f"  {os.path.basename(plots_dir)}/\n"
+            f"  → drag these directly into PowerPoint, Word, etc."
+        ) if n_pngs else ""
+
+        pdf_note = (
+            "\n\n💡 To export as PDF: open the HTML file in your browser "
+            "→ File → Print → Save as PDF"
+        )
+
+        reply = QMessageBox.question(
+            self,
+            "Report Exported",
+            f"HTML report saved to:\n{report_path}"
+            f"{png_note}"
+            f"{pdf_note}"
+            f"\n\nOpen HTML report in browser now?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                webbrowser.open(report_path)
+            except Exception:
+                pass   # non-fatal — user can open manually
+
+    # ══════════════════════════════════════════════════════════════════════
     # Helpers
     # ══════════════════════════════════════════════════════════════════════
 
@@ -1536,11 +2247,18 @@ class MainWindow(QMainWindow):
             )
             return
 
+        from optuna.trial import TrialState as _TS2
+        _existing2 = [
+            {"number": t.number, **t.params}
+            for t in self._study.trials if t.state == _TS2.COMPLETE
+        ]
         dlg = BatchResultsDialog(
             self._session_state.pending_batch,
             self._session_state.study_config.objectives,
             self._session_state,
             parent=self,
+            existing_trials=_existing2,
+            study=self._study,
         )
         dlg.results_submitted.connect(self._on_pending_results_submitted)
         dlg.exec()

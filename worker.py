@@ -31,8 +31,12 @@ class OptimizationWorker(QThread):
         Emitted after tell_batch() completes.
         Payload: (batches_done, total_batches)
 
-    optimization_done()
-        Emitted when all batches have been processed (or stop() was called).
+    optimization_done(str)
+        Emitted when the optimisation loop ends.
+        Payload: stop reason — one of:
+            "completed"  — all n_batches processed normally.
+            "converged"  — auto-stop triggered (no improvement in N batches).
+            "cancelled"  — stop() was called or the user cancelled results.
 
     error(str)
         Emitted if an unhandled exception occurs.
@@ -46,7 +50,7 @@ class OptimizationWorker(QThread):
 
     batch_ready = Signal(list)        # list of {"trial_number": int, "params": dict}
     batch_complete = Signal(int, int) # (batches_done, total_batches)
-    optimization_done = Signal()
+    optimization_done = Signal(str)   # stop reason: "completed" | "converged" | "cancelled"
     error = Signal(str)
 
     def __init__(
@@ -72,18 +76,23 @@ class OptimizationWorker(QThread):
         self._results_ready = threading.Event()
         self._pending_results: Optional[List[dict]] = None  # set by submit_results()
 
+        # Convergence tracking (Feature 12)
+        self._batch_bests: list[float] = []   # one entry per completed batch
+
     # ── QThread entry point ────────────────────────────────────────────────
 
     def run(self) -> None:
         try:
             n_batches = self._config.n_batches
             batch_size = self._config.batch_size
+            stop_reason = "completed"
 
             for batch_idx in range(n_batches):
 
                 # ── Pause / stop check ─────────────────────────────────────
                 self._pause_event.wait()
                 if self._stop_flag:
+                    stop_reason = "cancelled"
                     break
 
                 # ── Ask ────────────────────────────────────────────────────
@@ -112,9 +121,11 @@ class OptimizationWorker(QThread):
                 self._results_ready.wait()
 
                 if self._stop_flag:
+                    stop_reason = "cancelled"
                     break
                 if self._pending_results is None:
                     # User cancelled the dialog
+                    stop_reason = "cancelled"
                     break
 
                 # ── Tell ───────────────────────────────────────────────────
@@ -137,11 +148,69 @@ class OptimizationWorker(QThread):
 
                 self.batch_complete.emit(batch_idx + 1, n_batches)
 
+                # ── Feature 12: Auto-stop convergence check ────────────────
+                self._track_batch_best()
+                if self._config.auto_stop:
+                    if self._check_converged():
+                        stop_reason = "converged"
+                        break
+
         except Exception as exc:  # noqa: BLE001
             self.error.emit(str(exc))
             return
 
-        self.optimization_done.emit()
+        self.optimization_done.emit(stop_reason)
+
+    # ── Feature 12 helpers ─────────────────────────────────────────────────
+
+    def _track_batch_best(self) -> None:
+        """Record the current best objective value for the convergence check."""
+        try:
+            from optuna.trial import TrialState
+            completed = [t for t in self._study.trials if t.state == TrialState.COMPLETE]
+            if not completed:
+                return
+
+            # Use the first objective; for multi-objective use the best in direction[0]
+            direction = self._study.directions[0] if self._study.directions else None
+            values_list = []
+            for t in completed:
+                v = None
+                if t.values is not None and len(t.values) > 0:
+                    v = float(t.values[0])
+                elif t.value is not None:
+                    v = float(t.value)
+                if v is not None:
+                    values_list.append(v)
+
+            if not values_list:
+                return
+
+            import optuna as _optuna
+            if direction == _optuna.study.StudyDirection.MINIMIZE:
+                best = min(values_list)
+            else:
+                best = max(values_list)
+
+            self._batch_bests.append(best)
+        except Exception:
+            pass   # non-fatal — convergence checking simply skipped
+
+    def _check_converged(self) -> bool:
+        """
+        Return True if the relative improvement over the last N batches is
+        smaller than ``auto_stop_min_improvement`` for all consecutive pairs.
+        """
+        window = self._config.auto_stop_n_batches
+        threshold = self._config.auto_stop_min_improvement
+        recent = self._batch_bests[-window:]
+        if len(recent) < window:
+            return False
+        improvements = [
+            abs(recent[i] - recent[i - 1]) / (abs(recent[i - 1]) + 1e-9)
+            for i in range(1, len(recent))
+        ]
+        return all(imp < threshold for imp in improvements)
 
     # ── Control methods (called from the main thread) ──────────────────────
 

@@ -278,7 +278,14 @@ class StudyConfig:
     constraints: List[ParameterConstraint] = field(default_factory=list)
     batch_size: int = 1
     n_batches: int = 10
-    sampler_name: Literal["TPE", "NSGAII", "Random"] = "TPE"
+    sampler_name: Literal["TPE", "NSGAII", "Random", "GP"] = "TPE"
+    # ── Replicate aggregation (Feature 8) ─────────────────────────────────────
+    replicate_aggregation: bool = False   # master on/off switch
+    replicate_tolerance: float = 1e-6    # absolute ± threshold for numeric params
+    # ── Convergence-based auto-stop (Feature 12) ──────────────────────────────
+    auto_stop: bool = False
+    auto_stop_min_improvement: float = 0.01   # 1% minimum relative improvement
+    auto_stop_n_batches: int = 3              # window: consecutive batches with no improvement
 
     def to_dict(self) -> dict:
         return {
@@ -288,6 +295,11 @@ class StudyConfig:
             "batch_size": self.batch_size,
             "n_batches": self.n_batches,
             "sampler_name": self.sampler_name,
+            "replicate_aggregation": self.replicate_aggregation,
+            "replicate_tolerance": self.replicate_tolerance,
+            "auto_stop": self.auto_stop,
+            "auto_stop_min_improvement": self.auto_stop_min_improvement,
+            "auto_stop_n_batches": self.auto_stop_n_batches,
         }
 
     @classmethod
@@ -299,4 +311,9 @@ class StudyConfig:
             batch_size=d.get("batch_size", 1),
             n_batches=d.get("n_batches", 10),
             sampler_name=d.get("sampler_name", "TPE"),
+            replicate_aggregation=d.get("replicate_aggregation", False),
+            replicate_tolerance=float(d.get("replicate_tolerance", 1e-6)),
+            auto_stop=d.get("auto_stop", False),
+            auto_stop_min_improvement=float(d.get("auto_stop_min_improvement", 0.01)),
+            auto_stop_n_batches=int(d.get("auto_stop_n_batches", 3)),
         )

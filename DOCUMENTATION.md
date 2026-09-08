@@ -110,7 +110,9 @@ The dependencies are:
 | `numpy` | ≥ 1.26 | Numerical operations |
 | `matplotlib` | ≥ 3.8 | Plots (validation script) |
 | `sqlalchemy` | ≥ 2.0 | Optuna's SQLite backend |
-| `scikit-learn` | ≥ 1.4 | RF + GP surrogates (validation script) |
+| `scikit-learn` | ≥ 1.4 | RF surrogates (surrogate quality badge, importance, profiler) |
+| `scipy` | ≥ 1.11 | Scientific utilities |
+| `openpyxl` | ≥ 3.1 | Excel (.xlsx / .xls) file read / write |
 
 > **Note for Windows users:** If you see a `UnicodeEncodeError` when running
 > scripts in the terminal, the script already adds `sys.stdout.reconfigure`
@@ -139,7 +141,11 @@ The main window opens with an empty state. You will see:
 
 Go to **File → Load CSV** (or click the toolbar icon).
 
-Your CSV must have:
+BHOP accepts both **CSV** (`.csv`) and **Excel** (`.xlsx`, `.xls`) files —
+the same dialog accepts both formats. Excel files are read from the first
+sheet using `openpyxl`; the column layout requirements are identical to CSV.
+
+Your data file must have:
 - **One column per experiment parameter** (inputs).
 - **One or more result columns** (outputs / objectives).
 - Optionally: rows where result columns are blank — those are treated as
@@ -203,6 +209,36 @@ For **multi-objective** optimisation, select more than one result column.
 The sampler switches automatically to NSGA-II and a Pareto-front table
 replaces the single-best display.
 
+#### Replicate Aggregation (optional)
+
+Before clicking **Apply Objectives →** you can tick **Aggregate replicates**
+and set a ±tolerance. Any rows in the CSV whose numeric parameter values agree
+within that tolerance are merged: objective values are averaged, and an
+`n_replicates` column is added to the All Trials table so you can see how
+many raw measurements were combined.
+
+- `tolerance = 1e-6` (default) → exact-match only.
+- `tolerance = 0.5` → merge rows within ±0.5 of every numeric parameter.
+- Categorical parameters always require an exact match regardless of tolerance.
+
+#### Results tab — live feedback after each batch
+
+After each submitted batch the **📊 Results** tab automatically updates:
+
+| Sub-tab | What it shows |
+|---|---|
+| **All Trials** | Every completed trial, colour-coded with an `n_replicates` column |
+| **Best / Pareto** | Best trial (single-obj) or the full Pareto front (multi-obj) |
+| **📈 Convergence** | Step-line of best-value-so-far vs. trial number; one line per objective |
+| **📈 Pareto** | 2-D scatter of Objective A vs Objective B (multi-objective only) — Pareto-optimal points highlighted as green stars, dominated points in grey, connected by a dashed step-line |
+
+A **Surrogate quality badge** below the export buttons shows the
+cross-validated R² of a Random Forest trained on all completed trials:
+- ✅ Green (R² > 0.85) — model predictions are reliable.
+- ⚠ Amber (0.60–0.85) — acceptable; more data will improve accuracy.
+- 🔴 Red (< 0.60) — model is unreliable; do not trust suggestions blindly.
+- Grey — insufficient data (< 15 completed rows).
+
 ---
 
 ### 3.5 Choosing Batch Size, n-Batches and Sampler
@@ -210,12 +246,36 @@ replaces the single-best display.
 | Setting | Description |
 |---|---|
 | **Batch size** | How many experiments to suggest per round |
-| **Number of batches** | Total rounds of ask → experiment → tell |
-| **Sampler** | `TPE` (recommended), `NSGAII` (multi-obj), `Random` (baseline) |
+| **Number of batches** | Total rounds of ask → experiment → tell. Set large (e.g. 50) and enable Auto-stop to let the model decide when to halt. |
+| **Sampler** | `TPE` (recommended), `NSGAII` (multi-obj), `Random` (baseline), `GP` (Gaussian Process) |
 
-> **TPE** (Tree-structured Parzen Estimator) is the default and works well
-> for most single-objective problems. It learns a probabilistic model of the
-> objective and balances exploration vs. exploitation automatically.
+#### Sampler details
+
+| Sampler | Best for | Notes |
+|---|---|---|
+| `TPE` | Single-objective, ≤ 20 parameters | Default. Multivariate Parzen estimator; good balance of exploration and exploitation. |
+| `NSGAII` | Multi-objective | Genetic algorithm. Batch size should ideally be a multiple of the population size. |
+| `Random` | Baselines / debugging | No model — uniform random sampling. Useful to confirm BO adds value. |
+| `GP` | Smooth continuous spaces with < 200 trials | Gaussian Process surrogate. Provides calibrated uncertainty estimates. Scales as O(n³) — switch to TPE above ~200 completed trials. |
+
+#### Auto-stop criterion
+
+Tick **Auto-stop when converged** in the Batch Settings group to let BHOP
+halt automatically when the best objective value has not improved:
+
+- **Min improvement** — minimum relative change required per batch (default 1%).
+- **over N batches** — the window of consecutive batches to check (default 3).
+
+**Example**: with threshold 1% and window 3, BHOP stops when the last 3 batches
+each produced less than 1% relative improvement over the previous best.
+
+**Recommended workflow**: set *Total batches* to a generous upper bound (e.g. 50)
+and rely on auto-stop to halt the study when it plateaus — you can always click
+"Ask Next Batch" again if you want to continue.
+
+> **Note**: `GP` sampler does not support inequality constraints via
+> `constraints_func`. Constraints are still enforced post-hoc by projection,
+> but the surrogate does not learn to avoid infeasible regions automatically.
 
 ---
 
@@ -263,6 +323,37 @@ Click **Submit All** to tell Optuna the results. The app then:
 2. Calls `tell_batch()` to store the results in the Optuna SQLite DB.
 3. Moves to the next batch (ask → experiment → tell).
 4. Updates the trials table in the centre panel.
+
+#### Outlier detection (automatic)
+
+While you type a result value, the dialog compares it against the surrogate
+model's prediction for that composition (using Out-of-Bag Random Forest
+predictions). If the entered value is more than 90% away from the prediction
+**or** more than 2.5 standard deviations away, the spinbox turns **orange**
+as a caution indicator.
+
+This is **advisory only** — the orange highlight does not prevent submission.
+It catches typos (e.g. typing `1200` instead of `120`) and instrument failures
+before they corrupt the surrogate.
+
+The highlight is disabled when fewer than 5 completed trials exist (not enough
+data to calibrate the model).
+
+#### Pre-submit validation gate
+
+When you click **Submit All**, BHOP runs three automated checks before saving:
+
+1. **Constraint violations** — are the actual parameter values you entered
+   consistent with the algebraic constraints? (e.g. fractions summing to 1)
+2. **Large parameter deviations** — did you change any suggested parameter by
+   more than 20% of its full range? (flags accidental edits)
+3. **Outlier result** — is the entered measurement more than 90% away from the
+   model's prediction for that composition?
+
+If any check fails a single confirmation dialog appears listing all issues,
+with two buttons:
+- **Submit Anyway** — proceeds with the current values.
+- **Back / Re-enter** *(default)* — returns to the form so you can correct values.
 
 Click **Cancel** to close the dialog without submitting. The pending batch is
 still saved — see §3.8 for how to come back to it later.
@@ -325,14 +416,16 @@ between them.
 The window remembers its size between uses within the same session and is
 capped to fit your screen on first open.
 
-#### Two tabs inside the dialog
+#### Four tabs inside the dialog
 
-The Design Space dialog has two tabs:
+The Design Space dialog has four tabs:
 
 | Tab | Contents |
 |---|---|
 | **📊 Design Space** | Pairplot / parallel coordinates / marginals — where the data lives in parameter space |
 | **🔗 Correlation Matrix** | Annotated heatmap showing Pearson or Spearman correlations between all numeric parameters and all objectives |
+| **📈 Importance** | Horizontal bar chart of permutation importances from a Random Forest; shows which parameters drive each objective. Requires ≥ 15 completed rows. |
+| **🔮 Profiler** | What-if / prediction profiler — adjust sliders for each numeric parameter and dropdowns for categoricals to see the surrogate's predicted objective value update in real-time. Requires ≥ 10 completed rows. |
 
 Switch between them freely while the dialog is open.
 
@@ -557,10 +650,14 @@ PythonProject1/
 ├── session_manager.py       Save/load JSON session + SQLite path tracking
 ├── worker.py                QThread running the batch loop
 │
+├── surrogate_quality.py     Surrogate quality computation (cross-validated R², RMSE, Pearson r)
+├── report_generator.py      HTML report + PNG plot export
+│
 ├── param_card_widget.py     UI: one card per parameter in the left dock
 ├── batch_results_dialog.py  UI: dialog for entering batch results
 ├── dead_region_dialog.py    UI: dialog for defining dead regions
 ├── constraint_dialog.py     UI: dialog for defining algebraic parameter constraints
+├── design_space_widget.py   UI: design space, correlation, importance, profiler tabs
 │
 ├── BHOP.py                  Headless scripting example
 ├── test_backend.py          Pytest test suite
@@ -737,7 +834,12 @@ Top-level configuration for an entire optimisation session.
 | `constraints` | `List[ParameterConstraint]` | `[]` | Algebraic constraints on parameter values |
 | `batch_size` | `int` | `1` | Suggestions per round |
 | `n_batches` | `int` | `10` | Total rounds |
-| `sampler_name` | `str` | `"TPE"` | `"TPE"`, `"NSGAII"`, or `"Random"` |
+| `sampler_name` | `str` | `"TPE"` | `"TPE"`, `"NSGAII"`, `"Random"`, or `"GP"` |
+| `replicate_aggregation` | `bool` | `False` | Enable replicate aggregation on CSV load |
+| `replicate_tolerance` | `float` | `1e-6` | Absolute ±tolerance for numeric parameters when merging replicates |
+| `auto_stop` | `bool` | `False` | Stop when the best value hasn't improved by the threshold |
+| `auto_stop_min_improvement` | `float` | `0.01` | Minimum relative improvement per batch (1% default) |
+| `auto_stop_n_batches` | `int` | `3` | Window of consecutive batches to check for convergence |
 
 ---
 
@@ -933,7 +1035,7 @@ keeping the GUI responsive.
 |---|---|---|
 | `batch_ready` | `List[dict]` — `{"trial_number": int, "params": dict}` | After `ask_batch()` completes; GUI should open `BatchResultsDialog` |
 | `batch_complete` | `(batches_done: int, total_batches: int)` | After `tell_batch()` completes |
-| `optimization_done` | — | All batches done or `stop()` was called |
+| `optimization_done` | `str` — `"completed"`, `"converged"`, or `"cancelled"` | All batches done, auto-stop triggered, or stop() was called |
 | `error` | `str` — error message | On unhandled exception |
 
 #### Thread-safety pattern
@@ -1323,9 +1425,15 @@ The final checklist uses these thresholds (all adjustable in `section5`):
 |---|---|---|---|
 | `parameters` | `List[ParameterConfig]` | `[]` | Ordered list of all input parameters |
 | `objectives` | `List[ObjectiveConfig]` | `[]` | 1 objective = single-obj; ≥2 = multi-obj |
+| `constraints` | `List[ParameterConstraint]` | `[]` | Algebraic constraints on parameter values |
 | `batch_size` | `int` | `1` | Experiments per round (1–20 is typical) |
 | `n_batches` | `int` | `10` | Total rounds; can be increased mid-session |
-| `sampler_name` | `str` | `"TPE"` | `"TPE"`, `"NSGAII"`, or `"Random"` |
+| `sampler_name` | `str` | `"TPE"` | `"TPE"`, `"NSGAII"`, `"Random"`, or `"GP"` |
+| `replicate_aggregation` | `bool` | `False` | Enable replicate merging on CSV load |
+| `replicate_tolerance` | `float` | `1e-6` | Absolute ±tolerance for merging numeric params |
+| `auto_stop` | `bool` | `False` | Enable convergence-based auto-stop |
+| `auto_stop_min_improvement` | `float` | `0.01` | Minimum relative improvement per batch (1%) |
+| `auto_stop_n_batches` | `int` | `3` | Window of consecutive batches to check |
 
 ### `ParameterConfig` — full field table
 
