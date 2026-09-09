@@ -1,6 +1,6 @@
 """
-BHOP — Bayesian Hyperparameter Optimization for the Lab
-========================================================
+LabOpt — Lab Optimisation Tool
+================================
 
 GUI entry point
 ---------------
@@ -79,7 +79,7 @@ def run_headless_example() -> None:
     )
 
     # ── 2. Create a temporary session (uses a temp directory) ──────────────
-    session_dir = tempfile.mkdtemp(prefix="bhop_headless_")
+    session_dir = tempfile.mkdtemp(prefix="labopt_headless_")
     state = SessionManager.create_new_session(config, csv_path="", session_dir=session_dir)
     study = build_study(config, state.storage_path, state.study_name)
 
@@ -125,6 +125,6 @@ def run_headless_example() -> None:
 
 
 if __name__ == "__main__":
-    print("Running headless BHOP example...\n")
+    print("Running headless LabOpt example...\n")
     run_headless_example()
     print("\nDone.  For the full GUI, run:  python main.py")

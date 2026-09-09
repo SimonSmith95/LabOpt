@@ -1,4 +1,4 @@
-# BHOP — Bayesian Hyperparameter Optimisation for the Lab
+# LabOpt — Lab Optimisation Tool
 ## Complete Documentation
 
 ---
@@ -46,14 +46,14 @@
     - 11.1 [Data Assumptions](#111-data-assumptions)
     - 11.2 [Optimizer Assumptions](#112-optimizer-assumptions)
     - 11.3 [Validation Caveats](#113-validation-caveats)
-    - 11.4 [When to Use BHOP](#114-when-to-use-and-when-not-to-use-bhop)
+    - 11.4 [When to Use LabOpt](#114-when-to-use-and-when-not-to-use-labopt)
     - 11.5 [Reporting and Reproducibility](#115-reporting-and-reproducibility)
 
 ---
 
 ## 1. Project Overview
 
-**BHOP** is a lab-facing Bayesian Optimisation tool. It wraps the
+**LabOpt** is a lab-facing optimisation tool. It wraps the
 [Optuna](https://optuna.org/) optimisation framework in a clean PySide6 GUI,
 making it practical for wet-lab or materials-science workflows where:
 
@@ -70,6 +70,7 @@ making it practical for wet-lab or materials-science workflows where:
 |---|---|
 | `main.py` | GUI entry point — call `python main.py` |
 | `main_window.py` | Full PySide6 application window |
+| `LabOpt_logo.png` | Application logo (toolbar + window icon) |
 | `parameter_config.py` | Data models shared across the whole app |
 | `csv_loader.py` | Reads CSV, auto-detects column types |
 | `sampler_utils.py` | Dead-region-aware parameter sampling |
@@ -79,7 +80,7 @@ making it practical for wet-lab or materials-science workflows where:
 | `param_card_widget.py` | UI widget for one parameter |
 | `batch_results_dialog.py` | Dialog to enter lab measurements |
 | `dead_region_dialog.py` | Dialog to define forbidden parameter zones |
-| `BHOP.py` | Headless scripting example (no GUI needed) |
+| `BHOP.py` | Headless scripting example (no GUI needed) — see `LabOpt` entry point |
 | `test_backend.py` | Pytest test suite for all backend modules |
 | `validate_perovskite.py` | Stand-alone validation suite for the perovskite dataset |
 | `test_data/` | Example CSV and auto-generated session files |
@@ -118,7 +119,7 @@ The dependencies are:
 > scripts in the terminal, the script already adds `sys.stdout.reconfigure`
 > at the top to handle this. See [Troubleshooting](#10-troubleshooting).
 
----
+
 
 ## 3. How to Use the Application (GUI Walkthrough)
 
@@ -141,7 +142,7 @@ The main window opens with an empty state. You will see:
 
 Go to **File → Load CSV** (or click the toolbar icon).
 
-BHOP accepts both **CSV** (`.csv`) and **Excel** (`.xlsx`, `.xls`) files —
+LabOpt accepts both **CSV** (`.csv`) and **Excel** (`.xlsx`, `.xls`) files —
 the same dialog accepts both formats. Excel files are read from the first
 sheet using `openpyxl`; the column layout requirements are identical to CSV.
 
@@ -260,13 +261,13 @@ cross-validated R² of a Random Forest trained on all completed trials:
 
 #### Auto-stop criterion
 
-Tick **Auto-stop when converged** in the Batch Settings group to let BHOP
+Tick **Auto-stop when converged** in the Batch Settings group to let LabOpt
 halt automatically when the best objective value has not improved:
 
 - **Min improvement** — minimum relative change required per batch (default 1%).
 - **over N batches** — the window of consecutive batches to check (default 3).
 
-**Example**: with threshold 1% and window 3, BHOP stops when the last 3 batches
+**Example**: with threshold 1% and window 3, LabOpt stops when the last 3 batches
 each produced less than 1% relative improvement over the previous best.
 
 **Recommended workflow**: set *Total batches* to a generous upper bound (e.g. 50)
@@ -341,7 +342,7 @@ data to calibrate the model).
 
 #### Pre-submit validation gate
 
-When you click **Submit All**, BHOP runs three automated checks before saving:
+When you click **Submit All**, LabOpt runs three automated checks before saving:
 
 1. **Constraint violations** — are the actual parameter values you entered
    consistent with the algebraic constraints? (e.g. fractions summing to 1)
@@ -362,13 +363,13 @@ still saved — see §3.8 for how to come back to it later.
 
 ### 3.8 Saving and Resuming Sessions
 
-BHOP **automatically saves** the session after every ask and every tell.
+LabOpt **automatically saves** the session after every ask and every tell.
 The session is stored as two files in the same folder as your CSV (or a chosen
 directory):
 
 ```
-bhop_study_20260822_232040.db           ← Optuna SQLite database
-bhop_study_20260822_232040_session.json ← Session metadata + pending batch
+labopt_study_20260822_232040.db           ← Optuna SQLite database
+labopt_study_20260822_232040_session.json ← Session metadata + pending batch
 ```
 
 To **resume**:
@@ -410,7 +411,7 @@ dangerously far from any observed data.
 
 Switch to the **📊 Results** tab in the left dock, then click **📊 Design
 Space…** (top-left of the Results tab). The window opens as a separate,
-resizable, non-modal dialog — you can keep it open alongside BHOP and switch
+resizable, non-modal dialog — you can keep it open alongside LabOpt and switch
 between them.
 
 The window remembers its size between uses within the same session and is
@@ -527,14 +528,14 @@ below "Apply Objectives →"). The Constraint Editor dialog opens.
    ```
    Residual param: MAPbI
    ```
-   This means BHOP will suggest CsPbI and FAPbI freely, then set
+   This means LabOpt will suggest CsPbI and FAPbI freely, then set
    `MAPbI = 1 − CsPbI − FAPbI` automatically.
 6. Click **Validate** to check that the expression is well-formed and the
    residual parameter exists in your CSV.
 7. Click **OK** to accept.
 
 > **Tip:** You only need a residual parameter for **equality** constraints.
-> For inequality constraints (`<=`, `>=`), leave the residual blank — BHOP
+> For inequality constraints (`<=`, `>=`), leave the residual blank — LabOpt
 > will project violated suggestions back onto the constraint boundary.
 
 #### Applying constraints to the study
@@ -1014,12 +1015,12 @@ Provides save/load persistence for the entire application state.
 | `create_new_session(config, csv_path, session_dir)` | Creates a new session and returns the initial `SessionState`. The SQLite DB is not created yet — Optuna creates it lazily. |
 | `save(state)` | Writes state to disk **atomically** (write-to-.tmp then rename) to prevent corruption. |
 | `load(session_path)` | Loads a `_session.json`. Raises `FileNotFoundError` if the paired `.db` is missing. |
-| `list_recent_sessions(n=5)` | Returns the N most recent sessions from `~/.bhop_sessions.json`, filtering out any that no longer exist on disk. |
+| `list_recent_sessions(n=5)` | Returns the N most recent sessions from `~/.labopt_sessions.json`, filtering out any that no longer exist on disk. |
 | `mark_batch_pending(state, trials)` | Saves the pending batch to the session JSON and writes `pending_batch.csv` for the lab. |
 | `clear_pending_batch(state)` | Clears the pending batch and deletes `pending_batch.csv`. |
 | `match_pending_to_csv(state, df)` | Tries to match pending trial parameters against rows in a DataFrame (for auto-filling result dialogs). Returns `{trial_number: [values]}` or `None`. |
 
-The global recent-session registry is stored at `~/.bhop_sessions.json`
+The global recent-session registry is stored at `~/.labopt_sessions.json`
 (user's home directory).
 
 ---
@@ -1574,7 +1575,7 @@ EI_XI = 0.1    # more exploration (useful when the landscape is noisy)
    - Expression: `CsPbI + FAPbI + MAPbI`
    - Operator: `=`
    - Target: `1.0`
-   - Residual param: `MAPbI`  ← BHOP will compute this automatically
+   - Residual param: `MAPbI`  ← LabOpt will compute this automatically
 4. Click **Validate**, then **OK**.
 5. Click **Apply Objectives →** as usual.
 
@@ -1709,7 +1710,7 @@ def make_gp():
 ## 11. Assumptions, Limitations & When to Trust the Results
 
 This section exists so you can make an **informed decision** about whether
-BHOP is appropriate for your experiment before committing real lab time to its
+LabOpt is appropriate for your experiment before committing real lab time to its
 suggestions.  Every tool has assumptions; understanding them protects you from
 misplaced confidence.
 
@@ -1719,7 +1720,7 @@ misplaced confidence.
 
 #### Replicate averaging
 When two or more rows in your CSV have identical parameter values (replicates),
-BHOP averages them into a single training point before fitting the surrogate.
+LabOpt averages them into a single training point before fitting the surrogate.
 
 - **Assumes**: measurement noise is independent and identically distributed
   (i.i.d.) — i.e. each replicate is an unbiased noisy observation of the
@@ -1743,7 +1744,7 @@ roughly the same everywhere in parameter space.
   showing systematically higher errors in one part of parameter space.
 
 #### Column independence
-BHOP treats each enabled CSV column as an independent free variable.
+LabOpt treats each enabled CSV column as an independent free variable.
 
 - **Breaks down when**: columns are physically coupled but not constrained
   (e.g. temperature and pressure in a gas reaction).  Constraint expressions
@@ -1778,7 +1779,7 @@ no better than random — the first few batches are essentially exploration.
 
 #### Batch parallelism reduces per-trial efficiency
 Standard sequential BO asks one experiment at a time, fits the surrogate,
-then asks again.  BHOP's batch mode asks `batch_size` experiments at once
+then asks again.  LabOpt's batch mode asks `batch_size` experiments at once
 using Optuna's **constant liar** approximation (each trial assumes the pending
 results equal the current best).  This means:
 
@@ -1798,7 +1799,7 @@ are skewed (common in degradation or lifetime data), EI will be overconfident.
   distribution is strongly right-skewed (e.g. lifetime data).
 
 #### Categorical parameters are unordered
-BHOP encodes categorical parameters using `CategoricalDistribution`.  Optuna
+LabOpt encodes categorical parameters using `CategoricalDistribution`.  Optuna
 does not know that `"low" < "medium" < "high"`.
 
 - **What to do**: for ordinal categories, replace them with a numeric column
@@ -1807,7 +1808,7 @@ does not know that `"low" < "medium" < "high"`.
 #### Equality constraint: residual coordinate system
 When an equality constraint is active (e.g. `A + B + C = 1`) with a residual
 parameter, the surrogate operates in the **N−1 dimensional** internal space
-of free parameters.  BHOP enforces the constraint by:
+of free parameters.  LabOpt enforces the constraint by:
 
 1. Failing the raw Optuna suggestion (if it violates the constraint).
 2. Adding a corrected COMPLETE trial with the feasible values.
@@ -1840,12 +1841,12 @@ The validation suite (`validate_perovskite.py`) proves that the surrogate
 machinery works correctly on the perovskite stability dataset.  It does
 **not** prove that it will work on your dataset.
 
-**Before trusting BHOP suggestions for a new material system:**
+**Before trusting LabOpt suggestions for a new material system:**
 1. Collect ≥ 30 historical data points covering your parameter space.
 2. Adapt `validate_perovskite.py` to your CSV (change `FEATURES`, `TARGET`,
    and the domain-knowledge checks in `section4`).
 3. Run it and confirm that Pearson r > 0.5 on the hold-out.
-4. Only then use BHOP suggestions to guide new experiments.
+   4. Only then use LabOpt suggestions to guide new experiments.
 
 #### Surrogate r > 0.5 does not mean absolute predictions are accurate
 A Pearson r of 0.85 means the model ranks compositions well but does not
@@ -1855,10 +1856,10 @@ practical accuracy.
 
 ---
 
-### 11.4 When to Use (and When Not to Use) BHOP
+### 11.4 When to Use (and When Not to Use) LabOpt
 
 #### Good fit ✅
-| Situation | Why BHOP helps |
+| Situation | Why LabOpt helps |
 |---|---|
 | 3–15 continuous parameters | Well within TPE's reliable range |
 | Experiments take hours to days | BO's sequential learning is worth the setup cost |
@@ -1880,14 +1881,14 @@ practical accuracy.
 |---|---|
 | Real-time feedback loops (< minutes per experiment) | BO setup overhead exceeds benefit; use bandit algorithms |
 | Combinatorial discrete spaces (e.g. molecular graph search) | Use graph neural networks + genetic algorithms |
-| Safety-critical systems | BHOP has no built-in safety constraints or failure modes; add guardrails manually |
+| Safety-critical systems | LabOpt has no built-in safety constraints or failure modes; add guardrails manually |
 | Fewer than 5 total experiments planned | You have no budget for exploration; use expert knowledge directly |
 
 ---
 
 ### 11.5 Reporting and Reproducibility
 
-If you use BHOP in research, include the following in your methods section:
+If you use LabOpt in research, include the following in your methods section:
 
 - Optuna version (`pip show optuna`)
 - Sampler used (TPE / NSGAII / Random)

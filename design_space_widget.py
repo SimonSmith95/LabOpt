@@ -1960,7 +1960,7 @@ class DesignSpaceDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setModal(False)
-        self.setWindowTitle("Design Space — BHOP")
+        self.setWindowTitle("Design Space — LabOpt")
 
         # ── Size: fit within screen ────────────────────────────────────────
         screen = (

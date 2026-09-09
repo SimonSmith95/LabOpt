@@ -1,7 +1,7 @@
 """
 validate_synthetic.py
 =====================
-Validation script for BHOP using synthetic benchmark functions with KNOWN
+Validation script for LabOpt using synthetic benchmark functions with KNOWN
 ground-truth optima.  Unlike the Perovskite dataset, these benchmarks have:
 
   • No compositional constraints (parameters are fully independent)
@@ -350,7 +350,7 @@ def check_suggestions_in_bounds(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Validate BHOP surrogate + BO on synthetic benchmarks."
+        description="Validate LabOpt surrogate + BO on synthetic benchmarks."
     )
     parser.add_argument(
         "--only", choices=["branin", "hartmann6"],

@@ -1349,7 +1349,7 @@ class TestReportGenerator:
         html = self._minimal_report()
         path = write_report(html, str(tmp_path))
         fname = os.path.basename(path)
-        assert re.match(r"bhop_report_\d{8}_\d{6}\.html", fname), \
+        assert re.match(r"labopt_report_\d{8}_\d{6}\.html", fname), \
             f"Unexpected filename format: {fname}"
 
 

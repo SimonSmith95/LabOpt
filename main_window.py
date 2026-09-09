@@ -10,8 +10,10 @@ from typing import List, Optional
 
 import optuna
 import pandas as pd
+import sys
+
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtGui import QAction, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -519,7 +521,7 @@ def _markdown_to_html(text: str) -> str:
 
 class MainWindow(QMainWindow):
     """
-    Main application window for BHOP.
+    Main application window for LabOpt.
 
     Layout
     ------
@@ -533,7 +535,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("BHOP — Lab Optimizer")
+        self.setWindowTitle("LabOpt — Lab Optimiser")
         # Cap initial size to the available screen geometry so the window never
         # opens larger than the display (common on 768-height laptops).
         _screen = QApplication.primaryScreen()
@@ -663,6 +665,35 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
 
     def _build_toolbar(self) -> None:
+        # ── Logo toolbar — sits above the CSV toolbar ──────────────────────
+        _logo_path = os.path.join(
+            getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
+            "LabOpt_logo.png",
+        )
+        if os.path.exists(_logo_path):
+            logo_tb = QToolBar("Logo", self)
+            logo_tb.setMovable(False)
+            logo_tb.setFloatable(False)
+            # Stretch a spacer on each side so the logo is centered
+            #_left_spacer = QWidget()
+            #_left_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            #logo_tb.addWidget(_left_spacer)
+
+            _logo_lbl = QLabel()
+            _logo_lbl.setContentsMargins(12, 4, 0, 4)
+            _pm = QPixmap(_logo_path)
+            if not _pm.isNull():
+                _pm = _pm.scaledToHeight(72, Qt.SmoothTransformation)
+                _logo_lbl.setPixmap(_pm)
+            _logo_lbl.setContentsMargins(0, 4, 0, 4)
+            logo_tb.addWidget(_logo_lbl)
+            _right_spacer = QWidget()
+            _right_spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            logo_tb.addWidget(_right_spacer)
+            self.addToolBar(Qt.TopToolBarArea, logo_tb)
+            self.addToolBarBreak(Qt.TopToolBarArea)
+
+        # ── CSV / action toolbar ───────────────────────────────────────────
         tb = QToolBar("CSV", self)
         tb.setMovable(False)
         self.addToolBar(tb)
@@ -698,7 +729,7 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
 
     def _build_left_dock(self) -> None:
-        self._left_dock = QDockWidget("BHOP Controls", self)
+        self._left_dock = QDockWidget("LabOpt Controls", self)
         self._left_dock.setAllowedAreas(Qt.LeftDockWidgetArea)
         self._left_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
 
@@ -781,7 +812,7 @@ class MainWindow(QMainWindow):
         # ── Auto-stop (Feature 12) ─────────────────────────────────────
         self._auto_stop_cb = QCheckBox("Auto-stop when converged")
         self._auto_stop_cb.setToolTip(
-            "When enabled, BHOP stops asking new batches as soon as the best\n"
+            "When enabled, LabOpt stops asking new batches as soon as the best\n"
             "objective value has not improved by more than the threshold over\n"
             "the last N consecutive batches.\n\n"
             "Recommended: set n_batches to a large number (e.g. 50) and rely\n"
@@ -1015,6 +1046,16 @@ class MainWindow(QMainWindow):
         for lbl in (self._status_trials, self._status_best, self._status_text):
             sb.addWidget(lbl)
             sb.addWidget(self._make_separator())
+
+        # ── Repository credit (right-aligned permanent widget) ─────────────
+        _credit = QLabel(
+            '<a href="https://github.com/SimonSmith95/LabOpt" '
+            'style="color:#585b70; font-size:11px; text-decoration:none;">'
+            "github.com/SimonSmith95/LabOpt</a>"
+        )
+        _credit.setOpenExternalLinks(True)
+        _credit.setContentsMargins(0, 0, 8, 0)
+        sb.addPermanentWidget(_credit)
 
     @staticmethod
     def _make_separator() -> QFrame:
@@ -2379,7 +2420,7 @@ class MainWindow(QMainWindow):
         Open (or raise) the Design Space visualisation window.
 
         Creates the dialog the first time; thereafter reuses the same
-        window so the user can keep it open alongside BHOP.
+        window so the user can keep it open alongside LabOpt.
         """
         if self._df is None or not self._session_state:
             QMessageBox.information(
@@ -2407,16 +2448,16 @@ class MainWindow(QMainWindow):
     def _action_about(self) -> None:
         QMessageBox.information(
             self,
-            "About BHOP",
-            "BHOP — Bayesian Hyperparameter Optimization for the Lab\n\n"
+            "About LabOpt",
+            "LabOpt — Lab Optimisation Tool\n\n"
             "Built with Optuna + PySide6\n\n"
             "Supports:\n"
             "  • CSV-seeded historical trials\n"
             "  • Dead regions (excluded parameter zones)\n"
-            "  • Multi-objective optimization (Pareto front)\n"
+            "  • Multi-objective optimisation (Pareto front)\n"
             "  • Batched experiment suggestions\n"
             "  • Full session persistence (close & resume)\n"
-            "  • TPE / NSGAII / Random samplers",
+            "  • TPE / NSGAII / Random / GP samplers",
         )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -2475,7 +2516,7 @@ class MainWindow(QMainWindow):
         html = _markdown_to_html(section_text)
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("How to Use BHOP")
+        dlg.setWindowTitle("How to Use LabOpt")
         dlg.resize(820, 640)
 
         vbox = QVBoxLayout(dlg)

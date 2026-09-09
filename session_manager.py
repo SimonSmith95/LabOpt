@@ -17,7 +17,7 @@ import pandas as pd
 from parameter_config import StudyConfig
 
 # Registry of recent sessions stored in the user's home directory
-RECENT_SESSIONS_PATH = os.path.join(os.path.expanduser("~"), ".bhop_sessions.json")
+RECENT_SESSIONS_PATH = os.path.join(os.path.expanduser("~"), ".labopt_sessions.json")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -27,7 +27,7 @@ RECENT_SESSIONS_PATH = os.path.join(os.path.expanduser("~"), ".bhop_sessions.jso
 @dataclass
 class SessionState:
     """
-    Represents everything needed to save and restore a BHOP session.
+    Represents everything needed to save and restore a LabOpt session.
 
     pending_batch
         List of trials that have been *asked* from Optuna but whose lab
@@ -88,7 +88,7 @@ class SessionManager:
         """
         os.makedirs(session_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        study_name = f"bhop_study_{timestamp}"
+        study_name = f"labopt_study_{timestamp}"
         storage_path = os.path.join(session_dir, f"{study_name}.db")
         session_path = os.path.join(session_dir, f"{study_name}_session.json")
 
