@@ -62,7 +62,11 @@ def _get_param_value(trial_params: dict, param: ParameterConfig):
     return None
 
 
-def _build_X(trials_params: List[dict], config: StudyConfig) -> np.ndarray:
+def _build_X(
+    trials_params: List[dict],
+    config: StudyConfig,
+    ctx_attrs_list: Optional[List[dict]] = None,
+) -> np.ndarray:
     """
     Build a numeric feature matrix from a list of param dicts.
 
@@ -71,13 +75,39 @@ def _build_X(trials_params: List[dict], config: StudyConfig) -> np.ndarray:
                      valued categoricals so codes preserve order
     - Multi-range  : reconstructed via _get_param_value
     - Missing      : filled with -1
+
+    Parameters
+    ----------
+    trials_params
+        List of Optuna trial.params dicts.
+    config
+        StudyConfig — defines enabled parameters and context variables.
+    ctx_attrs_list
+        Optional list of trial.user_attrs dicts (one per trial).  When
+        supplied, context variable values (stored as ``ctx_<name>`` keys)
+        are appended as extra numeric columns to the feature matrix.
+        Entries that are missing or non-numeric are imputed with -1.
     """
     enabled = [p for p in config.parameters if p.enabled]
+    ctx_vars = getattr(config, "context_variables", [])
+
     rows = []
-    for params in trials_params:
+    for i, params in enumerate(trials_params):
         row = {}
         for p in enabled:
             row[p.name] = _get_param_value(params, p)
+
+        # Append context variable values
+        if ctx_attrs_list is not None and ctx_vars:
+            uattrs = ctx_attrs_list[i] if i < len(ctx_attrs_list) else {}
+            for cv in ctx_vars:
+                key = f"ctx_{cv.column_name}"
+                raw = uattrs.get(key)
+                try:
+                    row[cv.column_name] = float(raw) if raw is not None else None
+                except (TypeError, ValueError):
+                    row[cv.column_name] = None
+
         rows.append(row)
 
     X_df = pd.DataFrame(rows)
@@ -146,9 +176,10 @@ def compute_surrogate_quality(study, config: StudyConfig) -> dict:
         return {"status": "insufficient", "n": n,
                 "r2": None, "rmse": None, "pearson_r": None}
 
-    # ── Feature matrix ─────────────────────────────────────────────────────
+    # ── Feature matrix (params + context user_attrs) ───────────────────────
     trial_params = [t.params for t in completed]
-    X = _build_X(trial_params, config)
+    ctx_attrs = [dict(t.user_attrs) for t in completed]
+    X = _build_X(trial_params, config, ctx_attrs_list=ctx_attrs)
 
     # ── Target vector ──────────────────────────────────────────────────────
     y = _build_y(completed, config)

@@ -18,6 +18,7 @@
    - 3.8 [Saving and Resuming Sessions](#38-saving-and-resuming-sessions)
    - 3.9 [Design Space Visualisation](#39-design-space-visualisation)
    - 3.10 [Defining Parameter Constraints](#310-defining-parameter-constraints)
+   - 3.11 [Context Variables (Uncontrollable Environmental Conditions)](#311-context-variables-uncontrollable-environmental-conditions)
 4. [Headless / Scripting Mode](#4-headless--scripting-mode)
 5. [Codebase Architecture](#5-codebase-architecture)
    - 5.1 [File Map](#51-file-map)
@@ -32,6 +33,7 @@
    - 6.6 [worker.py](#66-workerpy)
    - 6.7 [GUI Widgets](#67-gui-widgets)
    - 6.8 [main.py & BHOP.py](#68-mainpy--bhoppy)
+   - 6.9 [contextual_sampler.py](#69-contextual_samplerpy)
 7. [Validation Script (validate_perovskite.py)](#7-validation-script-validate_perovskitepy)
    - 7.1 [What It Validates and Why](#71-what-it-validates-and-why)
    - 7.2 [How to Run It](#72-how-to-run-it)
@@ -587,6 +589,133 @@ Parameter names must **exactly match** your CSV column names (case-sensitive).
 | `temperature * time` | `<=` | `50000` | Processing budget cap |
 | `concentration` | `>=` | `0.05` | Minimum concentration |
 | `x1 + x2 + x3 + x4` | `=` | `1.0` | 4-component mixture |
+
+---
+
+### 3.11 Context Variables (Uncontrollable Environmental Conditions)
+
+Context variables allow the surrogate model to account for **environmental
+conditions that affect your experiment but cannot be controlled** — ambient
+humidity, atmospheric pressure, batch-to-batch reagent purity, and similar
+factors.
+
+#### The problem context variables solve
+
+Without context variables, LabOpt treats every non-objective column as a
+**controllable input** — something it can suggest values for. But some
+measured quantities are outputs of the environment, not inputs you set:
+
+- Humidity fluctuates and cannot be dialled in.
+- Atmospheric pressure at your lab location is fixed.
+- Reagent purity varies between supplier batches.
+
+If these are ignored, the surrogate cannot distinguish "this experiment had a
+poor yield because the composition was wrong" from "this experiment had a poor
+yield because the humidity spiked." Over time, this confuses the model and
+makes it penalise good parameter combinations that happened to run under
+unfavourable conditions.
+
+**Example:** If you are optimising synthesis temperature to maximise yield,
+and humidity affects yield strongly, the model might wrongly conclude that
+high temperature is bad — when in fact it was high humidity that caused the
+failures.
+
+#### What context variables do
+
+| Role | Controllable parameter | Context variable |
+|---|---|---|
+| You set it? | ✅ Yes | ❌ No (measured) |
+| Optuna suggests values? | ✅ Yes | ❌ No |
+| Surrogate learns from it? | ✅ Yes | ✅ Yes |
+| Appears in batch suggestions? | ✅ Yes | ❌ No |
+| Correctable after experiment? | Via param editing | ✅ Yes (dedicated cells) |
+
+#### Marking a column as a context variable (GUI)
+
+1. Load your CSV.
+2. In the **Objectives** panel, find the **Context Variables** section
+   (below the objective checkboxes).
+3. **Check** the columns that represent uncontrollable conditions.
+4. Click **Apply Objectives →** as usual.
+
+The context columns will no longer appear as parameter cards. Instead, a
+**🌡 Current Conditions** panel appears in the Settings tab.
+
+#### Entering current conditions before asking
+
+Before clicking **Ask Next Batch**, fill in the **🌡 Current Conditions**
+panel with today's estimated values:
+
+```
+Humidity (%):          [65.0]
+Atmospheric Pressure:  [1013.2]
+```
+
+These **planned context values** tell the contextual sampler what conditions
+the next experiments will run under, so it can pick the controllable
+parameters best suited to *those specific* conditions.
+
+> If you leave the panel blank, LabOpt falls back to standard Optuna
+> suggestions (no context conditioning). This is safe — context is optional.
+
+#### Correcting context values when entering results
+
+After running the experiments, the **Batch Results Dialog** shows editable
+context cells pre-filled with the planned values (light purple background).
+
+If actual conditions differed — for example, a humidity sensor showed 35%
+instead of the planned 10% — **edit the cell before clicking Submit**.
+
+```
+Humidity (%) — Planned: 10.0  →  Actual: [35.0]
+```
+
+Only the **actual** (possibly corrected) context values are stored in the
+Optuna trial. The planned value is discarded. This ensures the surrogate
+always trains on what truly happened during the experiment.
+
+#### What the model learns
+
+Context values are stored per trial and used as additional features in the
+RF surrogate. The model learns:
+
+```
+f(Temperature, Humidity) → Yield
+```
+
+The **Design Space Profiler** gains sliders for context variables, so you
+can ask: *"What yield would I expect at Temperature=150°C if humidity is 35%
+vs. 65%?"*
+
+The **Feature Importance** chart shows the relative contribution of context
+variables vs. controllable parameters.
+
+#### CSV format with context variables
+
+Your CSV can include context columns alongside your normal columns:
+
+```csv
+temperature,humidity_pct,atm_pressure_hpa,yield_pct
+150,62.3,1013.1,0.82
+180,71.5,1012.8,0.74
+160,58.1,1013.4,0.91
+```
+
+When loading this CSV and marking `humidity_pct` and `atm_pressure_hpa` as
+context variables, their historical values are automatically loaded into each
+trial's metadata for surrogate training.
+
+#### Caveats
+
+- Context variables must currently be **numeric** (FLOAT). Categorical context
+  support (e.g. `lab_technician`, `equipment_ID`) is planned for a future release.
+- A column cannot be both an **objective** and a **context variable**.
+  LabOpt validates this when you click **Apply Objectives →**.
+- The contextual RF sampler requires **≥ 15 completed trials** before it
+  activates. Below that threshold, standard Optuna TPE/GP is used.
+- Context conditioning improves suggestions but does not guarantee they are
+  optimal for the specified conditions — it is only as good as the surrogate's
+  fit to the historical data.
 
 ---
 
@@ -1195,6 +1324,72 @@ Demonstrates:
 6. Telling the results.
 
 Run with `python BHOP.py` to see it in action without the GUI.
+
+---
+
+### 6.9 `contextual_sampler.py`
+
+Provides the RF-based contextual acquisition function used when context
+variables are defined. Fully independent of PySide6 — usable in headless
+scripting.
+
+#### `ContextualSurrogate`
+
+The central class. Fits a Random Forest on `(controllable_params + context_vars)
+→ objective` and uses Expected Improvement to recommend controllable parameter
+values given a fixed current context.
+
+```python
+class ContextualSurrogate:
+    def __init__(self, config: StudyConfig): ...
+    def fit(self, study: optuna.Study) -> bool: ...
+    def suggest(self, current_context: dict, n_return: int = 1) -> List[dict]: ...
+```
+
+**`fit(study) → bool`**
+- Reads all COMPLETE trials from `study`.
+- Controllable param values come from `trial.params`.
+- Context values come from `trial.user_attrs["ctx_<name>"]`.
+- Trials with missing context have those features imputed with the column mean.
+- Returns `True` if ≥ `MIN_TRIALS` (15) complete trials exist; `False` otherwise.
+
+**`suggest(current_context, n_return=1) → List[dict]`**
+- Generates 2000 Latin Hypercube candidates over the controllable parameter space.
+- Appends the fixed `current_context` values to each candidate's feature vector.
+- Scores each candidate with Expected Improvement (EI) using per-tree variance
+  from `rf.estimators_` for uncertainty estimation.
+- Returns the top `n_return` candidates sorted by EI, as plain `{name: value}` dicts.
+
+**EI formula (minimisation):**
+```
+EI(x) = (y_best - μ(x)) · Φ(z) + σ(x) · φ(z)
+where z = (y_best - μ(x)) / σ(x)
+```
+For maximisation, the sign of `(y_best - μ(x))` is flipped.
+
+#### Integration with `ask_batch`
+
+When `ask_batch(study, config, batch_size, context=current_context)` is called
+with a non-empty `context` dict and `config.context_variables` is non-empty:
+
+1. Standard Optuna `study.ask()` is called to create `batch_size` RUNNING trials
+   (preserving trial numbering and state management).
+2. If `ContextualSurrogate.fit()` succeeds, `suggest()` returns RF-optimised
+   param dicts conditioned on the current context.
+3. The RF-chosen param values override the Optuna-suggested params in the
+   `BatchSuggestion.params` field shown to the user.
+4. `tell_batch()` uses the original Optuna trial numbers; context values are
+   stored as `user_attrs` on the corrected COMPLETE trial.
+
+If `fit()` returns `False` (insufficient data), the Optuna-suggested params are
+used unmodified (standard BO behaviour).
+
+#### Multi-objective contextual suggestions
+
+For multi-objective studies, `ContextualSurrogate` fits one RF per objective.
+Candidates are scored by the **product** of per-objective EI values. This is a
+practical approximation — it does not compute the full multi-objective EI
+(EHVI), but is fast and reasonable for 2–3 objectives.
 
 ---
 

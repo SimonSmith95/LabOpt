@@ -79,6 +79,15 @@ class OptimizationWorker(QThread):
         # Convergence tracking (Feature 12)
         self._batch_bests: list[float] = []   # one entry per completed batch
 
+        # Planned context values for the current batch (set by main_window before start())
+        # e.g. {"humidity_pct": 65.0, "atm_pressure_hpa": 1013.2}
+        self.planned_context: Optional[dict] = None
+
+        # Actual context corrections per trial (set by main_window in _on_results_submitted
+        # from BatchResultsDialog.get_context_corrections(), before submit_results() unblocks
+        # the worker).  List of dicts, one per submitted trial, or None.
+        self.pending_context_values: Optional[List[dict]] = None
+
     # ── QThread entry point ────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -96,7 +105,12 @@ class OptimizationWorker(QThread):
                     break
 
                 # ── Ask ────────────────────────────────────────────────────
-                trials = ask_batch(self._study, self._config, batch_size)
+                # Pass planned_context so the contextual sampler can condition
+                # suggestions on current environmental conditions (if defined).
+                trials = ask_batch(
+                    self._study, self._config, batch_size,
+                    context=self.planned_context,
+                )
 
                 # compute_full_params applies all equality and inequality
                 # constraints so that BatchResultsDialog shows the exact
@@ -143,7 +157,9 @@ class OptimizationWorker(QThread):
                 constrained = [pending_by_num.get(n, {}) for n in trial_numbers]
 
                 tell_batch(self._study, trial_numbers, values_list,
-                           constrained, self._config)
+                           constrained, self._config,
+                           context_values=self.pending_context_values)
+                self.pending_context_values = None   # reset for next batch
                 SessionManager.clear_pending_batch(self._session_state)
 
                 self.batch_complete.emit(batch_idx + 1, n_batches)

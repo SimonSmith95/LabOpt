@@ -33,6 +33,13 @@ class SessionState:
         List of trials that have been *asked* from Optuna but whose lab
         results have not yet been *told* back.  Each entry is:
             {"trial_number": int, "params": {col: val, ...}}
+
+    pending_planned_context
+        The context values the user entered in the "Current Conditions"
+        panel *before* asking for the pending batch.  These are used to
+        pre-fill the context correction cells in the Batch Results Dialog
+        when resuming a session.  ``None`` if no context variables exist
+        or the user did not enter any planned context.
     """
     session_path: str          # absolute path to this .json file
     storage_path: str          # absolute path to the Optuna SQLite .db file
@@ -40,6 +47,7 @@ class SessionState:
     csv_path: str              # path to the experiment data CSV
     study_config: StudyConfig
     pending_batch: Optional[List[dict]] = None
+    pending_planned_context: Optional[dict] = None   # {col_name: float, ...}
 
     # ── Serialisation ──────────────────────────────────────────────────────
 
@@ -51,6 +59,7 @@ class SessionState:
             "csv_path": self.csv_path,
             "study_config": self.study_config.to_dict(),
             "pending_batch": self.pending_batch,
+            "pending_planned_context": self.pending_planned_context,
         }
 
     @classmethod
@@ -62,6 +71,7 @@ class SessionState:
             csv_path=d.get("csv_path", ""),
             study_config=StudyConfig.from_dict(d["study_config"]),
             pending_batch=d.get("pending_batch"),
+            pending_planned_context=d.get("pending_planned_context"),
         )
 
 

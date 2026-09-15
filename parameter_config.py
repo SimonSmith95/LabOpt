@@ -104,6 +104,30 @@ class ObjectiveConfig:
 
 
 @dataclass
+class ContextConfig:
+    """Configuration for one uncontrollable context variable.
+
+    Context variables are measured environmental quantities (e.g. ambient
+    humidity, atmospheric pressure) that the surrogate learns from but that
+    are NOT part of the Optuna search space and are NOT suggested as next-
+    experiment values.  Their values are stored as ``user_attrs`` on each
+    Optuna trial with the ``ctx_`` prefix.
+    """
+    column_name: str
+    description: str = ""   # optional human-readable label
+
+    def to_dict(self) -> dict:
+        return {"column_name": self.column_name, "description": self.description}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ContextConfig":
+        return cls(
+            column_name=d["column_name"],
+            description=d.get("description", ""),
+        )
+
+
+@dataclass
 class ParameterConstraint:
     """
     A user-defined constraint relating one or more parameters.
@@ -276,6 +300,8 @@ class StudyConfig:
     parameters: List[ParameterConfig] = field(default_factory=list)
     objectives: List[ObjectiveConfig] = field(default_factory=list)
     constraints: List[ParameterConstraint] = field(default_factory=list)
+    # ── Context variables (uncontrollable environmental conditions) ────────────
+    context_variables: List[ContextConfig] = field(default_factory=list)
     batch_size: int = 1
     n_batches: int = 10
     sampler_name: Literal["TPE", "NSGAII", "Random", "GP"] = "TPE"
@@ -292,6 +318,7 @@ class StudyConfig:
             "parameters": [p.to_dict() for p in self.parameters],
             "objectives": [o.to_dict() for o in self.objectives],
             "constraints": [c.to_dict() for c in self.constraints],
+            "context_variables": [c.to_dict() for c in self.context_variables],
             "batch_size": self.batch_size,
             "n_batches": self.n_batches,
             "sampler_name": self.sampler_name,
@@ -308,6 +335,9 @@ class StudyConfig:
             parameters=[ParameterConfig.from_dict(p) for p in d.get("parameters", [])],
             objectives=[ObjectiveConfig.from_dict(o) for o in d.get("objectives", [])],
             constraints=[ParameterConstraint.from_dict(c) for c in d.get("constraints", [])],
+            context_variables=[
+                ContextConfig.from_dict(c) for c in d.get("context_variables", [])
+            ],
             batch_size=d.get("batch_size", 1),
             n_batches=d.get("n_batches", 10),
             sampler_name=d.get("sampler_name", "TPE"),

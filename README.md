@@ -53,16 +53,17 @@ python main.py
 | **Multi-objective** | Pareto-front optimisation with interactive scatter plot |
 | **Parameter constraints** | Algebraic equality & inequality rules (e.g. fractions summing to 1) |
 | **Dead regions** | Forbidden parameter sub-ranges the model never suggests |
+| **Context variables** | Uncontrollable environmental conditions (humidity, pressure) that the surrogate learns from without being suggested — corrections allowed after the experiment |
 | **Session persistence** | SQLite + JSON — resume any session from any machine |
 | **Design space visualisation** | Pairplot / parallel coordinates / 1-D marginals with batch overlay |
 | **Correlation matrix** | Pearson or Spearman heatmap across all parameters and objectives |
 | **Feature importance** | Permutation importance from a Random Forest surrogate |
-| **What-if Profiler** | Real-time predicted objective as you slide parameter values |
+| **What-if Profiler** | Real-time predicted objective as you slide parameter values — context variable sliders included |
 | **Surrogate quality badge** | Cross-validated R² with traffic-light rating (✅ ⚠ 🔴) |
 | **Outlier detection** | Flags implausible result entries before you submit them |
 | **Replicate aggregation** | Merge near-duplicate rows and average their objective values |
 | **Auto-stop** | Halt automatically when the best value has converged |
-| **Headless / scripting API** | Run the full loop from Python with no GUI |
+| **Headless / scripting API** | Run the full loop from Python with no GUI — context values accepted from any source (database, sensor, CSV) |
 
 ---
 
@@ -89,6 +90,60 @@ temperature * time   <= 50000  ← inequality (violated suggestions projected to
 ```
 
 > 📖 Constraint editor → [§ 3.10 Defining Parameter Constraints](DOCUMENTATION.md#310-defining-parameter-constraints)
+
+---
+
+## Context Variables (Uncontrollable Conditions)
+
+Some measured quantities affect your experiment but cannot be controlled — ambient humidity, atmospheric pressure, reagent purity. Mark these as **context variables** so the model learns from them without suggesting values for them.
+
+**The problem without context variables:**
+> You optimise synthesis temperature. Unknown to the model, humidity spiked on several days, causing poor yields. The model wrongly concludes that *temperature* was the problem and avoids those conditions — discarding good parameter choices.
+
+**With context variables:**
+> The model learns `f(Temperature, Humidity) → Yield`. When you ask for the next batch on a humid day, it recommends temperatures that work *at that humidity level*.
+
+### How it works
+
+| | Controllable parameter | Context variable |
+|---|---|---|
+| You set it? | ✅ Yes | ❌ No — measured |
+| Optimizer suggests values? | ✅ Yes | ❌ No |
+| Surrogate learns from it? | ✅ Yes | ✅ Yes |
+| Correctable after experiment? | Via cell editing | ✅ Yes — planned vs. actual |
+
+**GUI:** In the Objectives panel, mark context columns in the "Context Variables" section, then fill in the **🌡 Current Conditions** panel before asking for each batch. If actual conditions differed (e.g. a humidity spike), correct the values in the Batch Results Dialog before submitting.
+
+**Scripting:**
+```python
+from parameter_config import StudyConfig, ParameterConfig, ParameterType, ObjectiveConfig, ContextConfig
+from optuna_builder import build_study, ask_batch, tell_batch
+
+config = StudyConfig(
+    parameters=[
+        ParameterConfig(name="temperature", ptype=ParameterType.FLOAT,
+                        full_min=50.0, full_max=200.0),
+    ],
+    objectives=[ObjectiveConfig(column_name="yield_pct", direction="maximize")],
+    context_variables=[
+        ContextConfig("humidity_pct", description="Ambient humidity (%)"),
+    ],
+    batch_size=3,
+    sampler_name="TPE",
+)
+
+# Context values come from any source: database, sensor API, manual measurement
+current_context = {"humidity_pct": fetch_from_sensor()}
+
+trials = ask_batch(study, config, config.batch_size, context=current_context)
+
+# After running experiments — correct if actual conditions differed
+actual_context = [{"humidity_pct": 35.0}] * len(trials)   # e.g. humidity was higher
+tell_batch(study, [t.number for t in trials], results,
+           context_values=actual_context)
+```
+
+> 📖 Full guide → [§ 3.11 Context Variables](DOCUMENTATION.md#311-context-variables-uncontrollable-environmental-conditions)
 
 ---
 

@@ -4,7 +4,7 @@ Reads CSV data, infers parameter types, and extracts sensible defaults.
 """
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -87,19 +87,33 @@ def infer_column_type(series: pd.Series, categorical_threshold: int = 8) -> Para
 def extract_param_defaults(
     df: pd.DataFrame,
     result_columns: List[str],
+    context_columns: Optional[List[str]] = None,
     categorical_threshold: int = 8,
 ) -> List[ParameterConfig]:
     """
-    Build a ParameterConfig for each non-result column in *df*.
+    Build a ParameterConfig for each non-result, non-context column in *df*.
 
     - INT / FLOAT : full_min/max come from the data;
                     allowed_subranges defaults to [full_min, full_max].
     - CATEGORICAL  : all_choices = sorted unique string values; all allowed.
     - BOOL         : fixed_value = None (optimise both), choices = [True, False].
+
+    Parameters
+    ----------
+    df
+        The experiment DataFrame.
+    result_columns
+        Columns that are optimisation objectives — excluded from parameters.
+    context_columns
+        Columns that are uncontrollable context variables — excluded from
+        parameters (they are stored separately in ContextConfig objects).
+    categorical_threshold
+        Numeric columns with ≤ this many unique values are treated as CATEGORICAL.
     """
+    _exclude = set(result_columns) | set(context_columns or [])
     configs: List[ParameterConfig] = []
     for col in df.columns:
-        if col in result_columns:
+        if col in _exclude:
             continue
 
         series = df[col]
@@ -161,12 +175,19 @@ def load_trials_from_csv(df: pd.DataFrame, config: StudyConfig) -> List[dict]:
 
     Returns
     -------
-    list of {"params": {col: val, ...}, "values": [float, ...]}
+    list of {"params": {col: val, ...}, "values": [float, ...],
+             "user_attrs": {"ctx_<name>": float, ...}}
+
+    Context variable values (from config.context_variables) are stored with
+    the ``ctx_`` prefix in ``user_attrs`` so the surrogate can learn from them
+    without them entering the Optuna search space.
+
     Values list order matches config.objectives order.
     Safe to call multiple times — the caller deduplicates before adding.
     """
     obj_cols = [o.column_name for o in config.objectives]
     param_names = [p.name for p in config.parameters if p.enabled]
+    ctx_cols = [c.column_name for c in getattr(config, "context_variables", [])]
 
     results: List[dict] = []
     for _, row in df.iterrows():
@@ -182,9 +203,57 @@ def load_trials_from_csv(df: pd.DataFrame, config: StudyConfig) -> List[dict]:
         if len(params) < len([n for n in param_names if n in row.index]):
             continue
         values = [float(row[c]) for c in obj_cols]
-        results.append({"params": params, "values": values})
+
+        # Collect context variable values with ctx_ prefix
+        ctx_attrs: dict = {}
+        for col in ctx_cols:
+            if col in row.index and not pd.isna(row[col]):
+                ctx_attrs[f"ctx_{col}"] = float(row[col])
+
+        results.append({"params": params, "values": values, "user_attrs": ctx_attrs})
 
     return results
+
+
+def infer_context_defaults(
+    df: pd.DataFrame,
+    context_columns: List[str],
+) -> List[Dict[str, float]]:
+    """
+    Return summary statistics for context variable columns.
+
+    Used by the GUI to pre-fill the "Current Conditions" spinboxes with
+    sensible default values derived from historical data.
+
+    Parameters
+    ----------
+    df
+        The experiment DataFrame (may contain NaN values in context columns).
+    context_columns
+        Names of columns that are context variables.
+
+    Returns
+    -------
+    List of dicts, one per context column, with keys:
+        ``column_name``, ``min``, ``max``, ``mean``
+    Columns with no valid (non-NaN) data get ``min=0, max=1, mean=0``.
+    """
+    result = []
+    for col in context_columns:
+        if col not in df.columns:
+            result.append({"column_name": col, "min": 0.0, "max": 1.0, "mean": 0.0})
+            continue
+        non_null = df[col].dropna()
+        if len(non_null) == 0:
+            result.append({"column_name": col, "min": 0.0, "max": 1.0, "mean": 0.0})
+        else:
+            result.append({
+                "column_name": col,
+                "min": float(non_null.min()),
+                "max": float(non_null.max()),
+                "mean": float(non_null.mean()),
+            })
+    return result
 
 
 def aggregate_replicates(

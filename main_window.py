@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
 
 from batch_results_dialog import BatchResultsDialog
 from design_space_widget import ConvergenceWidget, DesignSpaceDialog, ParetoWidget
-from csv_loader import aggregate_replicates, extract_param_defaults, load_csv, load_trials_from_csv
+from csv_loader import aggregate_replicates, extract_param_defaults, infer_context_defaults, load_csv, load_trials_from_csv
 from report_generator import export_plots_as_png, generate_report, write_report
 from surrogate_quality import MIN_TRIALS, compute_surrogate_quality, predict_batch
 from optuna_builder import (
@@ -567,6 +567,16 @@ class MainWindow(QMainWindow):
         # Replicate aggregation UI widgets (rebuilt when a CSV is loaded)
         self._repl_cb: Optional[QCheckBox] = None
         self._repl_tol_le: Optional[QLineEdit] = None
+        # Context variable UI: (col_name, QCheckBox) per column
+        self._ctx_col_checkboxes: List[tuple] = []
+        # Context condition spinboxes shown in Settings tab: {col_name: QDoubleSpinBox}
+        self._context_spinboxes: dict = {}
+        # Planned context group box (created once, shown/hidden dynamically)
+        self._ctx_conditions_group: Optional[QGroupBox] = None
+        # Planned context values passed to worker (set just before asking)
+        self._planned_context: Optional[dict] = None
+        # Reference to results dialog so we can collect context corrections after submit
+        self._active_batch_dlg: Optional[BatchResultsDialog] = None
 
         self._build_menu()
         self._build_toolbar()
@@ -1126,6 +1136,28 @@ class MainWindow(QMainWindow):
             self._obj_inner_layout.addWidget(row_w)
             self._obj_col_rows.append((col, cb, dir_combo))
 
+        # ── Context Variables section ─────────────────────────────────────
+        self._ctx_col_checkboxes = []
+        ctx_header = QLabel("Context variables (uncontrollable conditions):")
+        ctx_header.setToolTip(
+            "Mark columns that are measured environmental conditions you cannot\n"
+            "control (e.g. humidity, atmospheric pressure, reagent purity).\n"
+            "The surrogate will learn from them without suggesting their values."
+        )
+        ctx_header.setStyleSheet("color: #a6e3a1; font-size: 11px;")
+        self._obj_inner_layout.addWidget(ctx_header)
+
+        for col in df.columns:
+            ctx_cb = QCheckBox(col)
+            ctx_cb.setStyleSheet("color: #a6e3a1;")
+            ctx_cb.setToolTip(
+                f"Mark '{col}' as a context variable.\n"
+                "It will be excluded from the parameter search space and treated\n"
+                "as an environmental condition the surrogate can learn from."
+            )
+            self._obj_inner_layout.addWidget(ctx_cb)
+            self._ctx_col_checkboxes.append((col, ctx_cb))
+
         # ── Replicate aggregation controls (Feature 8) ────────────────────
         repl_row = QWidget()
         repl_layout = QHBoxLayout(repl_row)
@@ -1195,16 +1227,39 @@ class MainWindow(QMainWindow):
 
         objectives = [ObjectiveConfig(col, direction) for col, direction in selected]
         result_cols = [o.column_name for o in objectives]
-        params = extract_param_defaults(self._df, result_cols)
+
+        # Collect context variable columns (checked green checkboxes)
+        # Validate mutual exclusivity with objectives
+        obj_col_set = set(result_cols)
+        from parameter_config import ContextConfig
+        ctx_configs = []
+        ctx_col_names = []
+        for col, ctx_cb in self._ctx_col_checkboxes:
+            if ctx_cb.isChecked():
+                if col in obj_col_set:
+                    QMessageBox.warning(
+                        self, "Column Conflict",
+                        f"Column '{col}' cannot be both an objective and a context variable.\n"
+                        "Please uncheck it from one of the two sections."
+                    )
+                    return
+                ctx_configs.append(ContextConfig(column_name=col))
+                ctx_col_names.append(col)
+
+        params = extract_param_defaults(self._df, result_cols, context_columns=ctx_col_names)
 
         config = StudyConfig(
             parameters=params,
             objectives=objectives,
             constraints=list(self._constraints),
+            context_variables=ctx_configs,
             batch_size=self._batch_size_spin.value(),
             n_batches=self._n_batches_spin.value(),
             sampler_name=self._sampler_combo.currentText(),
         )
+
+        # Rebuild the Current Conditions spinboxes for any context variables
+        self._rebuild_context_conditions_ui(ctx_configs)
 
         # Create a new session if one doesn't exist yet
         if self._session_state is None:
@@ -1347,6 +1402,88 @@ class MainWindow(QMainWindow):
     # Parameter cards
     # ══════════════════════════════════════════════════════════════════════
 
+    def _rebuild_context_conditions_ui(self, ctx_configs: list) -> None:
+        """
+        Create or update the "🌡 Current Conditions" group box in the Settings
+        scrollable area.  Called by _action_apply_objectives whenever the set
+        of context variables changes.
+
+        If no context variables are defined the group is hidden.
+        """
+        # Remove the old group box from the layout if it exists
+        if self._ctx_conditions_group is not None:
+            self._ctx_conditions_group.hide()
+            self._ctx_conditions_group.deleteLater()
+            self._ctx_conditions_group = None
+        self._context_spinboxes.clear()
+
+        if not ctx_configs:
+            return   # no context variables — nothing to show
+
+        # Build the group box
+        from parameter_config import ContextConfig
+        grp = QGroupBox("🌡  Current Conditions")
+        grp.setToolTip(
+            "Enter expected environmental conditions for the NEXT batch of experiments.\n"
+            "These values are used to condition the surrogate suggestions.\n"
+            "You can correct them per-trial in the Batch Results Dialog if\n"
+            "actual conditions differed from planned."
+        )
+        grp_layout = QVBoxLayout(grp)
+
+        help_lbl = QLabel(
+            "<i>Enter expected conditions before asking for the next batch.<br>"
+            "Correct per-trial in the results dialog if conditions differed.</i>"
+        )
+        help_lbl.setWordWrap(True)
+        help_lbl.setTextFormat(Qt.RichText)
+        help_lbl.setStyleSheet("color: #a6e3a1; font-size: 11px;")
+        grp_layout.addWidget(help_lbl)
+
+        # One spinbox per context variable, pre-filled with historical mean
+        ctx_defaults: dict = {}
+        if self._df is not None:
+            col_names = [c.column_name for c in ctx_configs]
+            for d in infer_context_defaults(self._df, col_names):
+                ctx_defaults[d["column_name"]] = d["mean"]
+
+        form = QFormLayout()
+        form.setSpacing(4)
+        for cv in ctx_configs:
+            spin = QDoubleSpinBox()
+            spin.setRange(-1e9, 1e9)
+            spin.setDecimals(4)
+            spin.setSingleStep(1.0)
+            default = ctx_defaults.get(cv.column_name, 0.0)
+            spin.setValue(default)
+            spin.setToolTip(
+                f"Planned value of '{cv.column_name}' for the next experiments.\n"
+                f"Historical mean: {default:.4g}"
+            )
+            label_text = cv.description if cv.description else cv.column_name
+            form.addRow(f"{label_text}:", spin)
+            self._context_spinboxes[cv.column_name] = spin
+
+        grp_layout.addLayout(form)
+        self._ctx_conditions_group = grp
+
+        # Insert just before the warning label in the scrollable vbox.
+        # The scrollable content widget's layout is the one inside _settings_scroll.
+        # We find it via the warning label's parent layout.
+        vbox = self._warning_label.parent().layout()
+        if vbox is not None:
+            # Find the index of the warning label so we can insert before it
+            warn_idx = -1
+            for i in range(vbox.count()):
+                if vbox.itemAt(i) and vbox.itemAt(i).widget() is self._warning_label:
+                    warn_idx = i
+                    break
+            if warn_idx >= 0:
+                vbox.insertWidget(warn_idx, grp)
+            else:
+                vbox.addWidget(grp)
+        grp.show()
+
     def _build_param_cards(self, params: List[ParameterConfig]) -> None:
         self._placeholder_lbl.hide()
 
@@ -1445,6 +1582,21 @@ class MainWindow(QMainWindow):
         self._worker.optimization_done.connect(self._on_optimization_done)
         self._worker.error.connect(self._on_worker_error)
 
+        # Collect planned context values from the Current Conditions spinboxes
+        if self._context_spinboxes:
+            self._planned_context = {
+                col: spin.value()
+                for col, spin in self._context_spinboxes.items()
+            }
+            self._worker.planned_context = self._planned_context
+            # Persist planned context in session state for resume support
+            if self._session_state:
+                self._session_state.pending_planned_context = self._planned_context
+                SessionManager.save(self._session_state)
+        else:
+            self._planned_context = None
+            self._worker.planned_context = None
+
         self._ask_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)
         self._set_status("Asking batch…")
@@ -1497,7 +1649,9 @@ class MainWindow(QMainWindow):
             existing_trials=_existing,
             study=self._study,
             predictions=_predictions,
+            planned_context=self._planned_context,
         )
+        self._active_batch_dlg = dlg   # keep ref so _on_results_submitted can call get_context_corrections()
         dlg.results_submitted.connect(self._on_results_submitted)
         if dlg.exec() != QDialog.Accepted:
             # User closed/cancelled the dialog without submitting results.
@@ -1532,7 +1686,16 @@ class MainWindow(QMainWindow):
         # Append actual compositions + results to the CSV before telling Optuna
         self._append_results_to_csv(results)
         if self._worker:
+            # Collect context corrections (actual conditions) from the dialog
+            # and pass them to the worker before unblocking it.
+            if self._active_batch_dlg is not None:
+                try:
+                    ctx_corrections = self._active_batch_dlg.get_context_corrections()
+                    self._worker.pending_context_values = ctx_corrections
+                except Exception:
+                    self._worker.pending_context_values = None
             self._worker.submit_results(results)
+        self._active_batch_dlg = None
         self._update_pending_btn_state()
         self._set_status("Submitting results…")
 

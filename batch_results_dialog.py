@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from parameter_config import ObjectiveConfig
+from parameter_config import ContextConfig, ObjectiveConfig
 from sampler_utils import find_near_duplicates
 from session_manager import SessionManager, SessionState
 
@@ -92,6 +92,7 @@ class BatchResultsDialog(QDialog):
         existing_trials: Optional[List[dict]] = None,   # Feature 4: near-duplicate detection
         study=None,                                      # optuna.Study — for Skip/purge
         predictions: Optional[List] = None,             # RF-predicted objective values
+        planned_context: Optional[dict] = None,         # Context variable conditions for this batch
     ) -> None:
         super().__init__(parent)
         self._pending_batch = list(pending_batch)   # copy so we can mutate
@@ -100,6 +101,13 @@ class BatchResultsDialog(QDialog):
         self._existing_trials = existing_trials
         self._study = study
         self._predictions = predictions             # list[float | None] or None
+        # Context variable definitions and planned values for this batch
+        self._planned_context: dict = planned_context or {}
+        self._ctx_vars: List[ContextConfig] = []
+        if session_state and session_state.study_config:
+            self._ctx_vars = list(getattr(session_state.study_config, "context_variables", []))
+        # Per-row context spinboxes: _ctx_spins[row][ctx_idx]
+        self._ctx_spins: List[List[QDoubleSpinBox]] = []
         # Set of trial numbers the user has chosen to skip (purge)
         self._skipped_trials: set[int] = set()
         # Near-duplicate hits (list of dicts from find_near_duplicates)
@@ -191,8 +199,16 @@ class BatchResultsDialog(QDialog):
         _pred_col_labels = (
             [f"Predicted {obj_names[0]}"] if _has_preds and obj_names else []
         )
+        # Context variable columns (editable — user can correct planned vs. actual)
+        _ctx_col_labels = (
+            [f"{cv.column_name} (context)" for cv in self._ctx_vars]
+            if self._ctx_vars else []
+        )
         # "Action" column (Skip button) is always the last column
-        all_cols = ["Trial #"] + param_names + obj_names + _pred_col_labels + ["Action"]
+        all_cols = (
+            ["Trial #"] + param_names + obj_names + _pred_col_labels
+            + _ctx_col_labels + ["Action"]
+        )
 
         self._table = QTableWidget(len(self._pending_batch), len(all_cols))
         self._table.setHorizontalHeaderLabels(all_cols)
@@ -215,8 +231,23 @@ class BatchResultsDialog(QDialog):
             "composition you achieved in the lab."
         )
 
+        # Spinbox style for context columns (light purple background)
+        _CTX_SPIN_STYLE = (
+            "QDoubleSpinBox {"
+            "  background-color: #e9d5ff;"
+            "  color: #1a1a2e;"
+            "  border: 2px solid #a855f7;"
+            "  border-radius: 4px;"
+            "  padding: 6px 8px;"
+            "  font-size: 13px;"
+            "  min-height: 32px;"
+            "}"
+            "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; }"
+        )
+
         # Store spinboxes: self._obj_spins[row][obj_idx]
         self._obj_spins: List[List[QDoubleSpinBox]] = []
+        self._ctx_spins = []   # reset (also set in __init__)
         self._param_names = param_names
         self._obj_names = obj_names
 
@@ -300,6 +331,32 @@ class BatchResultsDialog(QDialog):
                 pred_item.setFont(font)
                 self._table.setItem(row_idx, col, pred_item)
                 col += 1
+
+            # ── Context variable spinboxes (planned → actual corrections) ──
+            row_ctx_spins: List[QDoubleSpinBox] = []
+            for cv in self._ctx_vars:
+                ctx_spin = QDoubleSpinBox()
+                ctx_spin.setRange(-1e9, 1e9)
+                ctx_spin.setDecimals(4)
+                ctx_spin.setSingleStep(0.1)
+                ctx_spin.setStyleSheet(_CTX_SPIN_STYLE)
+                ctx_spin.setMinimumHeight(34)
+                ctx_spin.setToolTip(
+                    f"Actual measured value of '{cv.column_name}' during this experiment.\n"
+                    "Pre-filled with the planned condition — correct if the actual\n"
+                    "conditions differed (e.g. humidity spike, pressure change)."
+                )
+                # Pre-fill with planned context value
+                planned_val = self._planned_context.get(cv.column_name)
+                if planned_val is not None:
+                    try:
+                        ctx_spin.setValue(float(planned_val))
+                    except (TypeError, ValueError):
+                        ctx_spin.setValue(0.0)
+                self._table.setCellWidget(row_idx, col, ctx_spin)
+                row_ctx_spins.append(ctx_spin)
+                col += 1
+            self._ctx_spins.append(row_ctx_spins)
 
             # ── Skip (Purge) button ────────────────────────────────────────
             skip_label = "⚠  Skip (Duplicate)" if is_dup else "Skip Trial"
@@ -717,6 +774,44 @@ class BatchResultsDialog(QDialog):
         )
 
     # ── Public API ─────────────────────────────────────────────────────────
+
+    def get_context_corrections(self) -> List[dict]:
+        """
+        Return the actual context values entered by the user for each trial row.
+
+        Returns
+        -------
+        List of dicts, one per pending trial (in order), mapping context variable
+        column names to the float value in the corresponding spinbox.
+        Skipped trials get an empty dict ``{}``.
+
+        Example output (2 rows, 1 context variable)::
+
+            [
+                {"humidity_pct": 65.0},   # trial 0 — user corrected to 65
+                {"humidity_pct": 72.3},   # trial 1
+            ]
+
+        Called by the main window after ``results_submitted`` is emitted.
+        """
+        corrections: List[dict] = []
+        for row_idx in range(len(self._pending_batch)):
+            trial_number = self._pending_batch[row_idx]["trial_number"]
+            if trial_number in self._skipped_trials:
+                corrections.append({})
+                continue
+            row_dict: dict = {}
+            if row_idx < len(self._ctx_spins):
+                for ctx_idx, cv in enumerate(self._ctx_vars):
+                    if ctx_idx < len(self._ctx_spins[row_idx]):
+                        try:
+                            row_dict[cv.column_name] = float(
+                                self._ctx_spins[row_idx][ctx_idx].value()
+                            )
+                        except Exception:
+                            pass
+            corrections.append(row_dict)
+        return corrections
 
     def prefill_results(self, matches: Dict[int, List[float]]) -> None:
         """

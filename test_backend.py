@@ -1579,3 +1579,334 @@ class TestParetoScatter:
         tell_batch(study, [trials[1].number], [[3.0, 1.0]])
         pareto = get_pareto_front(study)
         assert len(pareto) == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Context Variables — new tests (Phases 1, 2, 3, 4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+from parameter_config import ContextConfig
+from csv_loader import infer_context_defaults
+
+
+class TestContextConfig:
+    """Phase 1 — ContextConfig serialisation."""
+
+    def test_round_trip(self):
+        cc = ContextConfig(column_name="humidity_pct", description="Ambient humidity (%)")
+        d = cc.to_dict()
+        cc2 = ContextConfig.from_dict(d)
+        assert cc2.column_name == cc.column_name
+        assert cc2.description == cc.description
+
+    def test_round_trip_no_description(self):
+        cc = ContextConfig(column_name="pressure")
+        cc2 = ContextConfig.from_dict(cc.to_dict())
+        assert cc2.column_name == "pressure"
+        assert cc2.description == ""
+
+    def test_study_config_with_context_variables_round_trip(self):
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("temp", ParameterType.FLOAT, full_min=50, full_max=200)],
+            objectives=[ObjectiveConfig("yield", "maximize")],
+            context_variables=[
+                ContextConfig("humidity", "Ambient humidity"),
+                ContextConfig("pressure", "Atmospheric pressure"),
+            ],
+        )
+        d = cfg.to_dict()
+        cfg2 = StudyConfig.from_dict(d)
+        assert len(cfg2.context_variables) == 2
+        assert cfg2.context_variables[0].column_name == "humidity"
+        assert cfg2.context_variables[1].column_name == "pressure"
+
+    def test_old_session_json_no_context_variables_key(self):
+        """Old sessions without 'context_variables' must deserialise without error."""
+        d = {
+            "parameters": [],
+            "objectives": [{"column_name": "y", "direction": "minimize"}],
+            "constraints": [],
+            # no "context_variables" key
+            "batch_size": 1, "n_batches": 5, "sampler_name": "TPE",
+            "replicate_aggregation": False, "replicate_tolerance": 1e-6,
+            "auto_stop": False, "auto_stop_min_improvement": 0.01, "auto_stop_n_batches": 3,
+        }
+        cfg = StudyConfig.from_dict(d)
+        assert cfg.context_variables == []
+
+
+class TestCsvLoaderContext:
+    """Phase 2 — csv_loader context handling."""
+
+    def _df(self):
+        return pd.DataFrame({
+            "temperature": [100.0, 150.0, 200.0],
+            "humidity":    [60.0,  75.0,  50.0],
+            "yield_pct":   [0.80,  0.85,  0.78],
+        })
+
+    def test_extract_param_defaults_excludes_context(self):
+        from csv_loader import extract_param_defaults
+        df = self._df()
+        params = extract_param_defaults(df, ["yield_pct"], context_columns=["humidity"])
+        names = [p.name for p in params]
+        assert "temperature" in names
+        assert "humidity" not in names
+        assert "yield_pct" not in names
+
+    def test_load_trials_populates_ctx_user_attrs(self):
+        df = self._df()
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("temperature", ParameterType.FLOAT, full_min=50, full_max=250)],
+            objectives=[ObjectiveConfig("yield_pct", "maximize")],
+            context_variables=[ContextConfig("humidity")],
+        )
+        trials = load_trials_from_csv(df, cfg)
+        assert len(trials) == 3
+        # Every trial should have ctx_humidity in user_attrs
+        for t in trials:
+            assert "ctx_humidity" in t["user_attrs"]
+            assert isinstance(t["user_attrs"]["ctx_humidity"], float)
+
+    def test_load_trials_handles_missing_context_gracefully(self):
+        """Rows with NaN humidity should still be loaded; ctx_humidity omitted."""
+        df = pd.DataFrame({
+            "temperature": [100.0, 150.0],
+            "humidity":    [60.0,  float("nan")],
+            "yield_pct":   [0.80,  0.85],
+        })
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("temperature", ParameterType.FLOAT, full_min=50, full_max=250)],
+            objectives=[ObjectiveConfig("yield_pct", "maximize")],
+            context_variables=[ContextConfig("humidity")],
+        )
+        trials = load_trials_from_csv(df, cfg)
+        assert len(trials) == 2
+        # First trial has ctx_humidity, second does not (was NaN)
+        assert "ctx_humidity" in trials[0]["user_attrs"]
+        assert "ctx_humidity" not in trials[1]["user_attrs"]
+
+    def test_infer_context_defaults(self):
+        df = self._df()
+        defaults = infer_context_defaults(df, ["humidity"])
+        assert len(defaults) == 1
+        d = defaults[0]
+        assert d["column_name"] == "humidity"
+        assert d["min"] == pytest.approx(50.0)
+        assert d["max"] == pytest.approx(75.0)
+        assert d["mean"] == pytest.approx((60 + 75 + 50) / 3)
+
+    def test_infer_context_defaults_missing_column(self):
+        df = self._df()
+        defaults = infer_context_defaults(df, ["nonexistent"])
+        assert defaults[0]["min"] == 0.0
+        assert defaults[0]["max"] == 1.0
+        assert defaults[0]["mean"] == 0.0
+
+
+class TestTellBatchContext:
+    """Phase 3 — tell_batch context_values stores ctx_ user_attrs."""
+
+    def _simple_cfg(self):
+        return StudyConfig(
+            parameters=[ParameterConfig("x", ParameterType.FLOAT, full_min=0, full_max=1)],
+            objectives=[ObjectiveConfig("y", "minimize")],
+            context_variables=[ContextConfig("humidity")],
+            sampler_name="Random",
+        )
+
+    def test_tell_batch_with_context_stores_user_attrs(self, tmp_path):
+        cfg = self._simple_cfg()
+        study = build_study(cfg, str(tmp_path / "ctx.db"), "ctx")
+        trials = ask_batch(study, cfg, 1)
+        context_values = [{"humidity": 65.0}]
+        tell_batch(
+            study,
+            [trials[0].number],
+            [[0.5]],
+            config=cfg,
+            context_values=context_values,
+        )
+        complete = [t for t in study.trials if t.state.name == "COMPLETE"]
+        assert len(complete) >= 1
+        last = complete[-1]
+        assert "ctx_humidity" in last.user_attrs
+        assert last.user_attrs["ctx_humidity"] == pytest.approx(65.0)
+
+    def test_tell_batch_no_context_backward_compat(self, tmp_path):
+        """tell_batch without context_values behaves as before."""
+        cfg = self._simple_cfg()
+        study = build_study(cfg, str(tmp_path / "ctx2.db"), "ctx2")
+        trials = ask_batch(study, cfg, 1)
+        tell_batch(study, [trials[0].number], [[0.3]])
+        complete = [t for t in study.trials if t.state.name == "COMPLETE"]
+        assert len(complete) >= 1
+
+    def test_tell_batch_partial_context(self, tmp_path):
+        """context_values list shorter than trial_numbers is handled gracefully."""
+        cfg = self._simple_cfg()
+        study = build_study(cfg, str(tmp_path / "ctx3.db"), "ctx3")
+        trials = ask_batch(study, cfg, 2)
+        tell_batch(
+            study,
+            [t.number for t in trials],
+            [[0.4], [0.6]],
+            config=cfg,
+            context_values=[{"humidity": 50.0}],  # only for trial 0
+        )
+        # Should not raise — trial 1 simply gets no ctx attrs
+
+
+class TestContextualSurrogate:
+    """Phase 4 — ContextualSurrogate unit tests."""
+
+    def _cfg(self):
+        return StudyConfig(
+            parameters=[ParameterConfig("x", ParameterType.FLOAT, full_min=0, full_max=1)],
+            objectives=[ObjectiveConfig("y", "minimize")],
+            context_variables=[ContextConfig("humidity")],
+            sampler_name="Random",
+        )
+
+    def _seed_study(self, study, cfg, n=20):
+        """Add n complete trials with synthetic ctx_humidity user_attrs."""
+        import numpy as np
+        from optuna.trial import FrozenTrial, TrialState
+        from optuna.distributions import FloatDistribution
+        from datetime import datetime
+        rng = np.random.default_rng(0)
+        dists = {"x": FloatDistribution(0.0, 1.0)}
+        for i in range(n):
+            x = float(rng.uniform(0, 1))
+            humidity = float(rng.uniform(40, 90))
+            # y = (x - 0.5)^2 + 0.01 * humidity (humidity adds noise)
+            y = (x - 0.5) ** 2 + 0.01 * humidity
+            frozen = FrozenTrial(
+                number=i,
+                trial_id=-1,
+                state=TrialState.COMPLETE,
+                value=y,
+                values=None,
+                datetime_start=datetime.now(),
+                datetime_complete=datetime.now(),
+                params={"x": x},
+                distributions=dists,
+                user_attrs={"ctx_humidity": humidity},
+                system_attrs={},
+                intermediate_values={},
+            )
+            study.add_trial(frozen)
+
+    def test_fit_returns_false_insufficient_data(self, tmp_path):
+        from contextual_sampler import ContextualSurrogate
+        cfg = self._cfg()
+        study = build_study(cfg, str(tmp_path / "cs1.db"), "cs1")
+        surrogate = ContextualSurrogate(cfg)
+        # No trials → should return False
+        assert surrogate.fit(study) is False
+
+    def test_fit_returns_true_sufficient_data(self, tmp_path):
+        from contextual_sampler import ContextualSurrogate
+        cfg = self._cfg()
+        study = build_study(cfg, str(tmp_path / "cs2.db"), "cs2")
+        self._seed_study(study, cfg, n=20)
+        surrogate = ContextualSurrogate(cfg)
+        assert surrogate.fit(study) is True
+
+    def test_suggest_returns_correct_keys(self, tmp_path):
+        from contextual_sampler import ContextualSurrogate
+        cfg = self._cfg()
+        study = build_study(cfg, str(tmp_path / "cs3.db"), "cs3")
+        self._seed_study(study, cfg, n=20)
+        surrogate = ContextualSurrogate(cfg)
+        surrogate.fit(study)
+        suggestions = surrogate.suggest({"humidity": 65.0}, n_return=2)
+        assert len(suggestions) == 2
+        for s in suggestions:
+            assert "x" in s
+
+    def test_suggest_respects_bounds(self, tmp_path):
+        from contextual_sampler import ContextualSurrogate
+        cfg = self._cfg()
+        study = build_study(cfg, str(tmp_path / "cs4.db"), "cs4")
+        self._seed_study(study, cfg, n=20)
+        surrogate = ContextualSurrogate(cfg)
+        surrogate.fit(study)
+        suggestions = surrogate.suggest({"humidity": 65.0}, n_return=5)
+        for s in suggestions:
+            assert 0.0 <= s["x"] <= 1.0
+
+    def test_suggest_missing_context_uses_imputation(self, tmp_path):
+        """suggest() with empty context should not crash — imputes mean."""
+        from contextual_sampler import ContextualSurrogate
+        cfg = self._cfg()
+        study = build_study(cfg, str(tmp_path / "cs5.db"), "cs5")
+        self._seed_study(study, cfg, n=20)
+        surrogate = ContextualSurrogate(cfg)
+        surrogate.fit(study)
+        # Empty context — ctx_humidity is imputed
+        suggestions = surrogate.suggest({}, n_return=1)
+        assert len(suggestions) == 1
+
+
+class TestContextualIntegration:
+    """Phase 10.5 — Full contextual loop integration test."""
+
+    def test_full_contextual_loop(self, tmp_path):
+        """
+        Create config with 1 param + 1 context variable.
+        Seed 20 trials. Ask batch with context. Verify ctx stored in user_attrs.
+        """
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("temperature", ParameterType.FLOAT,
+                                        full_min=50, full_max=200)],
+            objectives=[ObjectiveConfig("yield_pct", "maximize")],
+            context_variables=[ContextConfig("humidity_pct")],
+            sampler_name="Random",
+        )
+        study = build_study(cfg, str(tmp_path / "integ.db"), "integ")
+
+        # Seed historical data with context
+        import numpy as np
+        from optuna.trial import FrozenTrial, TrialState
+        from optuna.distributions import FloatDistribution
+        from datetime import datetime
+        rng = np.random.default_rng(42)
+        dists = {"temperature": FloatDistribution(50.0, 200.0)}
+        for i in range(20):
+            temp = float(rng.uniform(50, 200))
+            hum = float(rng.uniform(30, 80))
+            y = -(temp - 150) ** 2 / 10000 + 0.9 - 0.002 * hum
+            frozen = FrozenTrial(
+                number=i, trial_id=-1,
+                state=TrialState.COMPLETE,
+                value=None, values=[y],
+                datetime_start=datetime.now(), datetime_complete=datetime.now(),
+                params={"temperature": temp},
+                distributions=dists,
+                user_attrs={"ctx_humidity_pct": hum},
+                system_attrs={}, intermediate_values={},
+            )
+            study.add_trial(frozen)
+
+        # Ask batch with context — should activate contextual sampler
+        trials = ask_batch(study, cfg, batch_size=2, context={"humidity_pct": 65.0})
+        assert len(trials) == 2
+
+        # Tell with actual context (slightly different from planned)
+        actual_ctx = [{"humidity_pct": 68.0}, {"humidity_pct": 70.0}]
+        tell_batch(
+            study,
+            [t.number for t in trials],
+            [[0.82], [0.79]],
+            config=cfg,
+            context_values=actual_ctx,
+        )
+
+        # Verify context stored in completed trials
+        complete = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        # At least the 2 new trials should have ctx_humidity_pct
+        new_trials = [t for t in complete if t.number >= 20]
+        assert len(new_trials) == 2
+        for t in new_trials:
+            assert "ctx_humidity_pct" in t.user_attrs
