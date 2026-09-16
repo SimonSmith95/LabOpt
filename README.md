@@ -64,6 +64,8 @@ python main.py
 | **Replicate aggregation** | Merge near-duplicate rows and average their objective values |
 | **Auto-stop** | Halt automatically when the best value has converged |
 | **Headless / scripting API** | Run the full loop from Python with no GUI — context values accepted from any source (database, sensor, CSV) |
+| **Power Analysis** | Sample-size calculator: given measurement spread σ and minimum detectable effect Δ, compute required N — with live power-curve and N-vs-Δ plots |
+| **Surrogate Validation** | Rigorous §0–§5 checks: data quality, RF + GP hold-out and cross-validated accuracy, virtual BO benchmark (GP+EI vs RF+EI vs Greedy vs Random), Expected Improvement marginals, pass/fail summary. Triggered from the Results tab checkbox. Results embedded in the HTML report and shown as tabs in the Design Space dialog. Requires ≥ 30 unique rows. |
 
 ---
 
@@ -147,6 +149,25 @@ tell_batch(study, [t.number for t in trials], results,
 
 ---
 
+## Power Analysis — Sample Size Calculator
+
+Before committing to an experiment campaign, use the **🔬 Power** tab to answer:
+> *"How many experiments N do I need to reliably detect an improvement of Δ, given that my measurements have a spread of σ?"*
+
+The key relationship is **Cohen's d = Δ / σ** — the ratio of the effect you want to detect to the noise in your measurements:
+
+| Cohen's d | Effect size | N needed (α=0.05, power=0.80) |
+|---|---|---|
+| 0.2 | Small | ~197 |
+| 0.5 | Medium | ~32 |
+| 0.8 | Large | ~13 |
+
+Click **📊 From data** to auto-fill σ from your loaded objective column. The live plots update instantly as you adjust inputs.
+
+> 📖 Full guide → [§ 3.12 Power Analysis](DOCUMENTATION.md#312-power-analysis--sample-size-calculator)
+
+---
+
 ## Multi-Objective Optimisation
 
 Select more than one result column in the Objectives panel. LabOpt switches automatically to NSGA-II and shows the Pareto front in the Results tab.
@@ -207,6 +228,38 @@ for _ in range(config.n_batches):
 
 ---
 
+## Surrogate Validation
+
+Before trusting the model's suggestions, verify that the surrogate is actually learning from your data. Tick **🔬 Surrogate Validation** in the Results tab (next to Export Report):
+
+```
+📊 Results tab  →  [📄 Export Report…]  [🔬 Surrogate Validation  ☐]
+                   [████████████████░░░░]  45% — §2 BO Benchmark…
+                   ✅  6/8 checks passed  (YELLOW)
+```
+
+The engine runs five sections:
+
+| Section | What it checks |
+|---|---|
+| §0 Data Quality | Distribution of the objective; within-replicate variability |
+| §1 Surrogate Accuracy | RF + GP hold-out Pearson r & Spearman ρ; CV RMSE < 30 % of range |
+| §2 BO Benchmark | GP+EI / RF+EI / Greedy / Random strategies on a fixed pool — does BO beat random? |
+| §3 EI Marginals | 1-D Expected Improvement sweep per parameter — where should you explore next? |
+| §5 Pass/Fail | 8 dataset-agnostic checks with GREEN / YELLOW / RED overall rating |
+
+**Requirements:**
+- ≥ 30 unique rows in the loaded CSV.
+- Runtime: 1–2 min (30 rows) to 6–10 min (200 rows), depending on dataset size.
+
+**Results:**
+- 7 new tabs appear in the Design Space dialog automatically.
+- All 7 plots are embedded in the **📄 Export Report** HTML.
+
+> 📖 Full guide → [§ 3.13 Surrogate Validation](DOCUMENTATION.md#313-surrogate-validation)
+
+---
+
 ## Design Space Visualisation
 
 Open **📊 Design Space…** in the Results tab for:
@@ -228,6 +281,8 @@ All details, module references, architecture diagrams, and troubleshooting are i
 | Section | Topic |
 |---|---|
 | [§ 3](DOCUMENTATION.md#3-how-to-use-the-application-gui-walkthrough) | Complete GUI walkthrough |
+| [§ 3.11](DOCUMENTATION.md#311-context-variables-uncontrollable-environmental-conditions) | Context variables — how the surrogate learns from uncontrollable conditions |
+| [§ 3.12](DOCUMENTATION.md#312-power-analysis--sample-size-calculator) | Power Analysis — sample size calculator |
 | [§ 4](DOCUMENTATION.md#4-headless--scripting-mode) | Headless / scripting API |
 | [§ 5](DOCUMENTATION.md#5-codebase-architecture) | Architecture & module dependency diagram |
 | [§ 6](DOCUMENTATION.md#6-module-reference) | Module-level API reference |

@@ -35,9 +35,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizeGrip,
+    QSizePolicy,
     QSlider,
     QTabWidget,
     QVBoxLayout,
@@ -1977,6 +1980,16 @@ class DesignSpaceDialog(QDialog):
         self.resize(w, h)
         self.setMinimumSize(500, 380)
 
+        # ── Validation state ──────────────────────────────────────────────
+        self._validation_results = None   # ValidationResults | None
+        self._validation_worker  = None   # ValidationWorker  | None
+        self._val_tabs_added     = False  # True once validation tabs injected
+        # Stored for _extract_xy() and _extract_context()
+        self._df: Optional[pd.DataFrame] = None
+        self._params: List[ParameterConfig] = []
+        self._objectives: List[ObjectiveConfig] = []
+        self._study_config = None         # StudyConfig | None
+
         # ── Layout ────────────────────────────────────────────────────────
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(6, 6, 6, 6)
@@ -1996,6 +2009,39 @@ class DesignSpaceDialog(QDialog):
         self._profiler_widget = ProfilerWidget(self)
         self._tabs.addTab(self._profiler_widget, "🔮  Profiler")
 
+        # ── Validation header row (ABOVE the tab widget) ───────────────────
+        _val_row = QHBoxLayout()
+        self._val_checkbox = QCheckBox(
+            "🔬  Run Surrogate Validation (requires ≥ 30 unique samples)")
+        self._val_checkbox.setEnabled(False)
+        self._val_checkbox.setToolTip(
+            "Run a rigorous validation of the surrogate model on the current\n"
+            "dataset:\n"
+            "  §0  Data quality check\n"
+            "  §1  RF + GP hold-out and cross-validated accuracy\n"
+            "  §2  Virtual BO benchmark (GP+EI vs RF+EI vs Greedy vs Random)\n"
+            "  §3  Expected Improvement marginals per parameter\n"
+            "  §5  Pass/fail summary\n\n"
+            "Runtime: 3–10 minutes depending on dataset size.\n"
+            "Results are shown as new tabs and included in the HTML report."
+        )
+        self._val_checkbox.toggled.connect(self._on_validation_toggled)
+        _val_row.addWidget(self._val_checkbox)
+        _val_row.addStretch()
+
+        self._val_progress = QProgressBar()
+        self._val_progress.setRange(0, 100)
+        self._val_progress.setValue(0)
+        self._val_progress.setVisible(False)
+        self._val_progress.setFixedHeight(18)
+        _val_row.addWidget(self._val_progress)
+
+        self._val_status_lbl = QLabel("")
+        self._val_status_lbl.setStyleSheet("font-size: 11px; color: #a6e3a1;")
+        self._val_status_lbl.setVisible(False)
+        _val_row.addWidget(self._val_status_lbl)
+
+        vbox.addLayout(_val_row)
         vbox.addWidget(self._tabs, stretch=1)
 
         # ── Bottom row: size grip + close button ──────────────────────────
@@ -2017,16 +2063,317 @@ class DesignSpaceDialog(QDialog):
         params: List[ParameterConfig],
         objectives: List[ObjectiveConfig],
         suggestions: Optional[List[dict]] = None,
+        study_config=None,
     ) -> None:
-        """Refresh all four tabs with new data."""
+        """Refresh all tabs with new data.  Pass study_config for validation."""
+        # Detect a meaningful data change → reset any existing validation state
+        data_changed = (
+            self._df is None
+            or len(df) != len(self._df)
+            or list(df.columns) != list(self._df.columns)
+        )
+        if data_changed and (self._validation_results is not None
+                             or self._val_tabs_added):
+            self._reset_validation_state()
+
+        # Store for validation helpers
+        self._df           = df
+        self._params       = params
+        self._objectives   = objectives
+        self._study_config = study_config
+
+        # Enable/disable checkbox based on n_unique
+        self._update_val_checkbox_state()
+
         self._widget.refresh(df, params, objectives, suggestions)
         self._corr_widget.refresh(df, params, objectives)
         self._importance_widget.refresh(df, params, objectives)
         self._profiler_widget.refresh(df, params, objectives)
 
     def clear(self) -> None:
-        """Clear all four tabs."""
+        """Clear all tabs and reset validation state."""
+        self._reset_validation_state()
+        self._df           = None
+        self._params       = []
+        self._objectives   = []
+        self._study_config = None
+        self._val_checkbox.setEnabled(False)
         self._widget.clear()
         self._corr_widget.clear()
         self._importance_widget.clear()
         self._profiler_widget.clear()
+
+    def set_validation_results(self, results) -> None:
+        """
+        Accept validation results from MainWindow and inject tabs (idempotent).
+
+        Called automatically when MainWindow's Results-tab validation completes
+        and the Design Space dialog is open (or about to be opened), so the 7
+        validation tabs appear here without the user needing to re-run.
+        """
+        if results is None:
+            return
+        # If we have different results, reset tabs so they're re-injected
+        if self._validation_results is not results:
+            if self._val_tabs_added:
+                while self._tabs.count() > 4:
+                    self._tabs.removeTab(self._tabs.count() - 1)
+                self._val_tabs_added = False
+            self._validation_results = results
+        # Inject tabs (no-op if already done)
+        self._ensure_val_tabs()
+        # Update checkbox UI to show "Complete"
+        self._val_checkbox.blockSignals(True)
+        self._val_checkbox.setChecked(True)
+        self._val_checkbox.setText("🔬  Surrogate Validation  ✅  Complete")
+        self._val_checkbox.setEnabled(True)
+        self._val_checkbox.blockSignals(False)
+        self._val_status_lbl.setText(
+            f"✅  Complete — {results.n_pass}/{results.n_checks} checks passed"
+        )
+        self._val_status_lbl.setVisible(True)
+        self._val_progress.setValue(100)
+
+    # ── Validation: checkbox state ─────────────────────────────────────────
+
+    def _update_val_checkbox_state(self) -> None:
+        """Enable the validation checkbox iff df has ≥ 30 unique numeric rows."""
+        if self._df is None or not self._params:
+            self._val_checkbox.setEnabled(False)
+            return
+
+        numeric_cols = [
+            p.name for p in self._params
+            if p.enabled
+            and p.ptype in (ParameterType.FLOAT, ParameterType.INT)
+            and p.name in self._df.columns
+        ]
+        if not numeric_cols:
+            self._val_checkbox.setEnabled(False)
+            return
+
+        try:
+            n_unique = len(
+                self._df.dropna(subset=numeric_cols)
+                        .drop_duplicates(subset=numeric_cols)
+            )
+        except Exception:
+            n_unique = len(self._df)
+
+        base_tip = (
+            "Run a rigorous validation of the surrogate model on the current\n"
+            "dataset:\n"
+            "  §0  Data quality check\n"
+            "  §1  RF + GP hold-out and cross-validated accuracy\n"
+            "  §2  Virtual BO benchmark (GP+EI vs RF+EI vs Greedy vs Random)\n"
+            "  §3  Expected Improvement marginals per parameter\n"
+            "  §5  Pass/fail summary\n\n"
+            "Runtime: 3–10 minutes depending on dataset size.\n"
+            "Results are shown as new tabs and included in the HTML report."
+        )
+        if n_unique >= 30:
+            self._val_checkbox.setEnabled(True)
+            self._val_checkbox.setToolTip(base_tip)
+        else:
+            self._val_checkbox.setEnabled(False)
+            self._val_checkbox.setToolTip(
+                base_tip
+                + f"\n\n⚠ Currently disabled: only {n_unique} unique rows "
+                  f"(need ≥ 30)."
+            )
+
+    # ── Validation: state reset ────────────────────────────────────────────
+
+    def _reset_validation_state(self) -> None:
+        """Stop worker, remove validation tabs, reset all state."""
+        if self._validation_worker is not None and self._validation_worker.isRunning():
+            self._validation_worker.terminate()
+            self._validation_worker.wait(3000)
+            self._validation_worker = None
+
+        # Remove validation tabs (keep base 4: Design Space, Correlation,
+        #                          Importance, Profiler)
+        if self._val_tabs_added:
+            while self._tabs.count() > 4:
+                self._tabs.removeTab(self._tabs.count() - 1)
+
+        self._validation_results = None
+        self._validation_worker  = None
+        self._val_tabs_added     = False
+        self._val_progress.setVisible(False)
+        self._val_status_lbl.setVisible(False)
+        if hasattr(self, "_val_checkbox"):
+            self._val_checkbox.blockSignals(True)
+            self._val_checkbox.setChecked(False)
+            self._val_checkbox.setText(
+                "🔬  Run Surrogate Validation (requires ≥ 30 unique samples)")
+            self._val_checkbox.blockSignals(False)
+
+    # ── Validation: checkbox toggle ────────────────────────────────────────
+
+    def _on_validation_toggled(self, checked: bool) -> None:
+        if checked:
+            if self._validation_results is not None:
+                # Results already exist — just show/switch to tabs
+                self._ensure_val_tabs()
+                return
+
+            # Extract data arrays
+            try:
+                X, y, feature_names = self._extract_xy()
+            except ValueError as exc:
+                QMessageBox.warning(self, "Validation Error",
+                                    f"Cannot start validation:\n{exc}")
+                self._val_checkbox.setChecked(False)
+                return
+
+            ctx_X, ctx_names = self._extract_context()
+            direction = (self._objectives[0].direction
+                         if self._objectives else "minimize")
+            target_name = (self._objectives[0].column_name
+                           if self._objectives else "objective")
+
+            # Show progress UI
+            self._val_progress.setValue(0)
+            self._val_progress.setVisible(True)
+            self._val_status_lbl.setText("Starting validation…")
+            self._val_status_lbl.setVisible(True)
+            self._val_checkbox.setText("🔬  Running Validation — please wait…")
+            self._val_checkbox.setEnabled(False)
+
+            # Import lazily to avoid circular imports at module load time
+            from validation_worker import ValidationWorker
+            self._validation_worker = ValidationWorker(
+                X=X, y=y,
+                feature_names=feature_names,
+                target_name=target_name,
+                direction=direction,
+                context_X=ctx_X,
+                context_names=ctx_names,
+                parent=self,
+            )
+            self._validation_worker.progress_updated.connect(self._on_val_progress)
+            self._validation_worker.validation_done.connect(self._on_val_done)
+            self._validation_worker.error_occurred.connect(self._on_val_error)
+            self._validation_worker.start()
+
+        else:
+            # Unchecked — stop running worker but keep any existing results
+            if self._validation_worker is not None and \
+                    self._validation_worker.isRunning():
+                self._validation_worker.terminate()
+                self._validation_worker.wait(3000)
+            self._val_progress.setVisible(False)
+            self._val_status_lbl.setVisible(False)
+            self._val_checkbox.setText(
+                "🔬  Run Surrogate Validation (requires ≥ 30 unique samples)")
+            self._val_checkbox.setEnabled(True)
+
+    # ── Validation: worker signal handlers ────────────────────────────────
+
+    def _on_val_progress(self, pct: int, msg: str) -> None:
+        self._val_progress.setValue(pct)
+        self._val_status_lbl.setText(msg)
+
+    def _on_val_done(self, results) -> None:
+        self._validation_results = results
+        self._val_progress.setValue(100)
+        self._val_status_lbl.setText(
+            f"✅  Complete — {results.n_pass}/{results.n_checks} checks passed"
+        )
+        self._val_checkbox.setText("🔬  Surrogate Validation  ✅  Complete")
+        self._val_checkbox.setEnabled(True)
+        self._ensure_val_tabs()
+
+    def _on_val_error(self, msg: str) -> None:
+        self._val_progress.setVisible(False)
+        self._val_status_lbl.setVisible(False)
+        self._val_checkbox.setText("🔬  Run Surrogate Validation  ❌  Error")
+        self._val_checkbox.setEnabled(True)
+        QMessageBox.critical(
+            self, "Validation Error",
+            f"The validation run failed:\n\n{msg[:600]}"
+        )
+
+    # ── Validation: inject result tabs ────────────────────────────────────
+
+    def _ensure_val_tabs(self) -> None:
+        """Inject validation figures as new tabs (called at most once)."""
+        if self._val_tabs_added or self._validation_results is None:
+            return
+        self._val_tabs_added = True
+
+        r = self._validation_results
+        tab_specs = [
+            ("s0_data_summary",        "📊 Data Quality"),
+            ("s1_predicted_vs_true",   "🎯 Surrogate Accuracy"),
+            ("s1_residuals",           "📉 Residuals"),
+            ("s2_bo_convergence",      "📈 BO Benchmark"),
+            ("s2_bo_convergence_norm", "📈 BO (Normalised)"),
+            ("s3_ei_marginals",        "🔍 EI Marginals"),
+            ("s5_passfail",            "✅ Validation Summary"),
+        ]
+        first_val_idx = self._tabs.count()
+        for key, tab_label in tab_specs:
+            fig = r.figures.get(key)
+            if fig is None:
+                continue
+            canvas = FigureCanvasQTAgg(fig)
+            canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            page = QWidget()
+            page_vbox = QVBoxLayout(page)
+            page_vbox.setContentsMargins(4, 4, 4, 4)
+            page_vbox.addWidget(canvas)
+            self._tabs.addTab(page, tab_label)
+
+        # Switch to first validation tab
+        if self._tabs.count() > first_val_idx:
+            self._tabs.setCurrentIndex(first_val_idx)
+
+    # ── Validation: data extraction helpers ──────────────────────────────
+
+    def _extract_xy(self):
+        """Convert stored df + params + objectives to numpy arrays."""
+        if self._df is None:
+            raise ValueError("No CSV loaded.")
+        if not self._objectives:
+            raise ValueError("No objective configured.")
+
+        feature_cols = [
+            p.name for p in self._params
+            if p.enabled
+            and p.ptype in (ParameterType.FLOAT, ParameterType.INT)
+            and p.name in self._df.columns
+        ]
+        if not feature_cols:
+            raise ValueError("No enabled numeric feature parameters found.")
+
+        obj_col = self._objectives[0].column_name
+        if obj_col not in self._df.columns:
+            raise ValueError(f"Objective column '{obj_col}' not found in CSV.")
+
+        sub = self._df[feature_cols + [obj_col]].dropna()
+        if len(sub) < 5:
+            raise ValueError(
+                f"Too few valid rows after removing NaNs ({len(sub)} rows)."
+            )
+
+        X = sub[feature_cols].values.astype(float)
+        y = sub[obj_col].values.astype(float)
+        return X, y, feature_cols
+
+    def _extract_context(self):
+        """Extract context variable arrays from stored df + study_config."""
+        if self._df is None or self._study_config is None:
+            return None, None
+        ctx_names = [
+            cv.column_name
+            for cv in getattr(self._study_config, "context_variables", [])
+            if cv.column_name in self._df.columns
+        ]
+        if not ctx_names:
+            return None, None
+        ctx_sub = self._df[ctx_names].copy()
+        ctx_sub = ctx_sub.fillna(ctx_sub.mean())
+        ctx_X = ctx_sub.values.astype(float)
+        return ctx_X, ctx_names

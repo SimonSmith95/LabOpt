@@ -32,10 +32,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QStatusBar,
     QTabWidget,
     QTableWidget,
@@ -48,6 +50,7 @@ from PySide6.QtWidgets import (
 
 from batch_results_dialog import BatchResultsDialog
 from design_space_widget import ConvergenceWidget, DesignSpaceDialog, ParetoWidget
+from power_analysis_widget import PowerAnalysisCoordinator
 from csv_loader import aggregate_replicates, extract_param_defaults, infer_context_defaults, load_csv, load_trials_from_csv
 from report_generator import export_plots_as_png, generate_report, write_report
 from surrogate_quality import MIN_TRIALS, compute_surrogate_quality, predict_batch
@@ -59,7 +62,9 @@ from optuna_builder import (
 )
 from param_card_widget import ParamCardWidget
 from constraint_dialog import ConstraintDialog
-from parameter_config import ObjectiveConfig, ParameterConfig, ParameterConstraint, StudyConfig
+from parameter_config import (
+    ObjectiveConfig, ParameterConfig, ParameterConstraint, ParameterType, StudyConfig,
+)
 from session_manager import SessionManager, SessionState
 from worker import OptimizationWorker
 
@@ -558,6 +563,10 @@ class MainWindow(QMainWindow):
         self._batches_done: int = 0
         self._design_space_dlg: Optional[DesignSpaceDialog] = None
 
+        # Surrogate validation state (Results-tab checkbox trigger)
+        self._validation_results = None  # ValidationResults | None
+        self._validation_worker  = None  # ValidationWorker  | None
+
         # Objective-row widgets [(col_name_label, direction_combo), ...]
         self._obj_row_widgets: List[tuple] = []
         # Per-column checkboxes in the objectives selector
@@ -578,11 +587,21 @@ class MainWindow(QMainWindow):
         # Reference to results dialog so we can collect context corrections after submit
         self._active_batch_dlg: Optional[BatchResultsDialog] = None
 
+        # Centre stacked widget — created early so _build_left_dock (which adds
+        # the power result panel as page 1) and _build_centre (which adds the
+        # param-card scroll area as page 0) can both reference it.
+        self._centre_stack = QStackedWidget()
+
         self._build_menu()
         self._build_toolbar()
         self._build_left_dock()
         self._build_centre()
         self._build_status_bar()
+
+        # Ensure the param-card scroll area is visible at startup.
+        # (_build_left_dock adds the power result panel first so it becomes
+        # the QStackedWidget's default page; we correct that here.)
+        self._centre_stack.setCurrentWidget(self._scroll)
 
         # ── Theme (dark by default, persisted via QSettings) ──────────────
         settings = QSettings()
@@ -942,7 +961,7 @@ class MainWindow(QMainWindow):
         rbtn_row.addWidget(export_xlsx_btn)
         rvbox.addLayout(rbtn_row)
 
-        # ── Export Report button (Feature 9) ──────────────────────────
+        # ── Export Report + Surrogate Validation checkbox ──────────────
         rbtn_row2 = QHBoxLayout()
         export_report_btn = QPushButton("📄  Export Report…")
         export_report_btn.setToolTip(
@@ -954,7 +973,36 @@ class MainWindow(QMainWindow):
         export_report_btn.clicked.connect(self._action_export_report)
         rbtn_row2.addWidget(export_report_btn)
         rbtn_row2.addStretch()
+
+        self._val_checkbox_main = QCheckBox("🔬  Surrogate Validation")
+        self._val_checkbox_main.setEnabled(False)
+        self._val_checkbox_main.setToolTip(
+            "Run a rigorous validation of the surrogate model on the current dataset:\n"
+            "  §0  Data quality check\n"
+            "  §1  RF + GP hold-out and cross-validated accuracy\n"
+            "  §2  Virtual BO benchmark (GP+EI vs RF+EI vs Greedy vs Random)\n"
+            "  §3  Expected Improvement marginals per parameter\n"
+            "  §5  Pass/fail summary\n\n"
+            "Requires ≥ 30 unique rows.  Runtime: 3–10 minutes.\n"
+            "Results are embedded in the HTML report export and shown\n"
+            "as tabs in the Design Space dialog."
+        )
+        self._val_checkbox_main.toggled.connect(self._on_main_val_toggled)
+        rbtn_row2.addWidget(self._val_checkbox_main)
         rvbox.addLayout(rbtn_row2)
+
+        # ── Validation progress (hidden by default, above quality badge) ──
+        self._val_progress_main = QProgressBar()
+        self._val_progress_main.setRange(0, 100)
+        self._val_progress_main.setValue(0)
+        self._val_progress_main.setVisible(False)
+        self._val_progress_main.setFixedHeight(14)
+        rvbox.addWidget(self._val_progress_main)
+
+        self._val_status_lbl_main = QLabel("")
+        self._val_status_lbl_main.setStyleSheet("font-size: 10px; color: #a6e3a1;")
+        self._val_status_lbl_main.setVisible(False)
+        rvbox.addWidget(self._val_status_lbl_main)
 
         # ── Surrogate quality badge (Feature 2) ───────────────────────
         self._quality_badge = QLabel("Surrogate quality: —")
@@ -993,6 +1041,17 @@ class MainWindow(QMainWindow):
 
         rvbox.addWidget(self._results_tabs, stretch=1)
         self._left_tabs.addTab(results_widget, "📊  Results")
+
+        # ══════════════════════════════════════════════════════════════
+        # Tab 3 — 🔬 Power Analysis
+        # Input form lives in the left dock; result panel + plots go in
+        # the centre QStackedWidget (page 1, added here so _build_left_dock
+        # and _build_centre can share self._centre_stack).
+        # ══════════════════════════════════════════════════════════════
+        self._power = PowerAnalysisCoordinator()
+        self._left_tabs.addTab(self._power.input_panel, "🔬  Power")
+        self._centre_stack.addWidget(self._power.result_panel)  # index 1
+        self._left_tabs.currentChanged.connect(self._on_left_tab_changed)
 
         self._left_dock.setWidget(outer)
         self.addDockWidget(Qt.LeftDockWidgetArea, self._left_dock)
@@ -1040,7 +1099,10 @@ class MainWindow(QMainWindow):
         self._cards_layout.addWidget(self._placeholder_lbl)
 
         self._scroll.setWidget(self._cards_container)
-        vbox.addWidget(self._scroll)
+        # Add scroll area as page 0 of the centre stacked widget.
+        # Page 1 (power result panel) is added in _build_left_dock().
+        self._centre_stack.addWidget(self._scroll)   # index 0
+        vbox.addWidget(self._centre_stack)
 
         self.setCentralWidget(centre)
 
@@ -1353,6 +1415,7 @@ class MainWindow(QMainWindow):
         self._update_status_bar()
         self._refresh_recent_menu()
         self._refresh_design_space()   # show historical data, no suggestions yet
+        self._update_main_val_checkbox()  # enable if ≥ 30 unique rows
 
         # Status message describes whether aggregation occurred
         if repl_enabled and n_agg < n_raw:
@@ -1966,6 +2029,7 @@ class MainWindow(QMainWindow):
         if not self._study:
             self._convergence_widget.clear()
             self._pareto_widget.clear()
+            self._power.set_objective_data(None)
             return
         from optuna.trial import TrialState
 
@@ -1973,6 +2037,8 @@ class MainWindow(QMainWindow):
         if not completed:
             self._convergence_widget.clear()
             self._pareto_widget.clear()
+            # Still pass df data so the calculator works as a planning tool
+            self._refresh_power_widget(n_current=0)
             return
 
         obj_cols = (
@@ -2037,9 +2103,45 @@ class MainWindow(QMainWindow):
         # Refresh surrogate quality badge
         self._update_quality_badge()
 
+        # Refresh power analysis widget
+        self._refresh_power_widget(n_current=len(completed))
+
     # ══════════════════════════════════════════════════════════════════════
     # Feature 2 — Surrogate quality badge
     # ══════════════════════════════════════════════════════════════════════
+
+    def _refresh_power_widget(self, n_current: int = 0) -> None:
+        """Feed the power analysis coordinator with the first objective's data column."""
+        if self._session_state is None or self._df is None:
+            self._power.set_objective_data(None, n_current=n_current)
+            return
+        objectives = self._session_state.study_config.objectives
+        if not objectives:
+            self._power.set_objective_data(None, n_current=n_current)
+            return
+        obj_col = objectives[0].column_name
+        if obj_col not in self._df.columns:
+            self._power.set_objective_data(None, n_current=n_current)
+            return
+        series = self._df[obj_col].dropna()
+        self._power.set_objective_data(series, n_current=n_current)
+
+    def _on_left_tab_changed(self, index: int) -> None:
+        """
+        Show/hide the power result panel in the centre area.
+
+        Index 2 = 🔬 Power tab → show result panel.
+        Any other tab → show param cards.
+
+        Uses setCurrentWidget() instead of setCurrentIndex() so the correct
+        widget is always shown regardless of the order they were inserted into
+        the stack (_build_left_dock runs before _build_centre, so insertion
+        order is not the same as the logical page numbers in the comments).
+        """
+        if index == 2:
+            self._centre_stack.setCurrentWidget(self._power.result_panel)
+        else:
+            self._centre_stack.setCurrentWidget(self._scroll)
 
     def _update_quality_badge(self) -> None:
         """Recompute surrogate quality and update the badge label."""
@@ -2210,6 +2312,191 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export Error", f"Failed to export:\n{exc}")
 
     # ══════════════════════════════════════════════════════════════════════
+    # Surrogate Validation — Results-tab checkbox handlers
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _update_main_val_checkbox(self) -> None:
+        """Enable the Results-tab validation checkbox iff n_unique ≥ 30."""
+        if self._df is None or not self._session_state:
+            self._val_checkbox_main.setEnabled(False)
+            return
+        cfg = self._session_state.study_config
+        numeric_cols = [
+            p.name for p in cfg.parameters
+            if p.enabled
+            and p.ptype in (ParameterType.FLOAT, ParameterType.INT)
+            and p.name in self._df.columns
+        ]
+        if not numeric_cols:
+            self._val_checkbox_main.setEnabled(False)
+            return
+        try:
+            n_unique = len(
+                self._df.dropna(subset=numeric_cols)
+                        .drop_duplicates(subset=numeric_cols)
+            )
+        except Exception:
+            n_unique = len(self._df)
+        enabled = n_unique >= 30
+        self._val_checkbox_main.setEnabled(enabled)
+        if not enabled and self._val_checkbox_main.isChecked():
+            self._val_checkbox_main.blockSignals(True)
+            self._val_checkbox_main.setChecked(False)
+            self._val_checkbox_main.blockSignals(False)
+
+    def _on_main_val_toggled(self, checked: bool) -> None:
+        if checked:
+            if self._validation_results is not None:
+                # Results already exist — push to dialog if open, show status
+                if self._design_space_dlg is not None:
+                    try:
+                        self._design_space_dlg.set_validation_results(
+                            self._validation_results
+                        )
+                    except Exception:
+                        pass
+                r = self._validation_results
+                self._val_status_lbl_main.setText(
+                    f"✅  {r.n_pass}/{r.n_checks} checks passed ({r.summary})"
+                )
+                self._val_status_lbl_main.setVisible(True)
+                self._val_progress_main.setValue(100)
+                self._val_progress_main.setVisible(True)
+                return
+
+            # Extract data arrays
+            try:
+                X, y, feature_names = self._extract_xy_for_val()
+            except ValueError as exc:
+                QMessageBox.warning(
+                    self, "Validation Error",
+                    f"Cannot start validation:\n{exc}"
+                )
+                self._val_checkbox_main.setChecked(False)
+                return
+
+            ctx_X, ctx_names = self._extract_context_for_val()
+            objectives = (
+                self._session_state.study_config.objectives
+                if self._session_state else []
+            )
+            direction   = objectives[0].direction   if objectives else "minimize"
+            target_name = objectives[0].column_name if objectives else "objective"
+
+            # Show progress UI
+            self._val_progress_main.setValue(0)
+            self._val_progress_main.setVisible(True)
+            self._val_status_lbl_main.setText("Starting validation…")
+            self._val_status_lbl_main.setVisible(True)
+            self._val_checkbox_main.setText("🔬  Running…")
+            self._val_checkbox_main.setEnabled(False)
+
+            from validation_worker import ValidationWorker
+            self._validation_worker = ValidationWorker(
+                X=X, y=y,
+                feature_names=feature_names,
+                target_name=target_name,
+                direction=direction,
+                context_X=ctx_X,
+                context_names=ctx_names,
+                parent=self,
+            )
+            self._validation_worker.progress_updated.connect(
+                self._on_main_val_progress
+            )
+            self._validation_worker.validation_done.connect(self._on_main_val_done)
+            self._validation_worker.error_occurred.connect(self._on_main_val_error)
+            self._validation_worker.start()
+
+        else:
+            if self._validation_worker is not None and \
+                    self._validation_worker.isRunning():
+                self._validation_worker.terminate()
+                self._validation_worker.wait(3000)
+            self._val_progress_main.setVisible(False)
+            self._val_status_lbl_main.setVisible(False)
+            self._val_checkbox_main.setText("🔬  Surrogate Validation")
+            self._update_main_val_checkbox()   # re-enable if still ≥ 30 rows
+
+    def _on_main_val_progress(self, pct: int, msg: str) -> None:
+        self._val_progress_main.setValue(pct)
+        self._val_status_lbl_main.setText(msg)
+
+    def _on_main_val_done(self, results) -> None:
+        self._validation_results = results
+        self._val_progress_main.setValue(100)
+        self._val_status_lbl_main.setText(
+            f"✅  {results.n_pass}/{results.n_checks} checks passed "
+            f"({results.summary})"
+        )
+        self._val_checkbox_main.setText("🔬  Surrogate Validation  ✅")
+        self._update_main_val_checkbox()   # re-enable
+        # Push results to Design Space dialog if it is open
+        if self._design_space_dlg is not None:
+            try:
+                self._design_space_dlg.set_validation_results(results)
+            except Exception:
+                pass
+
+    def _on_main_val_error(self, msg: str) -> None:
+        self._val_progress_main.setVisible(False)
+        self._val_status_lbl_main.setVisible(False)
+        self._val_checkbox_main.setText("🔬  Surrogate Validation  ❌")
+        self._update_main_val_checkbox()   # re-enable if possible
+        QMessageBox.critical(
+            self, "Validation Error",
+            f"The validation run failed:\n\n{msg[:600]}"
+        )
+
+    def _extract_xy_for_val(self):
+        """Extract X, y, feature_names from the current df + session config."""
+        if self._df is None:
+            raise ValueError("No CSV loaded.")
+        if not self._session_state:
+            raise ValueError("No objectives configured (apply objectives first).")
+        cfg = self._session_state.study_config
+        if not cfg.objectives:
+            raise ValueError("No objectives configured.")
+        feature_cols = [
+            p.name for p in cfg.parameters
+            if p.enabled
+            and p.ptype in (ParameterType.FLOAT, ParameterType.INT)
+            and p.name in self._df.columns
+        ]
+        if not feature_cols:
+            raise ValueError("No enabled numeric feature parameters found.")
+        obj_col = cfg.objectives[0].column_name
+        if obj_col not in self._df.columns:
+            raise ValueError(f"Objective column '{obj_col}' not found in CSV.")
+        sub = self._df[feature_cols + [obj_col]].dropna()
+        if len(sub) < 5:
+            raise ValueError(
+                f"Too few valid rows after removing NaNs ({len(sub)} rows)."
+            )
+        import numpy as _np
+        X = sub[feature_cols].values.astype(float)
+        y = sub[obj_col].values.astype(float)
+        return X, y, feature_cols
+
+    def _extract_context_for_val(self):
+        """Extract context variable arrays from the current session config."""
+        if self._df is None or not self._session_state:
+            return None, None
+        ctx_names = [
+            cv.column_name
+            for cv in getattr(
+                self._session_state.study_config, "context_variables", []
+            )
+            if cv.column_name in self._df.columns
+        ]
+        if not ctx_names:
+            return None, None
+        ctx_sub = self._df[ctx_names].copy()
+        ctx_sub = ctx_sub.fillna(ctx_sub.mean())
+        import numpy as _np
+        return ctx_sub.values.astype(float), ctx_names
+
+    # ══════════════════════════════════════════════════════════════════════
     # Feature 9 — Export HTML report
     # ══════════════════════════════════════════════════════════════════════
 
@@ -2346,6 +2633,15 @@ class MainWindow(QMainWindow):
                     figures["importance"] = imp_w._fig
             except Exception:
                 pass
+
+        # ── Validation results (prefer Results-tab source; fall back to dialog) ──
+        _val_res = self._validation_results or (
+            self._design_space_dlg._validation_results
+            if self._design_space_dlg is not None else None
+        )
+        if _val_res is not None:
+            for key, fig in _val_res.figures.items():
+                figures[f"validation_{key}"] = fig
 
         # ── Generate and write ─────────────────────────────────────────────
         try:
@@ -2576,6 +2872,7 @@ class MainWindow(QMainWindow):
             params=cfg.parameters,
             objectives=cfg.objectives,
             suggestions=suggestions,
+            study_config=cfg,
         )
 
     def _action_open_design_space(self) -> None:
@@ -2603,7 +2900,16 @@ class MainWindow(QMainWindow):
             params=cfg.parameters,
             objectives=cfg.objectives,
             suggestions=None,   # suggestions already set by _refresh_design_space if pending
+            study_config=cfg,
         )
+        # Push any validation results from the Results tab into the dialog
+        if self._validation_results is not None:
+            try:
+                self._design_space_dlg.set_validation_results(
+                    self._validation_results
+                )
+            except Exception:
+                pass
         self._design_space_dlg.show()
         self._design_space_dlg.raise_()
         self._design_space_dlg.activateWindow()

@@ -19,6 +19,8 @@
    - 3.9 [Design Space Visualisation](#39-design-space-visualisation)
    - 3.10 [Defining Parameter Constraints](#310-defining-parameter-constraints)
    - 3.11 [Context Variables (Uncontrollable Environmental Conditions)](#311-context-variables-uncontrollable-environmental-conditions)
+   - 3.12 [Power Analysis — Sample Size Calculator](#312-power-analysis--sample-size-calculator)
+   - 3.13 [Surrogate Validation](#313-surrogate-validation)
 4. [Headless / Scripting Mode](#4-headless--scripting-mode)
 5. [Codebase Architecture](#5-codebase-architecture)
    - 5.1 [File Map](#51-file-map)
@@ -134,7 +136,8 @@ python main.py
 The main window opens with an empty state. You will see:
 - **Left dock — ⚙ Settings tab** — Objectives selector, sampler, batch settings, warnings, Ask / Pause buttons
 - **Left dock — 📊 Results tab** — All Trials table, Best/Pareto table, Design Space button, Export button (auto-activated after each batch)
-- **Centre panel** — scrollable parameter cards (one per input column in your CSV)
+- **Left dock — 🔬 Power tab** — Sample-size calculator; shows the input form on the left and the result/plots in the centre area (see §3.12)
+- **Centre panel** — scrollable parameter cards (one per input column in your CSV); replaced by the Power Analysis plots when the 🔬 Power tab is active
 - **Toolbar** — Load CSV, Reload CSV, 📋 Enter Pending Results…
 - **Status bar** — trial count, best value, current status
 
@@ -719,6 +722,222 @@ trial's metadata for surrogate training.
 
 ---
 
+### 3.12 Power Analysis — Sample Size Calculator
+
+The **🔬 Power** tab in the left dock is a standalone statistical sample-size
+calculator. It answers the question:
+
+> *"Given that my measurements have a typical spread of σ and I need to detect
+> an improvement of at least Δ, how many experiments N do I need to be
+> confident the result is real?"*
+
+This is independent of the Bayesian optimisation — you can use it at any time,
+before or during an optimisation campaign, to assess whether your experiment
+budget is sufficient.
+
+#### Accessing the Power tab
+
+Click the **🔬 Power** tab in the left dock. The input form appears in the
+left panel; the result and plots appear in the centre of the main window
+(replacing the parameter cards while the tab is active). Switching back to
+⚙ Settings or 📊 Results restores the parameter cards.
+
+#### Input parameters
+
+| Field | What to enter |
+|---|---|
+| **Min. effect (Δ)** | The smallest improvement you *need* to reliably detect, in the same units as your objective column. E.g. if your yield is in %, enter `5` to detect a 5 percentage-point improvement. |
+| **Spread (σ)** | The expected measurement standard deviation (noise). Click **📊 From data** to auto-fill this from your loaded objective column. |
+| **Significance (α)** | Type I error rate — the probability of a false positive. Standard choices: 0.01, 0.05, 0.10. Default 0.05 means a 5% chance of concluding an improvement exists when it does not. |
+| **Desired power (1−β)** | The probability of detecting the effect if it truly exists. Standard choices: 0.70, 0.80, 0.90, 0.95. Default 0.80 means an 80% chance of detecting a true Δ. |
+| **Test type** | One-sample / paired: compare one group to a reference value, or before/after on the same samples. Two-sample (independent): compare two separate groups — the reported N is *per group*. |
+
+#### The "📊 From data" button
+
+If a CSV is loaded and objectives are configured, the **📊 From data** button
+is enabled. Clicking it sets σ to the standard deviation of the loaded
+objective column, giving you a data-driven noise estimate rather than a guess.
+
+The tooltip shows the estimated value and the number of data points used:
+`Set σ = 12.4 (std of 47 values) — Click to apply.`
+
+#### Outputs
+
+| Output | Meaning |
+|---|---|
+| **N = [number]** | The minimum number of experiments required to achieve the chosen power at the given α. For two-sample tests this is the required sample size *per group*. |
+| **Cohen's d** | The standardised effect size: `d = Δ / σ`. Interpretations: Small < 0.2, Medium 0.2–0.5, Large 0.5–0.8, Very large > 0.8. |
+| **Adequacy badge** | Traffic-light comparing your current trial count to the required N: ✅ adequate (n ≥ N), ⚠ borderline (50–99% of N), 🔴 underpowered (< 50% of N). |
+
+#### The two plots
+
+**Power Curve (left plot):** Shows achieved statistical power (%) vs. number
+of experiments N. A horizontal dashed line marks your chosen target power;
+a vertical dashed line marks the required N. If you have loaded an active
+study, a dotted green line shows the achieved power at your current trial
+count.
+
+**N vs. Effect Size (right plot):** Shows how the required N changes as a
+function of Δ (the minimum detectable effect), holding σ, α, and power
+constant. The vertical red dashed line marks your current Δ setting. This
+plot helps you understand how sensitive the required N is to your choice of
+minimum detectable effect.
+
+#### Mathematical background
+
+The required N is computed from the two-sided t-test formula:
+
+```
+Cohen's d  =  Δ / σ
+z_α        =  scipy.stats.norm.ppf(1 − α/2)     e.g. 1.96 for α = 0.05
+z_β        =  scipy.stats.norm.ppf(power)         e.g. 0.84 for power = 0.80
+
+N_one_sample   =  ceil( ((z_α + z_β) / d)² )
+N_two_sample   =  2 × N_one_sample               (N per group)
+```
+
+For typical settings (α = 0.05, power = 0.80) this simplifies to:
+`N ≈ 7.85 × (σ / Δ)²`
+
+#### Interpreting the results with a high-spread dataset
+
+If your objective has a large standard deviation (e.g. σ = 364,517) and you
+want to detect a change of Δ = 9,999, Cohen's d = 9,999 / 364,517 ≈ 0.027
+(a very small effect, much less than 0.2). This requires approximately
+**10,432 experiments** — because you are trying to find a signal that is
+only 2.7% of the typical noise level.
+
+Conversely, if Δ = 99,999 (about 27% of σ), d ≈ 0.274 (a medium effect),
+and the required N drops to roughly **104 experiments**. It is not the
+absolute size of σ that matters, but *how large the effect you care about is
+relative to the noise*.
+
+> **Practical guidance:** if the required N is far larger than your experiment
+> budget, you have three options: (1) increase Δ — only care about larger
+> improvements; (2) reduce σ — improve measurement precision or add more
+> replicates per condition; (3) accept a lower power (say 0.70) and acknowledge
+> that the study is exploratory.
+
+#### Caveats
+
+- The calculation assumes normally distributed measurement noise and a
+  two-sided test. For non-normal distributions (e.g. heavily skewed yield
+  data) the true required N may differ.
+- Power analysis describes the minimum sample size needed for a frequentist
+  hypothesis test. In the Bayesian optimisation workflow you are not running
+  a traditional hypothesis test — the power calculation helps you assess
+  whether you have *enough data for the surrogate to learn reliably*, but
+  there is no exact correspondence between the two frameworks.
+- The "adequate power" badge compares your **total trial count** to the
+  required N. If experiments are spread unevenly across parameter space, the
+  effective data for any one region may be much lower.
+
+---
+
+### 3.13 Surrogate Validation
+
+The **🔬 Surrogate Validation** checkbox (in the Results tab, next to the
+Export Report button) runs a rigorous five-section validation of the surrogate
+model on the currently loaded dataset — without requiring you to open the
+Design Space dialog.
+
+This is a **generalised** validation that works on any dataset, not just
+the perovskite example used by `validate_perovskite.py`.
+
+#### When is the checkbox enabled?
+
+The checkbox is enabled automatically once you apply objectives and your CSV
+has **≥ 30 unique rows** (fewer than that and the statistics are not
+meaningful). The exact count is the number of unique numeric-parameter
+combinations after dropping NaNs.
+
+#### Starting a validation run
+
+1. Switch to the **📊 Results** tab.
+2. Tick **🔬  Surrogate Validation** (next to the Export Report button).
+3. A progress bar and status label appear above the surrogate quality badge.
+4. Wait 3–10 minutes (depending on dataset size — see estimates below).
+
+The checkbox cannot be ticked twice while a run is in progress — it
+temporarily disables itself.
+
+#### What the engine checks (§0–§5)
+
+| Section | What it does | Pass condition |
+|---|---|---|
+| **§0 Data Quality** | Distribution of the objective; within-replicate std; n_unique | n_unique ≥ 30 |
+| **§1 Surrogate Accuracy** | RF + GP 70/30 hold-out and repeated 5-fold CV | Pearson r > 0.5; Spearman ρ > 0.5; CV RMSE < 30% of target range |
+| **§2 BO Benchmark** | GP+EI / RF+EI / Greedy / Random strategies on a fixed pool — does BO beat random? | GP+EI and RF+EI reach top-20% of pool faster than Random |
+| **§3 EI Marginals** | 1-D Expected Improvement sweep per parameter (other features held at median) | Top EI suggestion inside training data bounding box (±20%) |
+| **§5 Pass/Fail Summary** | Evaluates all 8 checks and produces a colour-coded table | — |
+
+#### The 8 pass/fail checks
+
+| # | Check | Pass condition |
+|---|---|---|
+| 1 | Enough unique data | n_unique ≥ 30 |
+| 2 | RF Pearson r (hold-out) | r > 0.5 |
+| 3 | GP Pearson r (hold-out) | r > 0.5 |
+| 4 | RF Spearman ρ (hold-out) | ρ > 0.5 |
+| 5 | CV RMSE (both models) | RMSE < 30% of target range |
+| 6 | GP+EI beats Random | GP+EI median steps ≤ Random median steps |
+| 7 | RF+EI beats Random | RF+EI median steps ≤ Random median steps |
+| 8 | EI suggestions in-range | All feature-wise argmax EI values within ±20% of training data range |
+
+The overall rating is:
+- 🟢 **GREEN** — all 8 checks passed.
+- 🟡 **YELLOW** — 6+ checks passed (≥ 75%).
+- 🔴 **RED** — fewer than 6 checks passed.
+
+#### Results after completion
+
+When the run finishes:
+- The checkbox shows **✅** and a summary label (e.g. `✅ 6/8 checks passed (YELLOW)`).
+- **7 new tabs** appear in the Design Space dialog (opened automatically if you click 📊 Design Space… later):
+  - 📊 Data Quality
+  - 🎯 Surrogate Accuracy
+  - 📉 Residuals
+  - 📈 BO Benchmark
+  - 📈 BO (Normalised)
+  - 🔍 EI Marginals
+  - ✅ Validation Summary
+- All 7 plots are embedded in the **📄 Export Report…** HTML output.
+
+#### Runtime estimates
+
+| n_unique rows | Approx. runtime |
+|---|---|
+| 30–50 | 1–2 minutes |
+| 50–100 | 2–4 minutes |
+| 100–200 | 4–8 minutes |
+
+The bottleneck is the §2 BO Benchmark (6 runs × 4 strategies × 25 BO steps
+× GP fitting). You can reduce the runtime by using datasets with fewer unique
+rows.
+
+#### Relationship with the Design Space dialog validation
+
+The Design Space dialog also has a validation checkbox. Both checkboxes run
+the same engine (`validate_generic.py` / `ValidationWorker`) but are
+independent triggers — you can use either entry point:
+
+- **Results tab** (this section) — no need to open the Design Space dialog.
+- **Design Space dialog** — useful if you already have the dialog open.
+
+If you run validation from the Results tab and then open the Design Space
+dialog, the 7 result tabs are automatically injected into the dialog —
+you do not need to re-run.
+
+#### Technical implementation
+
+The backend is implemented in:
+- **`validate_generic.py`** — `ValidationEngine` (pure Python, no Qt) — returns `ValidationResults` with figure objects and pass/fail metrics.
+- **`validation_worker.py`** — `ValidationWorker(QThread)` — runs the engine in a background thread; emits `progress_updated`, `validation_done`, `error_occurred` signals.
+
+Both files can be imported in headless scripts. See the module docstrings for the public API.
+
+---
+
 ## 4. Headless / Scripting Mode
 
 `BHOP.py` is a self-contained example showing how to use the backend without
@@ -788,10 +1007,14 @@ PythonProject1/
 ├── dead_region_dialog.py    UI: dialog for defining dead regions
 ├── constraint_dialog.py     UI: dialog for defining algebraic parameter constraints
 ├── design_space_widget.py   UI: design space, correlation, importance, profiler tabs
+├── power_analysis_widget.py UI: Power Analysis tab — input form + result panel + plots
+├── power_analysis_math.py   Pure-math backend for power analysis (no Qt / matplotlib)
 │
 ├── BHOP.py                  Headless scripting example
 ├── test_backend.py          Pytest test suite
-├── validate_perovskite.py   Stand-alone validation suite (perovskite data)
+├── validate_perovskite.py   Stand-alone validation suite (perovskite dataset only)
+├── validate_generic.py      Generalised surrogate validation engine — works on any CSV
+├── validation_worker.py     QThread wrapper running validate_generic in the background
 ├── requirements.txt         pip dependencies
 │
 └── test_data/
@@ -970,6 +1193,21 @@ Top-level configuration for an entire optimisation session.
 | `auto_stop` | `bool` | `False` | Stop when the best value hasn't improved by the threshold |
 | `auto_stop_min_improvement` | `float` | `0.01` | Minimum relative improvement per batch (1% default) |
 | `auto_stop_n_batches` | `int` | `3` | Window of consecutive batches to check for convergence |
+| `context_variables` | `List[ContextConfig]` | `[]` | Uncontrollable environmental columns (see §3.11) — learned by the surrogate but never suggested |
+
+#### `ContextConfig`
+
+Configuration for one context variable (uncontrollable environmental condition).
+
+```python
+@dataclass
+class ContextConfig:
+    column_name: str           # CSV column name
+    description: str = ""      # Optional human-readable label (shown in GUI)
+```
+
+Context values are stored in each completed trial as `user_attrs["ctx_<column_name>"]`
+so the surrogate can access them as additional features during training.
 
 ---
 
@@ -1939,25 +2177,33 @@ roughly the same everywhere in parameter space.
   showing systematically higher errors in one part of parameter space.
 
 #### Column independence
-LabOpt treats each enabled CSV column as an independent free variable.
+LabOpt treats each enabled CSV column as an independent free variable — with one important exception: **context variables are explicitly modelled with interactions**.
 
-- **Breaks down when**: columns are physically coupled but not constrained
-  (e.g. temperature and pressure in a gas reaction).  Constraint expressions
-  help when the coupling is algebraic; if it is only physical, the surrogate
-  will explore physically impossible combinations.
-- **What to do**: use the **📐 Constraints…** dialog to add algebraic rules,
-  or disable one of the coupled columns and compute it from the other.
+The RF surrogate used by the contextual sampler learns:
+
+```
+f(controllable_params + context_vars) → objective
+```
+
+This means the model learns that, say, `temperature = 180°C` produces high yield at `humidity = 40%` but low yield at `humidity = 80%` — a cross-term that a strict independence assumption would miss. Context variables therefore *intentionally* break column independence in a beneficial direction.
+
+The independence concern still applies to **controllable parameters that are physically coupled but unconstrained**:
+
+- **Breaks down when**: two controllable columns are physically linked but no algebraic constraint captures it (e.g. temperature and pressure in a sealed reaction vessel).
+- **What to do**: use the **📐 Constraints…** dialog to add algebraic rules, or disable one of the coupled columns and compute it from the other.
 
 #### No hidden variables
-The surrogate assumes the columns in your CSV capture all relevant
-experimental factors.
+The surrogate can only learn from factors that are recorded in your CSV.
 
-- **Common hidden variables**: operator, ambient humidity, equipment age,
-  lot number of reagents, time-of-day.
-- **What this causes**: unexplained variance that looks like measurement noise
-  to the model, inflating RMSE and reducing prediction accuracy.
-- **Mitigation**: add categorical columns for controllable hidden variables
-  (e.g. `operator = "A"/"B"`, `batch = 1/2/3`).
+**Uncontrollable environmental factors** — ambient humidity, atmospheric pressure, reagent purity, equipment calibration drift — can be handled directly using **context variables** (§3.11). Mark these columns as context variables and the surrogate will learn their effect on the objective without treating them as optimisable inputs. This is the primary mechanism for addressing hidden environmental variables in LabOpt.
+
+The remaining risk is for factors that are **never measured and recorded at all**:
+
+- **Examples of truly hidden variables**: time-of-day effects, individual instrument behaviour that shifts without being logged, unknown reagent degradation not reflected in any column.
+- **What this causes**: unexplained variance that looks like measurement noise, inflating RMSE and causing the surrogate to give inconsistent suggestions.
+- **Mitigation for controllable hidden factors**: add them as parameters or categorical columns (e.g. `operator = "A"/"B"`, `batch = 1/2/3`) so the model can learn their effect.
+- **Mitigation for uncontrollable numeric factors**: add them as context variables (see §3.11).
+- **No mitigation**: completely unlogged factors — the only solution is better experimental record-keeping.
 
 ---
 
@@ -2013,6 +2259,35 @@ However, the internal coordinate system is not the same as the physical
 fractions — the surrogate may sample unevenly across the feasible simplex,
 particularly in early iterations when the model is undetermined.  This is
 expected and resolves as more data accumulates.
+
+#### Power analysis and BO sample requirements
+
+The **🔬 Power Analysis** tab (§3.12) computes required sample sizes using the
+classical two-sided t-test formula.  This is a **useful planning tool** but
+answers a fundamentally different question than Bayesian Optimisation:
+
+| Goal | Appropriate tool | Typical N |
+|---|---|---|
+| *Find* the best parameters | Bayesian Optimisation | 30–150 (adaptive) |
+| *Confirm* an improvement is statistically significant | Power analysis (t-test) | `7.85 × (σ/Δ)²` |
+
+**BO typically needs far fewer experiments than the power N to find a good
+solution.**  This is because BO is *adaptive* — it concentrates experiments in
+promising regions rather than sampling randomly.  A surrogate trained on 40
+well-chosen trials often outperforms a random search with 200 trials.  The power
+N is the budget needed to *confirm* via a hypothesis test that the discovered
+optimum is better than baseline by at least Δ — it is not the budget needed to
+*find* that optimum.
+
+**Practical interpretation of the adequacy badge:**
+
+- ✅ **Adequate** (n ≥ power N): you have enough data to both find *and* statistically confirm improvements of Δ. Strong position.
+- ⚠ **Borderline** (50–99% of power N): BO suggestions are likely still useful — the surrogate can learn from this data. You may not have enough for a formal statistical test of the final result, but the exploration is not wasted.
+- 🔴 **Underpowered** (< 50% of power N): if σ >> Δ, measurements are so noisy relative to the effect you care about that the surrogate may struggle to learn any reliable pattern. Consider whether Δ is realistic for your system, or whether measurement precision can be improved.
+
+**When power N is the right number to target:**  After BO identifies a promising parameter set, run replicates at that condition and at the baseline. The power N tells you how many total measurements you need (split across conditions) to publish a statistically credible claim that the improvement is real.
+
+**The biggest risk:** If σ is very large relative to Δ (Cohen's d < 0.1), even BO will struggle — measurement noise drowns the signal completely. In this regime, improving measurement precision (reducing σ) is more valuable than running more experiments.
 
 ---
 
