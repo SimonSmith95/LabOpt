@@ -84,7 +84,9 @@ class DesignSpaceWidget(QWidget):
         self._page: int = 0        # current page index (0-based)
         _PAGE_SIZE = 5             # max params per pairplot page (class-level below)
 
-        self._fig = Figure(facecolor=_BG)
+        # constrained_layout automatically sizes axes, legends, colorbars and
+        # suptitles so that nothing overflows the figure boundary.
+        self._fig = Figure(facecolor=_BG, layout='constrained')
         self._canvas = FigureCanvasQTAgg(self._fig)
         self._canvas.setStyleSheet(f"background-color: {_BG};")
 
@@ -143,6 +145,7 @@ class DesignSpaceWidget(QWidget):
         refresh_btn.setToolTip("Redraw the design space plot.")
         refresh_btn.clicked.connect(self._redraw)
         toolbar.addWidget(refresh_btn)
+
         layout.addLayout(toolbar)
 
         # Start with page nav hidden
@@ -219,7 +222,7 @@ class DesignSpaceWidget(QWidget):
 
     # ── Pairplot page navigation ───────────────────────────────────────────
 
-    _PAGE_SIZE = 5   # max number of parameters shown per pairplot page
+    _PAGE_SIZE = 4   # max parameters shown per page (pairplot & marginals)
 
     def _set_page_nav_visible(self, visible: bool) -> None:
         for w in (self._prev_btn, self._page_label, self._next_btn):
@@ -292,12 +295,13 @@ class DesignSpaceWidget(QWidget):
                 self._set_page_nav_visible(False)
             else:
                 self._draw_marginals(numeric)
-                self._set_page_nav_visible(False)
+                # Enable page navigation for marginals when there are many params
+                n_marginal_pages = max(1, math.ceil(len(numeric) / self._PAGE_SIZE))
+                self._set_page_nav_visible(n_marginal_pages > 1)
+                self._update_page_nav(len(numeric))
 
-        try:
-            self._fig.tight_layout()
-        except Exception:
-            pass
+        # constrained_layout (set on the Figure at creation) handles layout
+        # automatically — no tight_layout() call needed here.
 
         self._canvas.draw_idle()
         self._placeholder.hide()
@@ -495,13 +499,11 @@ class DesignSpaceWidget(QWidget):
                        markerfacecolor=_SUGGEST, markersize=12,
                        linestyle="None", label="Suggested")
             )
-        # Place legend anchored to the figure's top-right; `bbox_transform` is
-        # figure coordinates so it never collides with any subplot.
+        # Place legend inside the figure top-right corner.  No bbox_to_anchor
+        # is used so constrained_layout can keep it within the figure boundary.
         self._fig.legend(
             handles=legend_handles,
             loc="upper right",
-            bbox_to_anchor=(0.88 if has_color else 1.0, 1.0),
-            bbox_transform=self._fig.transFigure,
             facecolor=_BG, edgecolor=_GRID, labelcolor=_FG, fontsize=8,
         )
 
@@ -513,7 +515,8 @@ class DesignSpaceWidget(QWidget):
             )
         else:
             title = "Pairplot — Design Space"
-        self._fig.suptitle(title, color=_FG, fontsize=9, y=1.01)
+        # Constrained layout handles vertical spacing — no y= offset needed
+        self._fig.suptitle(title, color=_FG, fontsize=9)
         self._fig.patch.set_facecolor(_BG)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -599,8 +602,14 @@ class DesignSpaceWidget(QWidget):
     # Plot type 3: 1-D marginal strip (> 12 numeric params)
     # ══════════════════════════════════════════════════════════════════════
 
-    def _draw_marginals(self, numeric: list[ParameterConfig]) -> None:
-        n    = len(numeric)
+    def _draw_marginals(self, numeric_all: list[ParameterConfig]) -> None:
+        # ── Page slicing: show at most PAGE_SIZE parameters at a time ─────
+        n_total = len(numeric_all)
+        n_pages = max(1, math.ceil(n_total / self._PAGE_SIZE))
+        self._page = max(0, min(self._page, n_pages - 1))
+        start = self._page * self._PAGE_SIZE
+        numeric = numeric_all[start : start + self._PAGE_SIZE]
+        n = len(numeric)
         axes = self._fig.subplots(n, 1, squeeze=False)
         suggest_colours = [_SUGGEST, _SUGGEST2, "#cba6f7", "#94e2d5"]
 
@@ -637,8 +646,14 @@ class DesignSpaceWidget(QWidget):
             )
 
         axes[-1][0].set_xlabel("Parameter value", color=_FG, fontsize=8)
-        self._fig.suptitle("Parameter Marginal Distributions",
-                           color=_FG, fontsize=9)
+        if n_total > n:
+            _marginal_title = (
+                f"Parameter Marginals  (page {self._page + 1}/{n_pages}  ·  "
+                f"params {start + 1}–{start + n} of {n_total})"
+            )
+        else:
+            _marginal_title = "Parameter Marginal Distributions"
+        self._fig.suptitle(_marginal_title, color=_FG, fontsize=9)
         self._fig.patch.set_facecolor(_BG)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -683,6 +698,7 @@ class CorrelationWidget(QWidget):
         self._df: Optional[pd.DataFrame] = None
         self._params: List[ParameterConfig] = []
         self._objectives: List[ObjectiveConfig] = []
+        self._needs_redraw: bool = False   # lazy — only render when tab is shown
 
         self._fig = Figure(facecolor=_BG)
         self._canvas = FigureCanvasQTAgg(self._fig)
@@ -731,13 +747,14 @@ class CorrelationWidget(QWidget):
         params: List[ParameterConfig],
         objectives: List[ObjectiveConfig],
     ) -> None:
-        self._df         = df
-        self._params     = params
-        self._objectives = objectives
-        self._redraw()
+        self._df           = df
+        self._params       = params
+        self._objectives   = objectives
+        self._needs_redraw = True   # rendered on demand when tab is selected
 
     def clear(self) -> None:
-        self._df = None
+        self._df           = None
+        self._needs_redraw = False
         self._fig.clear()
         self._canvas.draw_idle()
         self._canvas.hide()
@@ -1009,6 +1026,7 @@ class ImportanceWidget(QWidget):
         self._df: Optional[pd.DataFrame] = None
         self._params: List[ParameterConfig] = []
         self._objectives: List[ObjectiveConfig] = []
+        self._needs_redraw: bool = False   # lazy — only compute when tab is shown
 
         self._fig = Figure(facecolor=_BG)
         self._canvas = FigureCanvasQTAgg(self._fig)
@@ -1069,10 +1087,11 @@ class ImportanceWidget(QWidget):
             self._obj_combo.setCurrentText(prev)
         self._obj_combo.blockSignals(False)
 
-        self._redraw()
+        self._needs_redraw = True   # rendered on demand when tab is selected
 
     def clear(self) -> None:
-        self._df = None
+        self._df           = None
+        self._needs_redraw = False
         self._fig.clear()
         self._canvas.draw_idle()
         self._canvas.hide()
@@ -1253,6 +1272,7 @@ class ProfilerWidget(QWidget):
         self._rf = None
         self._enabled_params: List[ParameterConfig] = []
         self._cat_codes: dict = {}   # param_name → {category_value: int_code}
+        self._needs_redraw: bool = False   # lazy — only fit RF when tab is shown
 
         # Per-row control widgets (rebuilt in _rebuild_controls)
         self._controls: dict = {}    # param_name → primary widget
@@ -1343,12 +1363,13 @@ class ProfilerWidget(QWidget):
             self._obj_combo.setCurrentText(prev_obj)
         self._obj_combo.blockSignals(False)
 
-        self._fit_and_rebuild()
+        self._needs_redraw = True   # RF fit deferred until tab is shown
 
     def clear(self) -> None:
         """Reset to placeholder state."""
-        self._df         = None
-        self._rf         = None
+        self._df           = None
+        self._rf           = None
+        self._needs_redraw = False
         self._enabled_params = []
         self._cat_codes  = {}
         self._clear_controls_layout()
@@ -1984,6 +2005,9 @@ class DesignSpaceDialog(QDialog):
         self._validation_results = None   # ValidationResults | None
         self._validation_worker  = None   # ValidationWorker  | None
         self._val_tabs_added     = False  # True once validation tabs injected
+        # Canvases created in _ensure_val_tabs() — kept so showEvent() can
+        # force a redraw when the dialog is reshown after being hidden.
+        self._val_canvases: List[FigureCanvasQTAgg] = []
         # Stored for _extract_xy() and _extract_context()
         self._df: Optional[pd.DataFrame] = None
         self._params: List[ParameterConfig] = []
@@ -2044,16 +2068,77 @@ class DesignSpaceDialog(QDialog):
         vbox.addLayout(_val_row)
         vbox.addWidget(self._tabs, stretch=1)
 
-        # ── Bottom row: size grip + close button ──────────────────────────
+        # ── Fullscreen toggle state ───────────────────────────────────────
+        self._is_fullscreen: bool = False
+        self._normal_geometry = None   # QRect saved before going fullscreen
+
+        # ── Tab-changed signal for lazy rendering ──────────────────────────
+        self._tabs.currentChanged.connect(self._on_tab_selected)
+
+        # ── Bottom row: size grip + fullscreen + close ────────────────────
         bottom_row = QHBoxLayout()
         size_grip = QSizeGrip(self)
         bottom_row.addWidget(size_grip, alignment=Qt.AlignLeft | Qt.AlignBottom)
         bottom_row.addStretch()
+        self._fullscreen_btn = QPushButton("⛶  Fullscreen")
+        self._fullscreen_btn.setFixedWidth(115)
+        self._fullscreen_btn.setToolTip("Expand to fill the screen.")
+        self._fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+        bottom_row.addWidget(self._fullscreen_btn)
         close_btn = QPushButton("Close")
         close_btn.setFixedWidth(90)
         close_btn.clicked.connect(self.hide)
         bottom_row.addWidget(close_btn)
         vbox.addLayout(bottom_row)
+
+    # ── Fullscreen toggle ─────────────────────────────────────────────────
+
+    def _toggle_fullscreen(self) -> None:
+        """Toggle between fullscreen and the pre-fullscreen window size."""
+        if not self._is_fullscreen:
+            # Save geometry before expanding
+            self._normal_geometry = self.geometry()
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                self.setGeometry(screen.availableGeometry())
+            else:
+                self.showMaximized()
+            self._is_fullscreen = True
+            self._fullscreen_btn.setText("⧉  Windowed")
+            self._fullscreen_btn.setToolTip("Restore to normal window size.")
+        else:
+            # Restore saved geometry
+            if self._normal_geometry is not None:
+                self.setGeometry(self._normal_geometry)
+            self._is_fullscreen = False
+            self._fullscreen_btn.setText("⛶  Fullscreen")
+            self._fullscreen_btn.setToolTip("Expand to fill the screen.")
+
+    # ── Lazy tab rendering ────────────────────────────────────────────────
+
+    def _on_tab_selected(self, index: int) -> None:
+        """
+        Render the newly selected tab on demand.
+
+        Tabs 1–3 (Correlation, Importance, Profiler) use expensive computations
+        (RF fitting, permutation importance) that would freeze the UI if run
+        eagerly.  They set _needs_redraw=True in refresh() and are only
+        computed here when the user actually clicks the tab.
+
+        Tab 0 (Design Space pairplot) always renders immediately — it is the
+        active default and the computation is cheap.
+        Tab 4+ (Validation figures) are static matplotlib canvases — no
+        recomputation needed.
+        """
+        if index == 1 and getattr(self._corr_widget, '_needs_redraw', False):
+            self._corr_widget._needs_redraw = False
+            self._corr_widget._redraw()
+        elif index == 2 and getattr(self._importance_widget, '_needs_redraw', False):
+            self._importance_widget._needs_redraw = False
+            self._importance_widget._redraw()
+        elif index == 3 and getattr(self._profiler_widget, '_needs_redraw', False):
+            self._profiler_widget._needs_redraw = False
+            self._profiler_widget._fit_and_rebuild()
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -2200,6 +2285,7 @@ class DesignSpaceDialog(QDialog):
         self._validation_results = None
         self._validation_worker  = None
         self._val_tabs_added     = False
+        self._val_canvases.clear()
         self._val_progress.setVisible(False)
         self._val_status_lbl.setVisible(False)
         if hasattr(self, "_val_checkbox"):
@@ -2320,6 +2406,7 @@ class DesignSpaceDialog(QDialog):
                 continue
             canvas = FigureCanvasQTAgg(fig)
             canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self._val_canvases.append(canvas)   # track for showEvent redraw
             page = QWidget()
             page_vbox = QVBoxLayout(page)
             page_vbox.setContentsMargins(4, 4, 4, 4)
@@ -2329,6 +2416,22 @@ class DesignSpaceDialog(QDialog):
         # Switch to first validation tab
         if self._tabs.count() > first_val_idx:
             self._tabs.setCurrentIndex(first_val_idx)
+
+    # ── showEvent: force validation canvases to repaint when reshown ──────
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """Schedule a non-blocking repaint of validation canvases when reshown.
+
+        FigureCanvasQTAgg buffers can go stale after hide() + show().  Using
+        draw_idle() (non-blocking) rather than draw() prevents the UI from
+        freezing if there are many large validation figures.
+        """
+        super().showEvent(event)
+        for canvas in self._val_canvases:
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
 
     # ── Validation: data extraction helpers ──────────────────────────────
 

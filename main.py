@@ -11,7 +11,11 @@ import sys
 
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
-from main_window import MainWindow
+
+# ── Logging must be configured before any other LabOpt import ────────────────
+from app_logger import configure_logger, get_logger, log_path
+configure_logger()
+_log = get_logger(__name__)
 
 
 def _resource_path(relative: str) -> str:
@@ -24,7 +28,37 @@ def _resource_path(relative: str) -> str:
     return os.path.join(base, relative)
 
 
+def _install_excepthook() -> None:
+    """
+    Replace sys.excepthook so unhandled exceptions are written to the log
+    file before the default traceback is printed.
+
+    This is the last line of defence for diagnosing crashes — the log entry
+    will be visible in labopt.log even if the terminal window was closed.
+    """
+    _crash_log = get_logger("crash")
+
+    def _hook(exc_type, exc_val, exc_tb):
+        _crash_log.critical(
+            "Unhandled exception — application may crash",
+            exc_info=(exc_type, exc_val, exc_tb),
+        )
+        # Let the default handler print to stderr as well
+        sys.__excepthook__(exc_type, exc_val, exc_tb)
+
+    sys.excepthook = _hook
+
+
 def main() -> None:
+    _install_excepthook()
+
+    _log.info("=" * 60)
+    _log.info("LabOpt starting  (Python %s)", sys.version.split()[0])
+    _log.info("Log file: %s", log_path())
+    _log.info("=" * 60)
+
+    from main_window import MainWindow   # deferred so logger is ready first
+
     app = QApplication(sys.argv)
     app.setApplicationName("LabOpt")
     app.setOrganizationName("Lab")
@@ -35,7 +69,11 @@ def main() -> None:
 
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+
+    _log.info("Main window shown — entering event loop")
+    exit_code = app.exec()
+    _log.info("Event loop exited (code %d) — shutting down", exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

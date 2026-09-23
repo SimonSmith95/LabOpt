@@ -54,6 +54,10 @@ python main.py
 | **Parameter constraints** | Algebraic equality & inequality rules (e.g. fractions summing to 1) |
 | **Dead regions** | Forbidden parameter sub-ranges the model never suggests |
 | **Context variables** | Uncontrollable environmental conditions (humidity, pressure) that the surrogate learns from without being suggested — corrections allowed after the experiment |
+| **🧪 Design of Experiments** | 8 strategies (LHS, Sobol, Halton, Full Factorial, Plackett-Burman, Box-Behnken, CCD, Random) to seed the surrogate before BO starts. Formula-based readiness indicator shows when to hand off to BO. Integrated coverage metrics, pairplot, main effects plots. |
+| **Session naming** | Human-readable project names, researcher field, and description stored in every session. Title bar and menus show project name instead of timestamp. |
+| **Session Browser** | File → Browse All Sessions… lists all projects by researcher, date, trial count, and status. |
+| **Docker / multi-user** | `LABOPT_SESSION_DIR` and `LABOPT_USER` environment variables for shared lab deployments. Per-user directory isolation on disk. |
 | **Session persistence** | SQLite + JSON — resume any session from any machine |
 | **Design space visualisation** | Pairplot / parallel coordinates / 1-D marginals with batch overlay |
 | **Correlation matrix** | Pearson or Spearman heatmap across all parameters and objectives |

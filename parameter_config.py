@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
+# DoEState uses Any for the results list (List[Optional[List[float]]])
+from typing import Any
 
 
 class ParameterType(Enum):
@@ -346,4 +348,60 @@ class StudyConfig:
             auto_stop=d.get("auto_stop", False),
             auto_stop_min_improvement=float(d.get("auto_stop_min_improvement", 0.01)),
             auto_stop_n_batches=int(d.get("auto_stop_n_batches", 3)),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DoEState — persists the DoE phase within a session
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class DoEState:
+    """
+    Persists the active Design of Experiments phase for a session.
+
+    points      : list of param-value dicts (one per DoE run), in the same
+                  format as StudyConfig parameter names.  Objective columns
+                  are NOT included here; they are stored in the Optuna DB
+                  as historical trials once entered.
+    results     : list of objective-value lists, parallel to points.
+                  None entries = not yet measured.  Length always == len(points).
+    strategy    : DoE strategy used, e.g. "LHS", "Sobol", "PlackettBurman"
+    n_points    : number of generated points (== len(points))
+    seed        : random seed used for reproducible generation
+    complete    : True when all results have been entered AND registered
+                  into the Optuna study.
+    registered_trial_numbers : list of Optuna trial numbers that were created
+                  from DoE results.  Used to distinguish DoE trials from BO
+                  trials in the results table (shown with a "DoE" tag).
+    """
+    strategy: str
+    n_points: int
+    seed: int
+    points: List[dict]
+    results: List[Any]          # List[Optional[List[float]]]
+    complete: bool = False
+    registered_trial_numbers: List[int] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "strategy": self.strategy,
+            "n_points": self.n_points,
+            "seed": self.seed,
+            "points": self.points,
+            "results": self.results,
+            "complete": self.complete,
+            "registered_trial_numbers": self.registered_trial_numbers,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DoEState":
+        return cls(
+            strategy=d["strategy"],
+            n_points=d["n_points"],
+            seed=d["seed"],
+            points=d["points"],
+            results=d["results"],
+            complete=d.get("complete", False),
+            registered_trial_numbers=d.get("registered_trial_numbers", []),
         )

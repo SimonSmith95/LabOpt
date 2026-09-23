@@ -48,8 +48,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app_logger import get_logger, log_path
 from batch_results_dialog import BatchResultsDialog
 from design_space_widget import ConvergenceWidget, DesignSpaceDialog, ParetoWidget
+
+_log = get_logger(__name__)
 from power_analysis_widget import PowerAnalysisCoordinator
 from csv_loader import aggregate_replicates, extract_param_defaults, infer_context_defaults, load_csv, load_trials_from_csv
 from report_generator import export_plots_as_png, generate_report, write_report
@@ -66,6 +69,9 @@ from parameter_config import (
     ObjectiveConfig, ParameterConfig, ParameterConstraint, ParameterType, StudyConfig,
 )
 from session_manager import SessionManager, SessionState
+from new_session_dialog import NewSessionDialog
+from session_browser import SessionBrowserDialog
+from doe_widget import DoEWidget
 from worker import OptimizationWorker
 
 # ── Warning thresholds (Phase 10) ─────────────────────────────────────────────
@@ -587,6 +593,12 @@ class MainWindow(QMainWindow):
         # Reference to results dialog so we can collect context corrections after submit
         self._active_batch_dlg: Optional[BatchResultsDialog] = None
 
+        # ── Pending project identity (set by NewSessionDialog, consumed by _action_apply_objectives) ──
+        self._pending_project_name: str = ""
+        self._pending_owner: str = ""
+        self._pending_description: str = ""
+        self._pending_session_dir: str = ""
+
         # Centre stacked widget — created early so _build_left_dock (which adds
         # the power result panel as page 1) and _build_centre (which adds the
         # param-card scroll area as page 0) can both reference it.
@@ -608,6 +620,16 @@ class MainWindow(QMainWindow):
         dark = settings.value("dark_mode", True, type=bool)
         self._dark_mode_action.setChecked(dark)
         self._apply_theme(dark)
+
+        # ── Periodic system-metrics logger ─────────────────────────────────
+        # Logs RSS memory, CPU %, and thread count every 60 seconds so that
+        # any gradual memory leak or CPU spike is visible in labopt.log.
+        from PySide6.QtCore import QTimer
+        self._metrics_timer = QTimer(self)
+        self._metrics_timer.setInterval(60_000)   # 60 s
+        self._metrics_timer.timeout.connect(self._log_system_metrics)
+        self._metrics_timer.start()
+        _log.info("MainWindow ready  (log → %s)", log_path())
 
     # ══════════════════════════════════════════════════════════════════════
     # Menu bar
@@ -631,6 +653,14 @@ class MainWindow(QMainWindow):
 
         self._recent_menu = file_menu.addMenu("Recent Sessions")
         self._refresh_recent_menu()
+
+        browse_sess_act = QAction("Browse All Sessions…", self)
+        browse_sess_act.setToolTip(
+            "Open the Session Browser to find and load any session\n"
+            "in the configured session directory."
+        )
+        browse_sess_act.triggered.connect(self._action_browse_sessions)
+        file_menu.addAction(browse_sess_act)
 
         file_menu.addSeparator()
 
@@ -678,7 +708,11 @@ class MainWindow(QMainWindow):
         self._recent_menu.clear()
         recent = SessionManager.list_recent_sessions(5)
         for entry in recent:
-            act = QAction(entry.get("study_name", "Unknown"), self)
+            # Show human-readable project name + owner when available
+            project = entry.get("project_name") or entry.get("study_name", "Unknown")
+            owner = entry.get("owner", "")
+            label = f"{project}  [{owner}]" if owner else project
+            act = QAction(label, self)
             path = entry.get("session_path", "")
             act.triggered.connect(
                 lambda _checked, p=path: self._load_session_from_path(p)
@@ -909,6 +943,18 @@ class MainWindow(QMainWindow):
         _btn_vbox.setContentsMargins(6, 4, 6, 6)
         _btn_vbox.setSpacing(4)
 
+        # ── Compact surrogate readiness indicator ──────────────────────
+        self._compact_readiness_lbl = QLabel("Readiness: — / —")
+        self._compact_readiness_lbl.setStyleSheet(
+            "font-size: 10px; color: #6c6f85; padding: 2px 0;"
+        )
+        self._compact_readiness_lbl.setAlignment(Qt.AlignCenter)
+        self._compact_readiness_lbl.setToolTip(
+            "Surrogate readiness: number of completed trials vs. recommended minimum.\n"
+            "Open the 🧪 DoE tab for the full readiness bar and formula details."
+        )
+        _btn_vbox.addWidget(self._compact_readiness_lbl)
+
         self._ask_btn = QPushButton("Ask Next Batch")
         self._ask_btn.setEnabled(False)
         bold_big = QFont()
@@ -1051,6 +1097,15 @@ class MainWindow(QMainWindow):
         self._power = PowerAnalysisCoordinator()
         self._left_tabs.addTab(self._power.input_panel, "🔬  Power")
         self._centre_stack.addWidget(self._power.result_panel)  # index 1
+
+        # ══════════════════════════════════════════════════════════════
+        # Tab 4 — 🧪 DoE
+        # ══════════════════════════════════════════════════════════════
+        self._doe_widget = DoEWidget(parent=self)
+        self._left_tabs.addTab(self._doe_widget, "🧪  DoE")
+        self._doe_widget.readiness_changed.connect(self._on_doe_readiness_changed)
+        self._doe_widget.start_bo_requested.connect(self._on_start_bo_from_doe)
+
         self._left_tabs.currentChanged.connect(self._on_left_tab_changed)
 
         self._left_dock.setWidget(outer)
@@ -1160,8 +1215,10 @@ class MainWindow(QMainWindow):
         try:
             df = load_csv(path)
         except ValueError as exc:
+            _log.error("CSV load failed: %s  (%s)", path, exc)
             QMessageBox.critical(self, "CSV Error", str(exc))
             return
+        _log.info("CSV loaded: %s  (%d rows × %d cols)", path, len(df), len(df.columns))
         self._df = df
         self._csv_path = path
         if self._session_state:
@@ -1326,13 +1383,22 @@ class MainWindow(QMainWindow):
         # Create a new session if one doesn't exist yet
         if self._session_state is None:
             session_dir = (
-                os.path.dirname(self._csv_path)
-                if self._csv_path
-                else os.path.join(os.path.expanduser("~"), "bhop_sessions")
+                self._pending_session_dir
+                or (os.path.dirname(self._csv_path) if self._csv_path else "")
+                or os.path.join(os.path.expanduser("~"), "labopt_sessions")
             )
             self._session_state = SessionManager.create_new_session(
-                config, self._csv_path or "", session_dir
+                config, self._csv_path or "", session_dir,
+                project_name=self._pending_project_name,
+                owner=self._pending_owner,
+                description=self._pending_description,
             )
+            # Clear consumed identity fields
+            self._pending_project_name = ""
+            self._pending_owner = ""
+            self._pending_description = ""
+            self._pending_session_dir = ""
+            self._update_window_title()
 
         self._session_state.study_config = config
         # Persist the updated config (including constraints) immediately so it
@@ -1406,6 +1472,13 @@ class MainWindow(QMainWindow):
                 td.setdefault("user_attrs", {})["n_replicates"] = n_rep
 
         added, skipped = load_historical_trials(self._study, trial_dicts, config)
+        _log.info(
+            "Objectives applied: %s | sampler=%s | %d params | %d trials loaded (%d skipped)",
+            [o.column_name for o in objectives],
+            config.sampler_name,
+            len([p for p in params if p.enabled]),
+            added, skipped,
+        )
 
         # Build parameter cards
         self._build_param_cards(params)
@@ -1416,6 +1489,9 @@ class MainWindow(QMainWindow):
         self._refresh_recent_menu()
         self._refresh_design_space()   # show historical data, no suggestions yet
         self._update_main_val_checkbox()  # enable if ≥ 30 unique rows
+
+        # Refresh DoE widget with new session + study
+        self._doe_widget.refresh(self._session_state, self._study)
 
         # Status message describes whether aggregation occurred
         if repl_enabled and n_agg < n_raw:
@@ -1499,7 +1575,7 @@ class MainWindow(QMainWindow):
             "Correct per-trial in the results dialog if conditions differed.</i>"
         )
         help_lbl.setWordWrap(True)
-        help_lbl.setTextFormat(Qt.RichText)
+        help_lbl.setTextFormat(Qt.TextFormat.RichText)
         help_lbl.setStyleSheet("color: #a6e3a1; font-size: 11px;")
         grp_layout.addWidget(help_lbl)
 
@@ -1660,6 +1736,10 @@ class MainWindow(QMainWindow):
             self._planned_context = None
             self._worker.planned_context = None
 
+        _log.info(
+            "Asking batch: size=%d  sampler=%s  batches_done=%d",
+            config.batch_size, config.sampler_name, self._batches_done,
+        )
         self._ask_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)
         self._set_status("Asking batch…")
@@ -1763,10 +1843,19 @@ class MainWindow(QMainWindow):
         self._set_status("Submitting results…")
 
     def _on_batch_complete(self, done: int, total: int) -> None:
+        _log.info("Batch %d/%d complete", done, total)
         self._batches_done = done
         self._batches_done_label.setText(f"{done} / {total}")
         self._refresh_results_tables()
         self._update_status_bar()
+        # Update DoE readiness bar with new trial count
+        if self._study:
+            try:
+                from optuna.trial import TrialState as _TS_bc
+                n_done = len([t for t in self._study.trials if t.state == _TS_bc.COMPLETE])
+                self._doe_widget.update_n_done(n_done)
+            except Exception:
+                pass
         # Auto-switch to Results tab so the user sees the new data immediately
         self._left_tabs.setCurrentIndex(1)
         self._set_status(f"Batch {done}/{total} complete.")
@@ -1821,6 +1910,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Done", "All batches complete!")
 
     def _on_worker_error(self, msg: str) -> None:
+        _log.error("Worker error: %s", msg)
         QMessageBox.critical(self, "Worker Error", msg)
         self._ask_btn.setEnabled(True)
         self._pause_btn.setEnabled(False)
@@ -1901,13 +1991,35 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
 
     def _action_new_session(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select CSV for New Session", "", "CSV Files (*.csv)"
+        """Open the two-step New Session wizard."""
+        dlg = NewSessionDialog(parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        # Store project identity so _action_apply_objectives can pass it to create_new_session
+        self._pending_project_name = dlg.project_name
+        self._pending_owner = dlg.owner
+        self._pending_description = dlg.description
+        self._pending_session_dir = dlg.session_dir
+        self._session_state = None  # will be created on Apply Objectives
+        if dlg.start_from_scratch:
+            self._set_status(
+                f"New session '{dlg.project_name}': define parameters, "
+                "then generate a DoE or click Apply Objectives."
+            )
+        elif dlg.csv_path:
+            self._do_load_csv(dlg.csv_path)
+            self._set_status(
+                f"New session '{dlg.project_name}': select objectives, "
+                "then click Apply Objectives."
+            )
+
+    def _action_browse_sessions(self) -> None:
+        """Open the Session Browser dialog (File → Browse All Sessions…)."""
+        dlg = SessionBrowserDialog(
+            parent=self,
+            open_callback=self._load_session_from_path,
         )
-        if path:
-            self._session_state = None  # will be created on Apply Objectives
-            self._do_load_csv(path)
-            self._set_status("New session: configure objectives, then click Apply Objectives.")
+        dlg.exec()
 
     def _action_load_session(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1916,7 +2028,71 @@ class MainWindow(QMainWindow):
         if path:
             self._load_session_from_path(path)
 
+    def _reset_ui_for_new_session(self) -> None:
+        """
+        Clear all UI state before loading or switching sessions.
+
+        Ensures that loading a second session gives exactly the same fresh
+        state as opening the app from scratch and loading a session.
+        """
+        # ── Data state ─────────────────────────────────────────────────────
+        self._df       = None
+        self._csv_path = None
+        self._csv_path_label.setText("  No CSV loaded")
+
+        # ── Stop any running validation worker ─────────────────────────────
+        if self._validation_worker is not None and \
+                self._validation_worker.isRunning():
+            self._validation_worker.terminate()
+            self._validation_worker.wait(2000)
+        self._validation_results = None
+        self._validation_worker  = None
+
+        # ── Reset Results-tab validation UI ────────────────────────────────
+        self._val_progress_main.setValue(0)
+        self._val_progress_main.setVisible(False)
+        self._val_status_lbl_main.setVisible(False)
+        self._val_checkbox_main.blockSignals(True)
+        self._val_checkbox_main.setChecked(False)
+        self._val_checkbox_main.setText("🔬  Surrogate Validation")
+        self._val_checkbox_main.setEnabled(False)
+        self._val_checkbox_main.blockSignals(False)
+
+        # ── Clear Design Space dialog ───────────────────────────────────────
+        if self._design_space_dlg is not None:
+            try:
+                self._design_space_dlg.clear()
+            except Exception:
+                pass
+
+        # ── Clear results tables ────────────────────────────────────────────
+        self._trials_table.clearContents()
+        self._trials_table.setRowCount(0)
+        self._pareto_table.clearContents()
+        self._pareto_table.setRowCount(0)
+
+        # ── Clear convergence / pareto plots ────────────────────────────────
+        try:
+            self._convergence_widget.clear()
+        except Exception:
+            pass
+        try:
+            self._pareto_widget.clear()
+        except Exception:
+            pass
+
+        # ── Reset misc UI state ─────────────────────────────────────────────
+        self._resume_banner.hide()
+        self._batches_done = 0
+        self._batches_done_label.setText("0 / —")
+        self._compact_readiness_lbl.setText("Readiness: — / —")
+        self._compact_readiness_lbl.setStyleSheet(
+            "font-size: 10px; color: #6c6f85; padding: 2px 0;"
+        )
+        self._set_status("Loading session…")
+
     def _load_session_from_path(self, path: str) -> None:
+        self._reset_ui_for_new_session()
         try:
             state = SessionManager.load(path)
         except Exception as exc:
@@ -1980,7 +2156,17 @@ class MainWindow(QMainWindow):
         else:
             self._resume_banner.hide()
 
-        self._set_status(f"Session '{state.study_name}' loaded.")
+        # Refresh DoE widget with loaded session + study
+        self._doe_widget.refresh(self._session_state, self._study)
+
+        _log.info(
+            "Session loaded: %s  (%d trials)",
+            state.display_name,
+            len(self._study.trials) if self._study else 0,
+        )
+        self._update_main_val_checkbox()   # re-enable if loaded CSV has ≥ 30 unique rows
+        self._update_window_title()
+        self._set_status(f"Session '{state.display_name}' loaded.")
 
     # ══════════════════════════════════════════════════════════════════════
     # Config save / load
@@ -2423,6 +2609,10 @@ class MainWindow(QMainWindow):
         self._val_status_lbl_main.setText(msg)
 
     def _on_main_val_done(self, results) -> None:
+        _log.info(
+            "Surrogate validation complete: %d/%d checks passed  %s",
+            results.n_pass, results.n_checks, results.summary,
+        )
         self._validation_results = results
         self._val_progress_main.setValue(100)
         self._val_status_lbl_main.setText(
@@ -2439,6 +2629,7 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_main_val_error(self, msg: str) -> None:
+        _log.error("Surrogate validation failed: %s", msg[:200])
         self._val_progress_main.setVisible(False)
         self._val_status_lbl_main.setVisible(False)
         self._val_checkbox_main.setText("🔬  Surrogate Validation  ❌")
@@ -2532,12 +2723,25 @@ class MainWindow(QMainWindow):
             n_batches    = 0
             objectives   = []
 
+        # Include project identity and DoE info in the report metadata
+        _project = getattr(self._session_state, "project_name", "") if self._session_state else ""
+        _owner   = getattr(self._session_state, "owner", "") if self._session_state else ""
+        _desc    = getattr(self._session_state, "description", "") if self._session_state else ""
+        _doe     = ""
+        if self._session_state and self._session_state.doe_state:
+            _doe = (f"{self._session_state.doe_state.strategy} "
+                    f"({self._session_state.doe_state.n_points} pts)")
+
         metadata = {
             "session_name": session_name,
             "date": datetime.date.today().isoformat(),
             "sampler": sampler,
             "n_batches": n_batches,
             "objectives": objectives,
+            "project_name": _project,
+            "owner": _owner,
+            "description": _desc,
+            "doe_strategy": _doe,
         }
 
         # ── Build trials DataFrame ─────────────────────────────────────────
@@ -2713,6 +2917,77 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
     # Helpers
     # ══════════════════════════════════════════════════════════════════════
+
+    # ── DoE signal handlers ────────────────────────────────────────────────
+
+    def _on_doe_readiness_changed(self, n_done: int, target: int) -> None:
+        """
+        Called when the DoE widget emits readiness_changed.
+        Updates the compact readiness indicator in the ⚙ Settings tab.
+        """
+        pct = min(100, int(100 * n_done / max(1, target)))
+        if pct >= 100:
+            colour = "#2ecc71"   # green
+            dot = "●"
+        elif pct >= 50:
+            colour = "#f39c12"   # amber
+            dot = "●"
+        else:
+            colour = "#e74c3c"   # red
+            dot = "●"
+        self._compact_readiness_lbl.setText(
+            f"Surrogate: {n_done}/{target} runs  "
+            f"<span style='color:{colour}'>{dot}</span>"
+        )
+        self._compact_readiness_lbl.setTextFormat(Qt.TextFormat.RichText)
+
+    def _on_start_bo_from_doe(self) -> None:
+        """
+        Called when the user clicks 'Start Optimisation' in the DoE tab.
+        Switches to the ⚙ Settings tab and enables the Ask Next Batch button.
+        """
+        self._left_tabs.setCurrentIndex(0)   # ⚙ Settings tab
+        self._ask_btn.setEnabled(True)
+        # Show a brief banner informing the user that BO is now active
+        self._resume_label.setText(
+            "✅  <b>DoE phase complete.</b>  BO is now active — "
+            "click <b>Ask Next Batch</b> to get the first suggested experiments."
+        )
+        self._resume_banner.show()
+        self._set_status(
+            "DoE complete. Surrogate seeded — click 'Ask Next Batch' to start BO."
+        )
+
+    def _update_window_title(self) -> None:
+        """Update window title bar to show the current project name and owner."""
+        if self._session_state and self._session_state.project_name:
+            title = f"LabOpt — {self._session_state.project_name}"
+            if self._session_state.owner:
+                title += f"  [{self._session_state.owner}]"
+        else:
+            title = "LabOpt — Lab Optimiser"
+        self.setWindowTitle(title)
+
+    # ── System metrics logger (called every 60 s by QTimer) ───────────────
+
+    def _log_system_metrics(self) -> None:
+        """Log RSS memory, CPU %, and thread count for the current process."""
+        try:
+            import psutil, os as _os
+            proc = psutil.Process(_os.getpid())
+            mem_mb   = proc.memory_info().rss / (1024 * 1024)
+            cpu_pct  = proc.cpu_percent(interval=None)   # non-blocking
+            n_threads = proc.num_threads()
+            n_trials = (
+                len(self._study.trials) if self._study else 0
+            )
+            _log.info(
+                "System metrics — RSS: %.1f MB  CPU: %.1f%%  "
+                "Threads: %d  Trials: %d",
+                mem_mb, cpu_pct, n_threads, n_trials,
+            )
+        except Exception:
+            pass   # psutil not installed or OS error — silent skip
 
     def _set_status(self, msg: str) -> None:
         self._status_text.setText(f"Status: {msg}")
@@ -3033,6 +3308,8 @@ class MainWindow(QMainWindow):
             self._sync_config_from_ui()
             SessionManager.save(self._session_state)
 
+        _log.info("Application closing — session saved: %s",
+                  bool(self._session_state))
         if self._worker and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(3000)

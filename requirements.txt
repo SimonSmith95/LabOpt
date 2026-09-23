@@ -10,3 +10,5 @@ sqlalchemy>=2.0
 scikit-learn>=1.4
 scipy>=1.11
 openpyxl>=3.1        # Excel (.xlsx/.xls) file read/write (Feature 10)
+pyDOE2>=1.3          # Plackett-Burman, Box-Behnken, CCD (optional — soft dependency)
+psutil>=5.9          # Process memory / CPU metrics for the application logger

@@ -52,6 +52,19 @@
     - 11.3 [Validation Caveats](#113-validation-caveats)
     - 11.4 [When to Use LabOpt](#114-when-to-use-and-when-not-to-use-labopt)
     - 11.5 [Reporting and Reproducibility](#115-reporting-and-reproducibility)
+12. [Design of Experiments (DoE)](#12-design-of-experiments-doe)
+    - 12.1 [What is a DoE and Why Does it Matter?](#121-what-is-a-doe-and-why-does-it-matter)
+    - 12.2 [Supported Strategies](#122-supported-strategies)
+    - 12.3 [The Surrogate Readiness Formula](#123-the-surrogate-readiness-formula)
+    - 12.4 [DoE Workflow in LabOpt](#124-doe-workflow-in-labopt)
+    - 12.5 [Assumptions and Limitations](#125-assumptions-and-limitations)
+    - 12.6 [Coverage Metrics Explained](#126-coverage-metrics-explained)
+    - 12.7 [Exporting DoE Results](#127-exporting-doe-results)
+13. [Session Naming & Multi-User Deployment](#13-session-naming--multi-user-deployment)
+    - 13.1 [Project Names and Researchers](#131-project-names-and-researchers)
+    - 13.2 [Environment Variables for Docker / Shared Lab](#132-environment-variables-for-docker--shared-lab)
+    - 13.3 [Session Browser](#133-session-browser)
+    - 13.4 [Backward Compatibility](#134-backward-compatibility)
 
 ---
 
@@ -2369,6 +2382,217 @@ If you use LabOpt in research, include the following in your methods section:
 
 This allows others to assess the quality of your surrogate model and
 reproduce your optimisation trajectory.
+
+---
+
+## 12. Design of Experiments (DoE)
+
+The DoE feature helps you plan your first batch of experiments *before* any
+LabOpt session has results.  A well-chosen initial design gives the surrogate
+model a global view of the parameter space from the start, which typically
+reduces the total number of experiments needed to reach the optimum by 20–40%.
+
+---
+
+### 12.1 What is a DoE and Why Does it Matter?
+
+When LabOpt starts a new session it has no data.  If you click "Ask Next
+Batch" immediately, the sampler uses a pseudo-random warm-up (Optuna's
+`n_startup_trials`).  Random sampling does **not** guarantee coverage:
+points can cluster by chance, leaving entire regions unexplored.
+
+A DoE distributes points *deliberately* so that:
+- Every "slice" of every parameter dimension is covered (LHS).
+- The minimum pairwise distance between points is maximised (maximin).
+- The L2-star discrepancy (deviation from a uniform distribution) is
+  minimised.
+
+The DoE phase sits *before* the main BO loop.  After entering your results
+the surrogate is seeded from day 1, and the "Start Optimisation" button
+hands off to BO with a well-informed prior.
+
+---
+
+### 12.2 Supported Strategies
+
+| Strategy | Best for | N formula | Requires |
+|---|---|---|---|
+| **LHS** (Latin Hypercube) | General purpose, mixed types | Any N | scipy |
+| **Sobol** | Large N, continuous, best joint coverage | Powers of 2 | scipy |
+| **Halton** | Continuous, any N, flexible | Any N | scipy |
+| **Full Factorial** | Few categorical / integer parameters | levels^n_params | stdlib |
+| **Plackett-Burman** | Screening — many factors, few runs | Next 4k ≥ k+1 | pyDOE2 |
+| **Box-Behnken** | RSM without extreme corner points | Tables (3–7 factors) | pyDOE2 |
+| **CCD** | Quadratic response surface | Factorial + axial | pyDOE2 |
+| **Random** | Baseline comparison only | Any N | stdlib |
+
+**Choosing a strategy:**
+- Default to **LHS** unless you have a specific reason to use another.
+- Use **Sobol** when N ≥ 32 and all parameters are continuous.
+- Use **Plackett-Burman** when you just want to screen which factors matter.
+- Use **Box-Behnken** or **CCD** when you are fitting a quadratic model.
+
+---
+
+### 12.3 The Surrogate Readiness Formula
+
+The DoE tab shows a readiness bar with a formula-based target:
+
+```
+target = max(10,  5 × n_params  +  2 × n_context)  +  max(0, (n_obj − 1) × 5)
+```
+
+Where:
+- `n_params` = enabled, non-residual controllable parameters
+- `n_context` = context variables
+- `n_obj` = number of optimisation objectives
+
+**Rationale:**
+- The "5 samples per parameter" rule comes from Jones et al. (1998) and
+  Sacks et al. (1989).  A GP with k parameters needs at least k+1 points
+  to fit any model; 5k gives enough data for 5-fold cross-validation.
+- Context variables add noise the model must separate; 2 extra points each.
+- Multi-objective problems require more points to approximate the Pareto front.
+- The floor of 10 matches the `MIN_TRIALS` constant in `surrogate_quality.py`.
+
+The readiness bar is **guidance, not a guarantee**.  The surrogate quality
+badge (R²) is the authoritative model-based indicator.
+
+---
+
+### 12.4 DoE Workflow in LabOpt
+
+1. **File → New Session…** — enter project name, researcher, session folder.
+2. **Apply Objectives →** — configure parameters and objectives.
+3. **Open the 🧪 DoE tab** — note the readiness target and formula.
+4. **Choose strategy and N** — start with LHS and N = readiness target.
+5. **Click "Generate DoE"** — review the pairplot and coverage metrics.
+6. **Export Pending CSV…** — take the parameter combinations to the lab.
+7. **Run the experiments** and record objective values.
+8. **Enter results** in the DoE table (or Import Results CSV…).
+9. **Click "Register Results →"** — trials are added to the Optuna study.
+10. **When the readiness bar turns green** → click **"▶ Start Optimisation"**.
+11. The ⚙ Settings tab becomes active — click **"Ask Next Batch"** to start BO.
+
+---
+
+### 12.5 Assumptions and Limitations
+
+**A. LHS uniformity is marginal, not joint.**
+LHS guarantees one point per equal-width bin in *each individual dimension*.
+It does NOT guarantee good coverage in 2D slices (pairs of dimensions).
+Sobol has better joint coverage for large N but requires N = 2^m exactly.
+
+**B. The "5 per parameter" rule is a heuristic lower bound.**
+Published benchmarks vary: some problems need 10× per parameter, others work
+with 3×.  The readiness bar is guidance; the R² badge is the real indicator.
+
+**C. Context variables are NOT part of the DoE point selection.**
+The DoE generator places points in the *controllable* parameter space only.
+Context variable values (humidity, batch number, etc.) are recorded as
+*measured* during each DoE experiment — they cannot be balanced by the design.
+
+**D. Equality constraints (compositional) are handled exactly.**
+The generator uses algebraic residual computation for `a + b + c = 1` style
+constraints — no wasted points.
+
+**E. Inequality constraints use rejection sampling.**
+If the feasible region is very small (< ~10% of the box), the generator may
+issue a warning and return fewer points than requested.  Relax the constraint
+or reduce N.
+
+**F. Box-Behnken requires exactly 3–7 continuous factors.**
+Categorical parameters are treated as discrete levels.
+
+**G. The DoE is a one-shot design — it does not adapt.**
+If results reveal an unexpected landscape, you can generate additional DoE
+batches and register them before starting BO.
+
+---
+
+### 12.6 Coverage Metrics Explained
+
+After generation the DoE tab shows:
+
+| Metric | Interpretation | Better when |
+|---|---|---|
+| **Maximin distance** | Minimum pairwise Euclidean distance (normalised) | Higher |
+| **L2-star discrepancy** | Deviation from uniform distribution | Lower |
+| **vs. Random baseline** | How much better than Optuna's default startup | Always positive |
+
+A LHS design with N=20 points in 4 dimensions typically achieves
+40–60% better maximin distance than a random draw of the same size.
+
+---
+
+### 12.7 Exporting DoE Results
+
+| Export | How | When to use |
+|---|---|---|
+| **Export Pending CSV…** | Parameter columns only, no objectives | Take to the lab bench |
+| **Import Results CSV…** | Match lab results back to DoE points | After experiments done |
+| **Export DoE Report…** | Self-contained HTML with pairplot, metrics, table | Archive / share |
+| **📈 Full Analysis…** | Interactive multi-tab dialog | Explore coverage in-app |
+
+---
+
+## 13. Session Naming & Multi-User Deployment
+
+### 13.1 Project Names and Researchers
+
+Every new session in LabOpt has:
+- **Project Name** (required) — displayed in the title bar and all menus.
+- **Researcher** (optional, defaults to `LABOPT_USER` env var or system login).
+- **Description** (optional) — free text, stored in the session JSON.
+
+Sessions are physically isolated on disk by owner name:
+
+```
+~/labopt_sessions/
+  alice/
+    perovskite_solar_cell_20260922_100734/
+      labopt_study_20260922_100734_session.json
+      labopt_study_20260922_100734.db
+      doe_pending.csv
+```
+
+### 13.2 Environment Variables for Docker / Shared Lab
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LABOPT_SESSION_DIR` | `~/labopt_sessions` | Root directory for all sessions. Set to a mounted volume path. |
+| `LABOPT_USER` | `os.getlogin()` | Pre-fills the Researcher field for all new sessions. |
+
+**Example docker-compose.yml snippet:**
+
+```yaml
+services:
+  labopt:
+    image: labopt:latest
+    environment:
+      - LABOPT_SESSION_DIR=/data/sessions
+      - LABOPT_USER=alice
+    volumes:
+      - /shared/labopt_data:/data/sessions
+```
+
+### 13.3 Session Browser
+
+**File → Browse All Sessions…** opens a dialog showing all sessions found
+under `LABOPT_SESSION_DIR`, with columns for:
+- Project Name
+- Owner (Researcher)
+- Created (date / time)
+- Trials (completed Optuna trials)
+- Status (DoE in progress / BO running / Pending results / New)
+
+Double-click any row to load that session.
+
+### 13.4 Backward Compatibility
+
+Old sessions (without `project_name`) load normally.  The title bar falls
+back to the internal `study_name` timestamp.  Old session directories are
+not moved.
 
 ---
 
