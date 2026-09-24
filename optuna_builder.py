@@ -220,7 +220,22 @@ def build_study(
             violations.append(max(0.0, v))
         return violations
 
-    if ineq_constraints:
+    # GP is handled first because GPSampler does not accept constraints_func.
+    # It is therefore always built without constraint awareness regardless of
+    # whether inequality constraints are present in the config.
+    if config.sampler_name == "GP":
+        try:
+            from optuna.samplers import GPSampler  # requires optuna >= 3.6
+            sampler: optuna.samplers.BaseSampler = GPSampler(seed=42)
+        except (ImportError, AttributeError):
+            import warnings as _warnings
+            _warnings.warn(
+                "GPSampler is not available in this Optuna version "
+                "(requires >= 3.6). Falling back to TPE.",
+                stacklevel=2,
+            )
+            sampler = optuna.samplers.TPESampler(seed=42, multivariate=True)
+    elif ineq_constraints:
         sampler_map: Dict[str, optuna.samplers.BaseSampler] = {
             "TPE":    optuna.samplers.TPESampler(
                           seed=42, multivariate=True,
@@ -229,13 +244,14 @@ def build_study(
                           seed=42, constraints_func=_constraints_fn),
             "Random": optuna.samplers.RandomSampler(seed=42),
         }
+        sampler = sampler_map.get(config.sampler_name, optuna.samplers.TPESampler(seed=42))
     else:
         sampler_map = {
             "TPE":    optuna.samplers.TPESampler(seed=42, multivariate=True),
             "NSGAII": optuna.samplers.NSGAIISampler(seed=42),
             "Random": optuna.samplers.RandomSampler(seed=42),
         }
-    sampler = sampler_map.get(config.sampler_name, optuna.samplers.TPESampler(seed=42))
+        sampler = sampler_map.get(config.sampler_name, optuna.samplers.TPESampler(seed=42))
 
     if len(config.objectives) == 1:
         study = optuna.create_study(
@@ -473,6 +489,10 @@ def load_historical_trials(
         trial_number = len(study.trials)
 
         # Optuna 4.x FrozenTrial requires trial_id; pass -1 so storage assigns one.
+        # Carry forward any user_attrs supplied in the trial dict (e.g. n_replicates).
+        user_attrs = {
+            str(k): v for k, v in data.get("user_attrs", {}).items()
+        }
         if len(values) == 1:
             frozen = FrozenTrial(
                 number=trial_number,
@@ -484,7 +504,7 @@ def load_historical_trials(
                 datetime_complete=datetime.now(),
                 params=trial_params,
                 distributions=trial_dists,
-                user_attrs={},
+                user_attrs=user_attrs,
                 system_attrs={},
                 intermediate_values={},
             )
@@ -499,7 +519,7 @@ def load_historical_trials(
                 datetime_complete=datetime.now(),
                 params=trial_params,
                 distributions=trial_dists,
-                user_attrs={},
+                user_attrs=user_attrs,
                 system_attrs={},
                 intermediate_values={},
             )
@@ -601,6 +621,7 @@ def ask_batch(
     study: optuna.Study,
     config: StudyConfig,
     batch_size: int,
+    context: Optional[dict] = None,
 ) -> List[optuna.Trial]:
     """
     Ask Optuna for *batch_size* parameter suggestions without running any
@@ -608,12 +629,65 @@ def ask_batch(
 
     Note: in Optuna 4.x, study.ask() creates trials in RUNNING state (not
     WAITING).  Use tell_batch() with the trial numbers to complete them.
+
+    Context-aware mode
+    ------------------
+    When *context* is supplied **and** ``config.context_variables`` is non-empty,
+    the function attempts to use the contextual RF surrogate
+    (``ContextualSurrogate``) to pick parameters that are optimal for the
+    given environmental conditions.
+
+    The contextual sampler requires ≥ 15 completed trials to activate.  If
+    there is insufficient data, or if no context variables are defined, the
+    function falls back to standard Optuna ``study.ask()`` behaviour.
+
+    Each returned Trial has a ``user_attrs["ctx_suggested_params"]`` entry
+    containing the RF-chosen param dict when the contextual path was taken.
+    The ``BatchResultsDialog`` / worker uses this to display the contextually
+    optimised values to the user.
     """
     distributions = build_distributions(config)
     trials: List[optuna.Trial] = []
-    for _ in range(batch_size):
+
+    # Try contextual suggestion when context + context_variables are both present
+    contextual_params: Optional[List[dict]] = None
+    if context and getattr(config, "context_variables", []):
+        try:
+            from contextual_sampler import ContextualSurrogate
+            surrogate = ContextualSurrogate(config)
+            if surrogate.fit(study):
+                contextual_params = surrogate.suggest(context, n_return=batch_size)
+                logger.info(
+                    "Contextual sampler active: %d suggestions generated for context %s",
+                    batch_size, context,
+                )
+            else:
+                logger.info(
+                    "Contextual sampler inactive: insufficient completed trials. "
+                    "Falling back to standard Optuna ask()."
+                )
+        except Exception as exc:
+            logger.warning(
+                "Contextual sampler failed (%s); falling back to standard ask().", exc
+            )
+            contextual_params = None
+
+    # Always create proper Optuna RUNNING trials (preserves trial numbering)
+    for idx in range(batch_size):
         trial = study.ask(distributions)
+        # Attach contextual param suggestion as a user_attr so the worker/GUI
+        # can display and use it instead of the raw Optuna suggestion.
+        if contextual_params is not None and idx < len(contextual_params):
+            try:
+                import json as _json
+                trial.set_user_attr(
+                    "ctx_suggested_params",
+                    _json.dumps({str(k): v for k, v in contextual_params[idx].items()}),
+                )
+            except Exception:
+                pass  # non-critical — GUI falls back to trial.params
         trials.append(trial)
+
     return trials
 
 
@@ -623,6 +697,7 @@ def tell_batch(
     results: List[List[float]],
     constrained_params: Optional[List[dict]] = None,
     config: Optional[StudyConfig] = None,
+    context_values: Optional[List[dict]] = None,
 ) -> None:
     """
     Report measured lab results back to Optuna for the given trial numbers.
@@ -642,19 +717,50 @@ def tell_batch(
     any combination).  FAILED trials are excluded from surrogate training by
     Optuna's TPE and NSGAII samplers.
 
+    Context values
+    --------------
+    When *context_values* is supplied (a list of dicts, one per trial), the
+    actual measured context conditions (e.g. humidity, atmospheric pressure)
+    are stored as ``user_attrs`` on each COMPLETE trial with the ``ctx_``
+    prefix.  Keys are raw column names (without the prefix); this function
+    adds the prefix automatically.
+
     Legacy mode
     -----------
-    When *constrained_params* / *config* are omitted the function falls back
-    to the simple ``study.tell(trial_number, values)`` behaviour.
+    When *constrained_params* / *config* / *context_values* are omitted the
+    function falls back to the simple ``study.tell(trial_number, values)``
+    behaviour.
     """
     for i, (trial_number, values) in enumerate(zip(trial_numbers, results)):
         try:
-            if (constrained_params is not None
-                    and config is not None
-                    and i < len(constrained_params)
-                    and constrained_params[i]):
+            # Build ctx_ user_attrs from context_values (actual conditions)
+            ctx: dict = {}
+            if context_values is not None and i < len(context_values) and context_values[i]:
+                for k, v in context_values[i].items():
+                    try:
+                        ctx[f"ctx_{k}"] = float(v)
+                    except (TypeError, ValueError):
+                        pass
 
-                ext_params = constrained_params[i]
+            # Determine whether to use the constraint-correct path.
+            # We also force this path when context values need to be attached,
+            # because study.tell() doesn't support adding user_attrs directly.
+            use_corrected_path = (
+                (constrained_params is not None
+                 and config is not None
+                 and i < len(constrained_params)
+                 and constrained_params[i])
+                or (ctx and config is not None)
+            )
+
+            if use_corrected_path and config is not None:
+                ext_params = (
+                    constrained_params[i]
+                    if (constrained_params is not None
+                        and i < len(constrained_params)
+                        and constrained_params[i])
+                    else None
+                )
 
                 # Step 1: fail the RUNNING trial so the surrogate ignores its
                 # unconstrained internal params.
@@ -663,8 +769,14 @@ def tell_batch(
                 except Exception:
                     pass  # already finished / not found — continue to add corrected trial
 
-                # Step 2: map constrained external params → internal Optuna key space.
-                internal = _csv_params_to_internal(ext_params, config)
+                if ext_params is not None:
+                    # Step 2: map constrained external params → internal Optuna key space.
+                    internal = _csv_params_to_internal(ext_params, config)
+                else:
+                    # No constrained params — reconstruct from the FAILED trial's params
+                    failed_trials = [t for t in study.trials if t.number == trial_number]
+                    internal = failed_trials[0].params if failed_trials else {}
+
                 dists    = build_distributions(config)
                 trial_dists  = {k: v for k, v in dists.items() if k in internal}
                 trial_params = {k: internal[k] for k in trial_dists}
@@ -681,7 +793,8 @@ def tell_batch(
                         pass
                     continue
 
-                # Step 3: add a corrected COMPLETE trial with constrained params.
+                # Step 3: add a corrected COMPLETE trial with constrained params
+                #         and ctx_ user_attrs for context variables.
                 frozen = FrozenTrial(
                     number=len(study.trials),
                     trial_id=-1,
@@ -692,14 +805,14 @@ def tell_batch(
                     datetime_complete=datetime.now(),
                     params=trial_params,
                     distributions=trial_dists,
-                    user_attrs={},
+                    user_attrs={str(k): v for k, v in ctx.items()},
                     system_attrs={},
                     intermediate_values={},
                 )
                 study.add_trial(frozen)
 
             else:
-                # Legacy / no-constraint path: plain tell.
+                # Legacy / no-constraint / no-context path: plain tell.
                 if len(values) == 1:
                     study.tell(trial_number, values[0])
                 else:
@@ -717,7 +830,9 @@ def get_pareto_front(study: optuna.Study) -> List[FrozenTrial]:
     """Return the best trial(s): Pareto front for multi-obj, best_trial for single-obj."""
     try:
         if hasattr(study, "directions") and len(study.directions) > 1:
-            return optuna.study.get_pareto_front_trials(study)
+            # study.best_trials is the standard Optuna 3.x+ API for the Pareto front.
+            # optuna.study.get_pareto_front_trials() was removed in newer versions.
+            return study.best_trials
         else:
             return [study.best_trial]
     except Exception:

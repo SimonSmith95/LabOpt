@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
+# DoEState uses Any for the results list (List[Optional[List[float]]])
+from typing import Any
 
 
 class ParameterType(Enum):
@@ -101,6 +103,30 @@ class ObjectiveConfig:
     @classmethod
     def from_dict(cls, d: dict) -> ObjectiveConfig:
         return cls(column_name=d["column_name"], direction=d["direction"])
+
+
+@dataclass
+class ContextConfig:
+    """Configuration for one uncontrollable context variable.
+
+    Context variables are measured environmental quantities (e.g. ambient
+    humidity, atmospheric pressure) that the surrogate learns from but that
+    are NOT part of the Optuna search space and are NOT suggested as next-
+    experiment values.  Their values are stored as ``user_attrs`` on each
+    Optuna trial with the ``ctx_`` prefix.
+    """
+    column_name: str
+    description: str = ""   # optional human-readable label
+
+    def to_dict(self) -> dict:
+        return {"column_name": self.column_name, "description": self.description}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ContextConfig":
+        return cls(
+            column_name=d["column_name"],
+            description=d.get("description", ""),
+        )
 
 
 @dataclass
@@ -276,18 +302,33 @@ class StudyConfig:
     parameters: List[ParameterConfig] = field(default_factory=list)
     objectives: List[ObjectiveConfig] = field(default_factory=list)
     constraints: List[ParameterConstraint] = field(default_factory=list)
+    # ── Context variables (uncontrollable environmental conditions) ────────────
+    context_variables: List[ContextConfig] = field(default_factory=list)
     batch_size: int = 1
     n_batches: int = 10
-    sampler_name: Literal["TPE", "NSGAII", "Random"] = "TPE"
+    sampler_name: Literal["TPE", "NSGAII", "Random", "GP"] = "TPE"
+    # ── Replicate aggregation (Feature 8) ─────────────────────────────────────
+    replicate_aggregation: bool = False   # master on/off switch
+    replicate_tolerance: float = 1e-6    # absolute ± threshold for numeric params
+    # ── Convergence-based auto-stop (Feature 12) ──────────────────────────────
+    auto_stop: bool = False
+    auto_stop_min_improvement: float = 0.01   # 1% minimum relative improvement
+    auto_stop_n_batches: int = 3              # window: consecutive batches with no improvement
 
     def to_dict(self) -> dict:
         return {
             "parameters": [p.to_dict() for p in self.parameters],
             "objectives": [o.to_dict() for o in self.objectives],
             "constraints": [c.to_dict() for c in self.constraints],
+            "context_variables": [c.to_dict() for c in self.context_variables],
             "batch_size": self.batch_size,
             "n_batches": self.n_batches,
             "sampler_name": self.sampler_name,
+            "replicate_aggregation": self.replicate_aggregation,
+            "replicate_tolerance": self.replicate_tolerance,
+            "auto_stop": self.auto_stop,
+            "auto_stop_min_improvement": self.auto_stop_min_improvement,
+            "auto_stop_n_batches": self.auto_stop_n_batches,
         }
 
     @classmethod
@@ -296,7 +337,71 @@ class StudyConfig:
             parameters=[ParameterConfig.from_dict(p) for p in d.get("parameters", [])],
             objectives=[ObjectiveConfig.from_dict(o) for o in d.get("objectives", [])],
             constraints=[ParameterConstraint.from_dict(c) for c in d.get("constraints", [])],
+            context_variables=[
+                ContextConfig.from_dict(c) for c in d.get("context_variables", [])
+            ],
             batch_size=d.get("batch_size", 1),
             n_batches=d.get("n_batches", 10),
             sampler_name=d.get("sampler_name", "TPE"),
+            replicate_aggregation=d.get("replicate_aggregation", False),
+            replicate_tolerance=float(d.get("replicate_tolerance", 1e-6)),
+            auto_stop=d.get("auto_stop", False),
+            auto_stop_min_improvement=float(d.get("auto_stop_min_improvement", 0.01)),
+            auto_stop_n_batches=int(d.get("auto_stop_n_batches", 3)),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DoEState — persists the DoE phase within a session
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class DoEState:
+    """
+    Persists the active Design of Experiments phase for a session.
+
+    points      : list of param-value dicts (one per DoE run), in the same
+                  format as StudyConfig parameter names.  Objective columns
+                  are NOT included here; they are stored in the Optuna DB
+                  as historical trials once entered.
+    results     : list of objective-value lists, parallel to points.
+                  None entries = not yet measured.  Length always == len(points).
+    strategy    : DoE strategy used, e.g. "LHS", "Sobol", "PlackettBurman"
+    n_points    : number of generated points (== len(points))
+    seed        : random seed used for reproducible generation
+    complete    : True when all results have been entered AND registered
+                  into the Optuna study.
+    registered_trial_numbers : list of Optuna trial numbers that were created
+                  from DoE results.  Used to distinguish DoE trials from BO
+                  trials in the results table (shown with a "DoE" tag).
+    """
+    strategy: str
+    n_points: int
+    seed: int
+    points: List[dict]
+    results: List[Any]          # List[Optional[List[float]]]
+    complete: bool = False
+    registered_trial_numbers: List[int] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "strategy": self.strategy,
+            "n_points": self.n_points,
+            "seed": self.seed,
+            "points": self.points,
+            "results": self.results,
+            "complete": self.complete,
+            "registered_trial_numbers": self.registered_trial_numbers,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DoEState":
+        return cls(
+            strategy=d["strategy"],
+            n_points=d["n_points"],
+            seed=d["seed"],
+            points=d["points"],
+            results=d["results"],
+            complete=d.get("complete", False),
+            registered_trial_numbers=d.get("registered_trial_numbers", []),
         )

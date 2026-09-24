@@ -28,12 +28,20 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QScreen
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizeGrip,
+    QSizePolicy,
+    QSlider,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -76,7 +84,9 @@ class DesignSpaceWidget(QWidget):
         self._page: int = 0        # current page index (0-based)
         _PAGE_SIZE = 5             # max params per pairplot page (class-level below)
 
-        self._fig = Figure(facecolor=_BG)
+        # constrained_layout automatically sizes axes, legends, colorbars and
+        # suptitles so that nothing overflows the figure boundary.
+        self._fig = Figure(facecolor=_BG, layout='constrained')
         self._canvas = FigureCanvasQTAgg(self._fig)
         self._canvas.setStyleSheet(f"background-color: {_BG};")
 
@@ -135,6 +145,7 @@ class DesignSpaceWidget(QWidget):
         refresh_btn.setToolTip("Redraw the design space plot.")
         refresh_btn.clicked.connect(self._redraw)
         toolbar.addWidget(refresh_btn)
+
         layout.addLayout(toolbar)
 
         # Start with page nav hidden
@@ -211,7 +222,7 @@ class DesignSpaceWidget(QWidget):
 
     # ── Pairplot page navigation ───────────────────────────────────────────
 
-    _PAGE_SIZE = 5   # max number of parameters shown per pairplot page
+    _PAGE_SIZE = 4   # max parameters shown per page (pairplot & marginals)
 
     def _set_page_nav_visible(self, visible: bool) -> None:
         for w in (self._prev_btn, self._page_label, self._next_btn):
@@ -284,12 +295,13 @@ class DesignSpaceWidget(QWidget):
                 self._set_page_nav_visible(False)
             else:
                 self._draw_marginals(numeric)
-                self._set_page_nav_visible(False)
+                # Enable page navigation for marginals when there are many params
+                n_marginal_pages = max(1, math.ceil(len(numeric) / self._PAGE_SIZE))
+                self._set_page_nav_visible(n_marginal_pages > 1)
+                self._update_page_nav(len(numeric))
 
-        try:
-            self._fig.tight_layout()
-        except Exception:
-            pass
+        # constrained_layout (set on the Figure at creation) handles layout
+        # automatically — no tight_layout() call needed here.
 
         self._canvas.draw_idle()
         self._placeholder.hide()
@@ -487,13 +499,11 @@ class DesignSpaceWidget(QWidget):
                        markerfacecolor=_SUGGEST, markersize=12,
                        linestyle="None", label="Suggested")
             )
-        # Place legend anchored to the figure's top-right; `bbox_transform` is
-        # figure coordinates so it never collides with any subplot.
+        # Place legend inside the figure top-right corner.  No bbox_to_anchor
+        # is used so constrained_layout can keep it within the figure boundary.
         self._fig.legend(
             handles=legend_handles,
             loc="upper right",
-            bbox_to_anchor=(0.88 if has_color else 1.0, 1.0),
-            bbox_transform=self._fig.transFigure,
             facecolor=_BG, edgecolor=_GRID, labelcolor=_FG, fontsize=8,
         )
 
@@ -505,7 +515,8 @@ class DesignSpaceWidget(QWidget):
             )
         else:
             title = "Pairplot — Design Space"
-        self._fig.suptitle(title, color=_FG, fontsize=9, y=1.01)
+        # Constrained layout handles vertical spacing — no y= offset needed
+        self._fig.suptitle(title, color=_FG, fontsize=9)
         self._fig.patch.set_facecolor(_BG)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -591,8 +602,14 @@ class DesignSpaceWidget(QWidget):
     # Plot type 3: 1-D marginal strip (> 12 numeric params)
     # ══════════════════════════════════════════════════════════════════════
 
-    def _draw_marginals(self, numeric: list[ParameterConfig]) -> None:
-        n    = len(numeric)
+    def _draw_marginals(self, numeric_all: list[ParameterConfig]) -> None:
+        # ── Page slicing: show at most PAGE_SIZE parameters at a time ─────
+        n_total = len(numeric_all)
+        n_pages = max(1, math.ceil(n_total / self._PAGE_SIZE))
+        self._page = max(0, min(self._page, n_pages - 1))
+        start = self._page * self._PAGE_SIZE
+        numeric = numeric_all[start : start + self._PAGE_SIZE]
+        n = len(numeric)
         axes = self._fig.subplots(n, 1, squeeze=False)
         suggest_colours = [_SUGGEST, _SUGGEST2, "#cba6f7", "#94e2d5"]
 
@@ -629,8 +646,14 @@ class DesignSpaceWidget(QWidget):
             )
 
         axes[-1][0].set_xlabel("Parameter value", color=_FG, fontsize=8)
-        self._fig.suptitle("Parameter Marginal Distributions",
-                           color=_FG, fontsize=9)
+        if n_total > n:
+            _marginal_title = (
+                f"Parameter Marginals  (page {self._page + 1}/{n_pages}  ·  "
+                f"params {start + 1}–{start + n} of {n_total})"
+            )
+        else:
+            _marginal_title = "Parameter Marginal Distributions"
+        self._fig.suptitle(_marginal_title, color=_FG, fontsize=9)
         self._fig.patch.set_facecolor(_BG)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -675,6 +698,7 @@ class CorrelationWidget(QWidget):
         self._df: Optional[pd.DataFrame] = None
         self._params: List[ParameterConfig] = []
         self._objectives: List[ObjectiveConfig] = []
+        self._needs_redraw: bool = False   # lazy — only render when tab is shown
 
         self._fig = Figure(facecolor=_BG)
         self._canvas = FigureCanvasQTAgg(self._fig)
@@ -723,13 +747,14 @@ class CorrelationWidget(QWidget):
         params: List[ParameterConfig],
         objectives: List[ObjectiveConfig],
     ) -> None:
-        self._df         = df
-        self._params     = params
-        self._objectives = objectives
-        self._redraw()
+        self._df           = df
+        self._params       = params
+        self._objectives   = objectives
+        self._needs_redraw = True   # rendered on demand when tab is selected
 
     def clear(self) -> None:
-        self._df = None
+        self._df           = None
+        self._needs_redraw = False
         self._fig.clear()
         self._canvas.draw_idle()
         self._canvas.hide()
@@ -841,36 +866,1125 @@ class CorrelationWidget(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Convergence Widget
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ConvergenceWidget(QWidget):
+    """
+    Matplotlib canvas showing best-value-so-far vs. cumulative trial number.
+
+    One step-line per objective, colour-coded.  A dashed horizontal line marks
+    the current global best.  For a single objective the legend is suppressed.
+
+    Public API
+    ----------
+    refresh(study, objectives)
+        Rebuild the convergence plot from all COMPLETE trials.
+    clear()
+        Hide the canvas and show the placeholder text.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._fig = Figure(facecolor=_BG)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setStyleSheet(f"background-color: {_BG};")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        layout.addWidget(self._canvas, stretch=1)
+
+        self._placeholder = QLabel(
+            "Run at least one batch to see the convergence plot."
+        )
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setStyleSheet(
+            f"color: {_FG}; font-size: 13px; font-style: italic;"
+        )
+        layout.addWidget(self._placeholder)
+        self._canvas.hide()
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def refresh(self, study, objectives: List[ObjectiveConfig]) -> None:
+        """
+        Redraw from all COMPLETE trials in *study*.
+
+        Parameters
+        ----------
+        study      : optuna.Study — the active study object.
+        objectives : list of ObjectiveConfig — used for labels and direction.
+        """
+        from optuna.trial import TrialState
+
+        completed = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        if not completed:
+            self.clear()
+            return
+
+        completed.sort(key=lambda t: t.number)
+
+        self._fig.clear()
+        ax = self._fig.add_subplot(111)
+        ax.set_facecolor(_AX_BG)
+        for spine in ax.spines.values():
+            spine.set_color(_GRID)
+        ax.tick_params(colors=_FG, labelsize=8)
+        ax.xaxis.label.set_color(_FG)
+        ax.yaxis.label.set_color(_FG)
+        ax.title.set_color(_FG)
+        ax.grid(color=_GRID, linewidth=0.5, alpha=0.5)
+
+        obj_colours = [_HIST, _SUGGEST, _PARETO, _SUGGEST2, "#cba6f7", "#94e2d5"]
+
+        for obj_idx, obj in enumerate(objectives):
+            direction = obj.direction  # "minimize" | "maximize"
+            trial_numbers: list[int] = []
+            values: list[float] = []
+            for t in completed:
+                if t.values is not None and obj_idx < len(t.values):
+                    v = t.values[obj_idx]
+                    if v is not None and np.isfinite(v):
+                        trial_numbers.append(t.number)
+                        values.append(float(v))
+
+            if not values:
+                continue
+
+            # Running best
+            running_best: list[float] = []
+            best = float("inf") if direction == "minimize" else float("-inf")
+            for v in values:
+                best = min(best, v) if direction == "minimize" else max(best, v)
+                running_best.append(best)
+
+            col = obj_colours[obj_idx % len(obj_colours)]
+            arrow = "\u2193" if direction == "minimize" else "\u2191"
+            label = f"{obj.column_name} ({arrow})"
+
+            ax.step(trial_numbers, running_best, where="post",
+                    color=col, linewidth=2.0, label=label, zorder=3)
+            ax.scatter(trial_numbers, running_best,
+                       color=col, s=18, zorder=4, alpha=0.75)
+            # Global-best dashed line
+            ax.axhline(running_best[-1], color=col, linewidth=0.8,
+                       linestyle="--", alpha=0.45)
+
+        ax.set_xlabel("Trial number", color=_FG, fontsize=9)
+        ax.set_ylabel("Best objective value", color=_FG, fontsize=9)
+        ax.set_title("Convergence \u2014 Best Value vs. Trial",
+                     color=_FG, fontsize=9, pad=6)
+
+        if len(objectives) > 1:
+            ax.legend(loc="best", facecolor=_BG, edgecolor=_GRID,
+                      labelcolor=_FG, fontsize=8)
+
+        self._fig.patch.set_facecolor(_BG)
+        try:
+            self._fig.tight_layout()
+        except Exception:
+            pass
+
+        self._canvas.draw_idle()
+        self._placeholder.hide()
+        self._canvas.show()
+
+    def clear(self) -> None:
+        """Reset to placeholder state."""
+        self._fig.clear()
+        self._canvas.draw_idle()
+        self._canvas.hide()
+        self._placeholder.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parameter Importance Widget (Feature 3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ImportanceWidget(QWidget):
+    """
+    Horizontal bar chart showing permutation importances from a Random Forest
+    fitted on all completed trials.
+
+    Minimum 15 completed rows required (guard is applied before fitting).
+    Disabled parameters are excluded automatically.
+    For multi-objective studies a QComboBox lets the user pick the target.
+
+    Public API
+    ----------
+    refresh(df, params, objectives)
+        Refit the RF and redraw (called after every batch and on session load).
+    clear()
+        Hide the canvas and show the placeholder text.
+    """
+
+    MIN_TRIALS = 15
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._df: Optional[pd.DataFrame] = None
+        self._params: List[ParameterConfig] = []
+        self._objectives: List[ObjectiveConfig] = []
+        self._needs_redraw: bool = False   # lazy — only compute when tab is shown
+
+        self._fig = Figure(facecolor=_BG)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setStyleSheet(f"background-color: {_BG};")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # ── Toolbar ───────────────────────────────────────────────────────
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("Objective:"))
+        self._obj_combo = QComboBox()
+        self._obj_combo.setFixedWidth(200)
+        self._obj_combo.setToolTip(
+            "Select which objective to compute feature importances for."
+        )
+        self._obj_combo.currentIndexChanged.connect(self._redraw)
+        toolbar.addWidget(self._obj_combo)
+        toolbar.addStretch()
+        refresh_btn = QPushButton("⟳  Refresh")
+        refresh_btn.setFixedWidth(100)
+        refresh_btn.clicked.connect(self._redraw)
+        toolbar.addWidget(refresh_btn)
+        layout.addLayout(toolbar)
+
+        layout.addWidget(self._canvas, stretch=1)
+
+        self._placeholder = QLabel(
+            f"Not enough data — need {self.MIN_TRIALS}+ completed rows."
+        )
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setStyleSheet(
+            f"color: {_FG}; font-size: 13px; font-style: italic;"
+        )
+        layout.addWidget(self._placeholder)
+        self._canvas.hide()
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def refresh(
+        self,
+        df: pd.DataFrame,
+        params: List[ParameterConfig],
+        objectives: List[ObjectiveConfig],
+    ) -> None:
+        self._df         = df
+        self._params     = params
+        self._objectives = objectives
+
+        # Sync objective combo
+        prev = self._obj_combo.currentText()
+        self._obj_combo.blockSignals(True)
+        self._obj_combo.clear()
+        for o in objectives:
+            self._obj_combo.addItem(o.column_name)
+        if prev in [o.column_name for o in objectives]:
+            self._obj_combo.setCurrentText(prev)
+        self._obj_combo.blockSignals(False)
+
+        self._needs_redraw = True   # rendered on demand when tab is selected
+
+    def clear(self) -> None:
+        self._df           = None
+        self._needs_redraw = False
+        self._fig.clear()
+        self._canvas.draw_idle()
+        self._canvas.hide()
+        self._placeholder.setText(
+            f"Not enough data — need {self.MIN_TRIALS}+ completed rows."
+        )
+        self._placeholder.show()
+
+    # ── Internal ───────────────────────────────────────────────────────────
+
+    def _redraw(self) -> None:
+        if self._df is None or not self._params or not self._objectives:
+            return
+
+        # ── Which objective? ───────────────────────────────────────────────
+        obj_col = self._obj_combo.currentText()
+        if not obj_col or obj_col not in self._df.columns:
+            return
+
+        # ── Enabled numeric + categorical params ───────────────────────────
+        enabled_params = [
+            p for p in self._params
+            if p.enabled and p.name in self._df.columns
+            and p.ptype in (ParameterType.FLOAT, ParameterType.INT,
+                            ParameterType.CATEGORICAL, ParameterType.BOOL)
+        ]
+        if not enabled_params:
+            self._show_placeholder("No enabled parameters found.")
+            return
+
+        param_names = [p.name for p in enabled_params]
+
+        # ── Build feature / target matrices ────────────────────────────────
+        sub = self._df[param_names + [obj_col]].copy()
+        sub = sub.dropna(subset=[obj_col])   # must have an objective value
+
+        if len(sub) < self.MIN_TRIALS:
+            self._show_placeholder(
+                f"Not enough data — need {self.MIN_TRIALS}+ rows with "
+                f"objective values ({len(sub)} so far)."
+            )
+            return
+
+        X_df = sub[param_names].copy()
+        for col in X_df.columns:
+            if X_df[col].dtype == object or pd.api.types.is_string_dtype(X_df[col]):
+                X_df[col] = pd.Categorical(X_df[col]).codes
+        X = X_df.fillna(-1).values.astype(float)
+        y = pd.to_numeric(sub[obj_col], errors="coerce").values
+
+        # Drop rows where y is still NaN after coerce
+        valid = np.isfinite(y)
+        X, y = X[valid], y[valid]
+
+        if len(y) < self.MIN_TRIALS:
+            self._show_placeholder(
+                f"Not enough numeric rows — need {self.MIN_TRIALS}+ ({len(y)} so far)."
+            )
+            return
+
+        # ── Fit RF + permutation importance ────────────────────────────────
+        try:
+            from sklearn.ensemble import RandomForestRegressor
+            from sklearn.inspection import permutation_importance
+
+            rf = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=1)
+            rf.fit(X, y)
+            result = permutation_importance(
+                rf, X, y, n_repeats=10, random_state=42, n_jobs=1
+            )
+        except Exception as exc:
+            self._show_placeholder(f"Importance computation failed:\n{exc}")
+            return
+
+        means = result.importances_mean
+        stds  = result.importances_std
+
+        # Sort descending
+        order = np.argsort(means)[::-1]
+        sorted_names  = [param_names[i] for i in order]
+        sorted_means  = means[order]
+        sorted_stds   = stds[order]
+
+        # ── Draw ───────────────────────────────────────────────────────────
+        self._fig.clear()
+        ax = self._fig.add_subplot(111)
+        ax.set_facecolor(_AX_BG)
+        for spine in ax.spines.values():
+            spine.set_color(_GRID)
+        ax.tick_params(colors=_FG, labelsize=8)
+        ax.xaxis.label.set_color(_FG)
+        ax.yaxis.label.set_color(_FG)
+        ax.title.set_color(_FG)
+        ax.grid(axis="x", color=_GRID, linewidth=0.5, alpha=0.5)
+
+        y_pos = np.arange(len(sorted_names))
+        bars = ax.barh(
+            y_pos, sorted_means,
+            xerr=sorted_stds,
+            color=_HIST, alpha=0.85,
+            error_kw={"ecolor": _FG, "capsize": 3, "linewidth": 1.0},
+        )
+
+        # Colour zero/negative bars differently (they are noise)
+        for bar, m in zip(bars, sorted_means):
+            if m <= 0:
+                bar.set_color(_SUGGEST)
+                bar.set_alpha(0.5)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(sorted_names, fontsize=max(7, min(10, 120 // len(sorted_names))))
+        ax.invert_yaxis()   # most important at top
+        ax.set_xlabel(
+            "Mean permutation importance (decrease in R²)",
+            color=_FG, fontsize=8,
+        )
+        obj_cfg = next((o for o in self._objectives if o.column_name == obj_col), None)
+        direction_str = f"({obj_cfg.direction})" if obj_cfg else ""
+        ax.set_title(
+            f"Parameter Importance — {obj_col} {direction_str}\n"
+            f"({len(y)} trials, RF + 10-repeat permutation)",
+            color=_FG, fontsize=9, pad=6,
+        )
+        self._fig.patch.set_facecolor(_BG)
+
+        try:
+            self._fig.tight_layout()
+        except Exception:
+            pass
+
+        self._canvas.draw_idle()
+        self._placeholder.hide()
+        self._canvas.show()
+
+    def _show_placeholder(self, msg: str) -> None:
+        self._fig.clear()
+        self._canvas.draw_idle()
+        self._canvas.hide()
+        self._placeholder.setText(msg)
+        self._placeholder.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Feature 6 — What-If Profiler Widget
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ProfilerWidget(QWidget):
+    """
+    What-If / Prediction Profiler panel.
+
+    Lets the user drag sliders (FLOAT/INT), pick from dropdowns (CATEGORICAL),
+    or toggle checkboxes (BOOL) and see a Random Forest surrogate's predicted
+    objective value update in real-time.  Analogous to JMP's Prediction Profiler.
+
+    The RF is fit once in ``refresh()`` and cached — it is NOT refit on every
+    slider movement.
+
+    Minimum 10 completed rows are required; a placeholder is shown otherwise.
+
+    Public API
+    ----------
+    refresh(df, params, objectives)
+        Refit the RF and rebuild the UI controls.
+    clear()
+        Reset to placeholder state.
+    """
+
+    MIN_TRIALS = 10
+    _N_STEPS   = 1000   # slider resolution for FLOAT / INT params
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._df: Optional[pd.DataFrame] = None
+        self._params: List[ParameterConfig] = []
+        self._objectives: List[ObjectiveConfig] = []
+
+        # Fitted surrogate and encoding state (rebuilt on each refresh)
+        self._rf = None
+        self._enabled_params: List[ParameterConfig] = []
+        self._cat_codes: dict = {}   # param_name → {category_value: int_code}
+        self._needs_redraw: bool = False   # lazy — only fit RF when tab is shown
+
+        # Per-row control widgets (rebuilt in _rebuild_controls)
+        self._controls: dict = {}    # param_name → primary widget
+        self._line_edits: dict = {}  # param_name → QLineEdit (FLOAT/INT only)
+
+        # ── Outer layout ───────────────────────────────────────────────────
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        # ── Objective selector (shown when there are 2+ objectives) ────────
+        obj_row = QHBoxLayout()
+        obj_row.addWidget(QLabel("Predict objective:"))
+        self._obj_combo = QComboBox()
+        self._obj_combo.setFixedWidth(240)
+        self._obj_combo.setToolTip("Select which objective the surrogate predicts.")
+        self._obj_combo.currentIndexChanged.connect(self._on_objective_changed)
+        obj_row.addWidget(self._obj_combo)
+        obj_row.addStretch()
+        layout.addLayout(obj_row)
+
+        # ── Prediction result label ────────────────────────────────────────
+        self._prediction_label = QLabel("Predicted — : —")
+        self._prediction_label.setAlignment(Qt.AlignCenter)
+        self._prediction_label.setStyleSheet(
+            "background-color: #313244; "
+            f"color: {_FG}; "
+            "font-size: 14px; font-weight: bold; "
+            "padding: 10px; border-radius: 6px; "
+            "border: 1px solid #45475a;"
+        )
+        self._prediction_label.setMinimumHeight(42)
+        layout.addWidget(self._prediction_label)
+
+        # ── Scroll area containing the parameter controls ──────────────────
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setStyleSheet("QScrollArea { border: none; }")
+        self._controls_container = QWidget()
+        self._controls_container.setStyleSheet(
+            f"background-color: {_BG};"
+        )
+        self._controls_layout = QGridLayout(self._controls_container)
+        self._controls_layout.setContentsMargins(4, 4, 4, 4)
+        self._controls_layout.setHorizontalSpacing(8)
+        self._controls_layout.setVerticalSpacing(6)
+        # Column stretch: name(0) fixed, slider(1) stretches, value(2) fixed
+        self._controls_layout.setColumnStretch(1, 1)
+        self._scroll.setWidget(self._controls_container)
+        layout.addWidget(self._scroll, stretch=1)
+
+        # ── Placeholder (shown when data is insufficient) ──────────────────
+        self._placeholder = QLabel(
+            f"Collect at least {self.MIN_TRIALS} data points to enable the Profiler."
+        )
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setStyleSheet(
+            f"color: {_FG}; font-size: 13px; font-style: italic;"
+        )
+        layout.addWidget(self._placeholder)
+
+        # Initial visibility
+        self._scroll.hide()
+        self._prediction_label.hide()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Public API
+    # ══════════════════════════════════════════════════════════════════════
+
+    def refresh(
+        self,
+        df: pd.DataFrame,
+        params: List[ParameterConfig],
+        objectives: List[ObjectiveConfig],
+    ) -> None:
+        """Refit the RF surrogate and rebuild the control widgets."""
+        self._df         = df
+        self._params     = params
+        self._objectives = objectives
+
+        # Sync objective combo (preserve current selection if still valid)
+        prev_obj = self._obj_combo.currentText()
+        self._obj_combo.blockSignals(True)
+        self._obj_combo.clear()
+        for o in objectives:
+            self._obj_combo.addItem(o.column_name)
+        if prev_obj in [o.column_name for o in objectives]:
+            self._obj_combo.setCurrentText(prev_obj)
+        self._obj_combo.blockSignals(False)
+
+        self._needs_redraw = True   # RF fit deferred until tab is shown
+
+    def clear(self) -> None:
+        """Reset to placeholder state."""
+        self._df           = None
+        self._rf           = None
+        self._needs_redraw = False
+        self._enabled_params = []
+        self._cat_codes  = {}
+        self._clear_controls_layout()
+        self._scroll.hide()
+        self._prediction_label.hide()
+        self._placeholder.setText(
+            f"Collect at least {self.MIN_TRIALS} data points to enable the Profiler."
+        )
+        self._placeholder.show()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Internal helpers
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _on_objective_changed(self) -> None:
+        """Called when the user picks a different objective to predict."""
+        self._fit_and_rebuild()
+
+    def _fit_and_rebuild(self) -> None:
+        """Fit the RF for the selected objective, then rebuild the control grid."""
+        if self._df is None or not self._params or not self._objectives:
+            self._show_placeholder(
+                f"Collect at least {self.MIN_TRIALS} data points to enable the Profiler."
+            )
+            return
+
+        obj_col = self._obj_combo.currentText()
+        if not obj_col or obj_col not in self._df.columns:
+            self._show_placeholder("No valid objective selected.")
+            return
+
+        # Collect enabled parameters of supported types
+        self._enabled_params = [
+            p for p in self._params
+            if p.enabled
+            and p.name in self._df.columns
+            and p.ptype in (
+                ParameterType.FLOAT, ParameterType.INT,
+                ParameterType.CATEGORICAL, ParameterType.BOOL,
+            )
+        ]
+        if not self._enabled_params:
+            self._show_placeholder("No enabled parameters found.")
+            return
+
+        param_names = [p.name for p in self._enabled_params]
+        sub = self._df[param_names + [obj_col]].copy()
+        sub = sub.dropna(subset=[obj_col])
+
+        if len(sub) < self.MIN_TRIALS:
+            self._show_placeholder(
+                f"Collect at least {self.MIN_TRIALS} data points to enable the Profiler "
+                f"({len(sub)} so far)."
+            )
+            return
+
+        # Build feature matrix (label-encode categoricals/bools)
+        X_df = sub[param_names].copy()
+        self._cat_codes = {}
+        for p in self._enabled_params:
+            col = p.name
+            if p.ptype == ParameterType.CATEGORICAL:
+                cat = pd.Categorical(X_df[col])
+                self._cat_codes[col] = {v: i for i, v in enumerate(cat.categories)}
+                X_df[col] = cat.codes.astype(float)
+            elif p.ptype == ParameterType.BOOL:
+                X_df[col] = X_df[col].astype(float)
+
+        X = X_df.fillna(-1).values.astype(float)
+        y = pd.to_numeric(sub[obj_col], errors="coerce").values
+        valid = np.isfinite(y)
+        X, y = X[valid], y[valid]
+
+        if len(y) < self.MIN_TRIALS:
+            self._show_placeholder(
+                f"Need {self.MIN_TRIALS}+ numeric rows ({len(y)} so far)."
+            )
+            return
+
+        # Fit RF — cached; NOT refit on slider movement
+        try:
+            from sklearn.ensemble import RandomForestRegressor
+            self._rf = RandomForestRegressor(
+                n_estimators=200, random_state=42, n_jobs=1
+            )
+            self._rf.fit(X, y)
+        except Exception as exc:
+            self._show_placeholder(f"Surrogate fit failed:\n{exc}")
+            return
+
+        # Build the control grid and show it
+        self._rebuild_controls(obj_col)
+        self._placeholder.hide()
+        self._scroll.show()
+        self._prediction_label.show()
+        # Compute initial prediction with midpoint values
+        self._on_params_changed()
+
+    def _clear_controls_layout(self) -> None:
+        """Remove every widget from the controls QGridLayout."""
+        while self._controls_layout.count():
+            item = self._controls_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._controls   = {}
+        self._line_edits = {}
+
+    def _rebuild_controls(self, obj_col: str) -> None:
+        """Create one row of controls per enabled parameter inside the scroll area."""
+        self._clear_controls_layout()
+
+        # Header row
+        hdr_name = QLabel("Parameter")
+        hdr_name.setStyleSheet(f"color: #89b4fa; font-weight: bold; font-size: 11px;")
+        hdr_val  = QLabel("Value")
+        hdr_val.setStyleSheet(f"color: #89b4fa; font-weight: bold; font-size: 11px;")
+        hdr_val.setAlignment(Qt.AlignRight)
+        self._controls_layout.addWidget(hdr_name, 0, 0)
+        self._controls_layout.addWidget(hdr_val,  0, 2)
+
+        for row_idx, p in enumerate(self._enabled_params, start=1):
+            # Column 0: parameter name label
+            name_lbl = QLabel(p.name)
+            name_lbl.setStyleSheet(f"color: {_FG}; font-size: 11px;")
+            name_lbl.setMinimumWidth(110)
+            name_lbl.setMaximumWidth(200)
+            name_lbl.setWordWrap(True)
+            self._controls_layout.addWidget(name_lbl, row_idx, 0)
+
+            if p.ptype in (ParameterType.FLOAT, ParameterType.INT):
+                lo  = float(p.full_min)
+                hi  = float(p.full_max)
+                rng = hi - lo if hi != lo else 1.0
+                init_val = (lo + hi) / 2.0
+
+                # ── Slider (column 1, stretches) ───────────────────────────
+                slider = QSlider(Qt.Horizontal)
+                slider.setRange(0, self._N_STEPS)
+                init_step = max(0, min(self._N_STEPS,
+                                       int((init_val - lo) / rng * self._N_STEPS)))
+                slider.setValue(init_step)
+                slider.setMinimumWidth(80)
+                slider.setStyleSheet(
+                    "QSlider::groove:horizontal {"
+                    "  background: #313244; height: 6px; border-radius: 3px;"
+                    "}"
+                    "QSlider::handle:horizontal {"
+                    "  background: #89b4fa; width: 14px; height: 14px;"
+                    "  border-radius: 7px; margin: -4px 0;"
+                    "}"
+                    "QSlider::sub-page:horizontal {"
+                    "  background: #89b4fa; border-radius: 3px;"
+                    "}"
+                )
+                self._controls_layout.addWidget(slider, row_idx, 1)
+
+                # ── Value line-edit (column 2, fixed width) ────────────────
+                le = QLineEdit()
+                if p.ptype == ParameterType.INT:
+                    le.setText(str(int(round(init_val))))
+                else:
+                    le.setText(f"{init_val:.4f}")
+                le.setFixedWidth(90)
+                le.setStyleSheet(
+                    f"background-color: #313244; color: {_FG}; "
+                    "border: 1px solid #45475a; border-radius: 4px; "
+                    "padding: 2px 4px; font-size: 11px;"
+                )
+                self._controls_layout.addWidget(le, row_idx, 2)
+
+                self._controls[p.name]    = slider
+                self._line_edits[p.name]  = le
+
+                # ── Wire bidirectional sync ────────────────────────────────
+                # Use default-argument capture to avoid closure-over-loop-variable bug
+                def _make_slider_handler(param, _slider, _le):
+                    def _on_slider(val):
+                        _lo  = float(param.full_min)
+                        _hi  = float(param.full_max)
+                        _rng = _hi - _lo if _hi != _lo else 1.0
+                        actual = _lo + (val / self._N_STEPS) * _rng
+                        if param.ptype == ParameterType.INT:
+                            actual = round(actual)
+                            _le.blockSignals(True)
+                            _le.setText(str(int(actual)))
+                            _le.blockSignals(False)
+                        else:
+                            _le.blockSignals(True)
+                            _le.setText(f"{actual:.4f}")
+                            _le.blockSignals(False)
+                        self._on_params_changed()
+                    return _on_slider
+
+                def _make_le_handler(param, _slider, _le):
+                    def _on_le_finished():
+                        _lo  = float(param.full_min)
+                        _hi  = float(param.full_max)
+                        _rng = _hi - _lo if _hi != _lo else 1.0
+                        try:
+                            v = float(_le.text())
+                        except ValueError:
+                            v = (_lo + _hi) / 2.0
+                        # Clamp to valid range
+                        v = max(_lo, min(_hi, v))
+                        if param.ptype == ParameterType.INT:
+                            v = float(round(v))
+                            _le.blockSignals(True)
+                            _le.setText(str(int(v)))
+                            _le.blockSignals(False)
+                        else:
+                            _le.blockSignals(True)
+                            _le.setText(f"{v:.4f}")
+                            _le.blockSignals(False)
+                        step = max(0, min(self._N_STEPS,
+                                          int((v - _lo) / _rng * self._N_STEPS)))
+                        _slider.blockSignals(True)
+                        _slider.setValue(step)
+                        _slider.blockSignals(False)
+                        self._on_params_changed()
+                    return _on_le_finished
+
+                slider.valueChanged.connect(_make_slider_handler(p, slider, le))
+                le.editingFinished.connect(_make_le_handler(p, slider, le))
+
+            elif p.ptype == ParameterType.CATEGORICAL:
+                choices = p.allowed_choices if p.allowed_choices else p.all_choices
+                combo = QComboBox()
+                combo.addItems([str(c) for c in choices])
+                combo.setStyleSheet(
+                    "QComboBox { background-color: #313244; color: #cdd6f4; "
+                    "border: 1px solid #45475a; border-radius: 4px; padding: 3px 6px; }"
+                )
+                combo.currentIndexChanged.connect(self._on_params_changed)
+                self._controls_layout.addWidget(combo, row_idx, 1, 1, 2)
+                self._controls[p.name] = combo
+
+            elif p.ptype == ParameterType.BOOL:
+                cb = QCheckBox()
+                cb.setChecked(True)
+                cb.toggled.connect(self._on_params_changed)
+                self._controls_layout.addWidget(cb, row_idx, 1)
+                self._controls[p.name] = cb
+
+        # Push rows to top — add a stretch row below the last parameter
+        self._controls_layout.setRowStretch(len(self._enabled_params) + 1, 1)
+
+        # Update the prediction label header text
+        obj_cfg = next(
+            (o for o in self._objectives if o.column_name == obj_col), None
+        )
+        arrow = (" ↓" if obj_cfg and obj_cfg.direction == "minimize"
+                 else " ↑" if obj_cfg else "")
+        self._prediction_label.setText(
+            f"Predicted {obj_col}{arrow}: —"
+        )
+
+    def _on_params_changed(self) -> None:
+        """Read all current control values, run prediction, update label."""
+        if self._rf is None or not self._enabled_params:
+            return
+
+        feature_vec: list[float] = []
+        for p in self._enabled_params:
+            ctrl = self._controls.get(p.name)
+            if ctrl is None:
+                feature_vec.append(0.0)
+                continue
+
+            if p.ptype in (ParameterType.FLOAT, ParameterType.INT):
+                le = self._line_edits.get(p.name)
+                try:
+                    v = float(le.text()) if le else p.full_min
+                except ValueError:
+                    v = float(p.full_min)
+                v = max(float(p.full_min), min(float(p.full_max), v))
+                if p.ptype == ParameterType.INT:
+                    v = float(round(v))
+                feature_vec.append(v)
+
+            elif p.ptype == ParameterType.CATEGORICAL:
+                chosen   = ctrl.currentText()
+                code_map = self._cat_codes.get(p.name, {})
+                feature_vec.append(float(code_map.get(chosen, 0)))
+
+            elif p.ptype == ParameterType.BOOL:
+                feature_vec.append(1.0 if ctrl.isChecked() else 0.0)
+
+        try:
+            pred = float(self._rf.predict([feature_vec])[0])
+        except Exception:
+            return
+
+        obj_col = self._obj_combo.currentText()
+        obj_cfg = next(
+            (o for o in self._objectives if o.column_name == obj_col), None
+        )
+        arrow = (" ↓" if obj_cfg and obj_cfg.direction == "minimize"
+                 else " ↑" if obj_cfg else "")
+        self._prediction_label.setText(
+            f"Predicted {obj_col}{arrow}: {pred:.4g}"
+        )
+
+    def _show_placeholder(self, msg: str) -> None:
+        self._clear_controls_layout()
+        self._scroll.hide()
+        self._prediction_label.hide()
+        self._placeholder.setText(msg)
+        self._placeholder.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Stand-alone dialog wrapper
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pareto Front Scatter Widget (Feature 7)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ParetoWidget(QWidget):
+    """
+    2D scatter plot of Objective A vs Objective B for multi-objective studies.
+
+    Pareto-optimal points are highlighted with coloured stars; dominated points
+    are shown in grey.  A step-line traces the Pareto front sorted by obj_x.
+
+    For 3+ objectives a toolbar lets the user pick which pair to display.
+
+    Public API
+    ----------
+    refresh(study, objectives)
+        Rebuild the plot from all COMPLETE trials.
+    clear()
+        Hide the canvas and show the placeholder text.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._study = None
+        self._objectives: List[ObjectiveConfig] = []
+
+        self._fig = Figure(facecolor=_BG)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setStyleSheet(f"background-color: {_BG};")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # ── Toolbar (objective-pair selectors, shown only for 3+ objectives) ─
+        toolbar_layout = QHBoxLayout()
+        toolbar_layout.addWidget(QLabel("X-axis:"))
+        self._x_combo = QComboBox()
+        self._x_combo.setFixedWidth(160)
+        self._x_combo.currentIndexChanged.connect(self._redraw)
+        toolbar_layout.addWidget(self._x_combo)
+        toolbar_layout.addWidget(QLabel("  Y-axis:"))
+        self._y_combo = QComboBox()
+        self._y_combo.setFixedWidth(160)
+        self._y_combo.currentIndexChanged.connect(self._redraw)
+        toolbar_layout.addWidget(self._y_combo)
+        toolbar_layout.addStretch()
+        refresh_btn = QPushButton("⟳  Refresh")
+        refresh_btn.setFixedWidth(100)
+        refresh_btn.clicked.connect(self._redraw)
+        toolbar_layout.addWidget(refresh_btn)
+
+        # Wrap toolbar in a widget so it can be shown/hidden cleanly
+        self._toolbar_widget = QWidget()
+        self._toolbar_widget.setLayout(toolbar_layout)
+        self._toolbar_widget.hide()
+        layout.addWidget(self._toolbar_widget)
+
+        layout.addWidget(self._canvas, stretch=1)
+
+        self._placeholder = QLabel(
+            "Pareto plot requires 2+ objectives.\n"
+            "Load a multi-objective study to see the Pareto front."
+        )
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setStyleSheet(
+            f"color: {_FG}; font-size: 13px; font-style: italic;"
+        )
+        layout.addWidget(self._placeholder)
+        self._canvas.hide()
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def refresh(self, study, objectives: List[ObjectiveConfig]) -> None:
+        """
+        Rebuild the Pareto scatter from all COMPLETE trials.
+
+        Parameters
+        ----------
+        study      : optuna.Study — the active study object.
+        objectives : list of ObjectiveConfig.
+        """
+        self._study = study
+        self._objectives = objectives
+
+        if len(objectives) < 2:
+            self._fig.clear()
+            self._canvas.draw_idle()
+            self._canvas.hide()
+            self._toolbar_widget.hide()
+            self._placeholder.setText(
+                "Pareto plot requires 2+ objectives.\n"
+                "Add a second objective to see the Pareto front."
+            )
+            self._placeholder.show()
+            return
+
+        # Sync combo boxes for 3+ objectives (show toolbar only when needed)
+        show_toolbar = len(objectives) > 2
+        self._toolbar_widget.setVisible(show_toolbar)
+        if show_toolbar:
+            prev_x = self._x_combo.currentText()
+            prev_y = self._y_combo.currentText()
+            self._x_combo.blockSignals(True)
+            self._y_combo.blockSignals(True)
+            self._x_combo.clear()
+            self._y_combo.clear()
+            for o in objectives:
+                self._x_combo.addItem(o.column_name)
+                self._y_combo.addItem(o.column_name)
+            # Restore previous selection if still valid; else default to 0/1
+            if prev_x in [o.column_name for o in objectives]:
+                self._x_combo.setCurrentText(prev_x)
+            else:
+                self._x_combo.setCurrentIndex(0)
+            if prev_y in [o.column_name for o in objectives]:
+                self._y_combo.setCurrentText(prev_y)
+            else:
+                self._y_combo.setCurrentIndex(min(1, len(objectives) - 1))
+            self._x_combo.blockSignals(False)
+            self._y_combo.blockSignals(False)
+
+        self._redraw()
+
+    def clear(self) -> None:
+        """Reset to placeholder state."""
+        self._study = None
+        self._objectives = []
+        self._fig.clear()
+        self._canvas.draw_idle()
+        self._canvas.hide()
+        self._toolbar_widget.hide()
+        self._placeholder.setText(
+            "Pareto plot requires 2+ objectives.\n"
+            "Load a multi-objective study to see the Pareto front."
+        )
+        self._placeholder.show()
+
+    # ── Internal ───────────────────────────────────────────────────────────
+
+    def _redraw(self) -> None:
+        if self._study is None or len(self._objectives) < 2:
+            return
+
+        from optuna.trial import TrialState
+        from optuna_builder import get_pareto_front
+
+        completed = [t for t in self._study.trials if t.state == TrialState.COMPLETE]
+        if not completed:
+            self._canvas.hide()
+            self._placeholder.setText(
+                "No completed trials yet.\n"
+                "Run at least one batch to see the Pareto scatter."
+            )
+            self._placeholder.show()
+            return
+
+        # Determine which objective indices to plot
+        if len(self._objectives) > 2:
+            x_name = self._x_combo.currentText()
+            y_name = self._y_combo.currentText()
+            x_idx = next(
+                (i for i, o in enumerate(self._objectives) if o.column_name == x_name), 0
+            )
+            y_idx = next(
+                (i for i, o in enumerate(self._objectives) if o.column_name == y_name), 1
+            )
+        else:
+            x_idx, y_idx = 0, 1
+
+        obj_x = self._objectives[x_idx]
+        obj_y = self._objectives[y_idx]
+
+        # Extract values for all completed trials
+        all_x: list[float] = []
+        all_y: list[float] = []
+        for t in completed:
+            vals = (
+                t.values if t.values is not None
+                else ([t.value] if t.value is not None else [])
+            )
+            if len(vals) > max(x_idx, y_idx):
+                xv = vals[x_idx]
+                yv = vals[y_idx]
+                if xv is not None and yv is not None:
+                    try:
+                        all_x.append(float(xv))
+                        all_y.append(float(yv))
+                    except (TypeError, ValueError):
+                        pass
+
+        if not all_x:
+            self._canvas.hide()
+            self._placeholder.setText(
+                "No valid objective values found for the selected pair."
+            )
+            self._placeholder.show()
+            return
+
+        # Get Pareto-optimal trials
+        pareto_trials = get_pareto_front(self._study)
+        pareto_x: list[float] = []
+        pareto_y: list[float] = []
+        for t in pareto_trials:
+            vals = (
+                t.values if t.values is not None
+                else ([t.value] if t.value is not None else [])
+            )
+            if len(vals) > max(x_idx, y_idx):
+                xv = vals[x_idx]
+                yv = vals[y_idx]
+                if xv is not None and yv is not None:
+                    try:
+                        pareto_x.append(float(xv))
+                        pareto_y.append(float(yv))
+                    except (TypeError, ValueError):
+                        pass
+
+        # ── Draw ───────────────────────────────────────────────────────────
+        self._fig.clear()
+        ax = self._fig.add_subplot(111)
+        ax.set_facecolor(_AX_BG)
+        for spine in ax.spines.values():
+            spine.set_color(_GRID)
+        ax.tick_params(colors=_FG, labelsize=8)
+        ax.xaxis.label.set_color(_FG)
+        ax.yaxis.label.set_color(_FG)
+        ax.title.set_color(_FG)
+        ax.grid(color=_GRID, linewidth=0.5, alpha=0.5)
+
+        # All points (grey, potentially dominated)
+        ax.scatter(
+            all_x, all_y,
+            color="grey", alpha=0.5, s=40, zorder=2,
+            label=f"All trials ({len(all_x)})",
+        )
+
+        # Pareto-optimal points (green stars)
+        if pareto_x:
+            ax.scatter(
+                pareto_x, pareto_y,
+                marker="*", s=120, color=_PARETO,
+                edgecolors="white", linewidths=0.5,
+                zorder=5, label=f"Pareto-optimal ({len(pareto_x)})",
+            )
+            # Step-line tracing the Pareto front, sorted by x value
+            sorted_pairs = sorted(zip(pareto_x, pareto_y), key=lambda p: p[0])
+            sx, sy = zip(*sorted_pairs)
+            ax.step(
+                sx, sy,
+                where="post", color=_PARETO, linewidth=1.5,
+                alpha=0.7, linestyle="--", zorder=4,
+            )
+
+        # Axis labels include direction arrows
+        x_arrow = "↑ maximize" if obj_x.direction == "maximize" else "↓ minimize"
+        y_arrow = "↑ maximize" if obj_y.direction == "maximize" else "↓ minimize"
+        ax.set_xlabel(f"{obj_x.column_name}  ({x_arrow})", color=_FG, fontsize=9)
+        ax.set_ylabel(f"{obj_y.column_name}  ({y_arrow})", color=_FG, fontsize=9)
+        ax.set_title("Pareto Front — Trade-off Scatter", color=_FG, fontsize=9, pad=6)
+
+        ax.legend(
+            loc="best", facecolor=_BG, edgecolor=_GRID,
+            labelcolor=_FG, fontsize=8,
+        )
+
+        self._fig.patch.set_facecolor(_BG)
+        try:
+            self._fig.tight_layout()
+        except Exception:
+            pass
+
+        self._canvas.draw_idle()
+        self._placeholder.hide()
+        self._canvas.show()
+
 
 class DesignSpaceDialog(QDialog):
     """
     Non-modal window hosting a tabbed interface:
 
     * **📊 Design Space** — pairplot / parallel coordinates / marginals
-      (the original :class:`DesignSpaceWidget`)
     * **🔗 Correlation Matrix** — annotated Pearson / Spearman heatmap
-      (:class:`CorrelationWidget`)
+    * **📈 Importance** — permutation importance bar chart
+    * **🔮 Profiler** — what-if prediction profiler (Feature 6)
 
     Usage
     -----
     ::
 
-        # Create once, reuse thereafter
         dlg = DesignSpaceDialog(parent=main_window)
         dlg.refresh(df, params, objectives, suggestions=None)
         dlg.show()
         dlg.raise_()
-
-    Calling ``refresh()`` while the dialog is already visible simply redraws
-    both tabs with new data; no new window is opened.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setModal(False)
-        self.setWindowTitle("Design Space — BHOP")
+        self.setWindowTitle("Design Space — LabOpt")
 
         # ── Size: fit within screen ────────────────────────────────────────
         screen = (
@@ -887,12 +2001,24 @@ class DesignSpaceDialog(QDialog):
         self.resize(w, h)
         self.setMinimumSize(500, 380)
 
+        # ── Validation state ──────────────────────────────────────────────
+        self._validation_results = None   # ValidationResults | None
+        self._validation_worker  = None   # ValidationWorker  | None
+        self._val_tabs_added     = False  # True once validation tabs injected
+        # Canvases created in _ensure_val_tabs() — kept so showEvent() can
+        # force a redraw when the dialog is reshown after being hidden.
+        self._val_canvases: List[FigureCanvasQTAgg] = []
+        # Stored for _extract_xy() and _extract_context()
+        self._df: Optional[pd.DataFrame] = None
+        self._params: List[ParameterConfig] = []
+        self._objectives: List[ObjectiveConfig] = []
+        self._study_config = None         # StudyConfig | None
+
         # ── Layout ────────────────────────────────────────────────────────
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(6, 6, 6, 6)
         vbox.setSpacing(4)
 
-        # Two-tab interface
         self._tabs = QTabWidget()
 
         self._widget = DesignSpaceWidget(self)
@@ -901,18 +2027,118 @@ class DesignSpaceDialog(QDialog):
         self._corr_widget = CorrelationWidget(self)
         self._tabs.addTab(self._corr_widget, "🔗  Correlation Matrix")
 
+        self._importance_widget = ImportanceWidget(self)
+        self._tabs.addTab(self._importance_widget, "📈  Importance")
+
+        self._profiler_widget = ProfilerWidget(self)
+        self._tabs.addTab(self._profiler_widget, "🔮  Profiler")
+
+        # ── Validation header row (ABOVE the tab widget) ───────────────────
+        _val_row = QHBoxLayout()
+        self._val_checkbox = QCheckBox(
+            "🔬  Run Surrogate Validation (requires ≥ 30 unique samples)")
+        self._val_checkbox.setEnabled(False)
+        self._val_checkbox.setToolTip(
+            "Run a rigorous validation of the surrogate model on the current\n"
+            "dataset:\n"
+            "  §0  Data quality check\n"
+            "  §1  RF + GP hold-out and cross-validated accuracy\n"
+            "  §2  Virtual BO benchmark (GP+EI vs RF+EI vs Greedy vs Random)\n"
+            "  §3  Expected Improvement marginals per parameter\n"
+            "  §5  Pass/fail summary\n\n"
+            "Runtime: 3–10 minutes depending on dataset size.\n"
+            "Results are shown as new tabs and included in the HTML report."
+        )
+        self._val_checkbox.toggled.connect(self._on_validation_toggled)
+        _val_row.addWidget(self._val_checkbox)
+        _val_row.addStretch()
+
+        self._val_progress = QProgressBar()
+        self._val_progress.setRange(0, 100)
+        self._val_progress.setValue(0)
+        self._val_progress.setVisible(False)
+        self._val_progress.setFixedHeight(18)
+        _val_row.addWidget(self._val_progress)
+
+        self._val_status_lbl = QLabel("")
+        self._val_status_lbl.setStyleSheet("font-size: 11px; color: #a6e3a1;")
+        self._val_status_lbl.setVisible(False)
+        _val_row.addWidget(self._val_status_lbl)
+
+        vbox.addLayout(_val_row)
         vbox.addWidget(self._tabs, stretch=1)
 
-        # ── Bottom row: size grip + close button ──────────────────────────
+        # ── Fullscreen toggle state ───────────────────────────────────────
+        self._is_fullscreen: bool = False
+        self._normal_geometry = None   # QRect saved before going fullscreen
+
+        # ── Tab-changed signal for lazy rendering ──────────────────────────
+        self._tabs.currentChanged.connect(self._on_tab_selected)
+
+        # ── Bottom row: size grip + fullscreen + close ────────────────────
         bottom_row = QHBoxLayout()
         size_grip = QSizeGrip(self)
         bottom_row.addWidget(size_grip, alignment=Qt.AlignLeft | Qt.AlignBottom)
         bottom_row.addStretch()
+        self._fullscreen_btn = QPushButton("⛶  Fullscreen")
+        self._fullscreen_btn.setFixedWidth(115)
+        self._fullscreen_btn.setToolTip("Expand to fill the screen.")
+        self._fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+        bottom_row.addWidget(self._fullscreen_btn)
         close_btn = QPushButton("Close")
         close_btn.setFixedWidth(90)
         close_btn.clicked.connect(self.hide)
         bottom_row.addWidget(close_btn)
         vbox.addLayout(bottom_row)
+
+    # ── Fullscreen toggle ─────────────────────────────────────────────────
+
+    def _toggle_fullscreen(self) -> None:
+        """Toggle between fullscreen and the pre-fullscreen window size."""
+        if not self._is_fullscreen:
+            # Save geometry before expanding
+            self._normal_geometry = self.geometry()
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                self.setGeometry(screen.availableGeometry())
+            else:
+                self.showMaximized()
+            self._is_fullscreen = True
+            self._fullscreen_btn.setText("⧉  Windowed")
+            self._fullscreen_btn.setToolTip("Restore to normal window size.")
+        else:
+            # Restore saved geometry
+            if self._normal_geometry is not None:
+                self.setGeometry(self._normal_geometry)
+            self._is_fullscreen = False
+            self._fullscreen_btn.setText("⛶  Fullscreen")
+            self._fullscreen_btn.setToolTip("Expand to fill the screen.")
+
+    # ── Lazy tab rendering ────────────────────────────────────────────────
+
+    def _on_tab_selected(self, index: int) -> None:
+        """
+        Render the newly selected tab on demand.
+
+        Tabs 1–3 (Correlation, Importance, Profiler) use expensive computations
+        (RF fitting, permutation importance) that would freeze the UI if run
+        eagerly.  They set _needs_redraw=True in refresh() and are only
+        computed here when the user actually clicks the tab.
+
+        Tab 0 (Design Space pairplot) always renders immediately — it is the
+        active default and the computation is cheap.
+        Tab 4+ (Validation figures) are static matplotlib canvases — no
+        recomputation needed.
+        """
+        if index == 1 and getattr(self._corr_widget, '_needs_redraw', False):
+            self._corr_widget._needs_redraw = False
+            self._corr_widget._redraw()
+        elif index == 2 and getattr(self._importance_widget, '_needs_redraw', False):
+            self._importance_widget._needs_redraw = False
+            self._importance_widget._redraw()
+        elif index == 3 and getattr(self._profiler_widget, '_needs_redraw', False):
+            self._profiler_widget._needs_redraw = False
+            self._profiler_widget._fit_and_rebuild()
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -922,12 +2148,335 @@ class DesignSpaceDialog(QDialog):
         params: List[ParameterConfig],
         objectives: List[ObjectiveConfig],
         suggestions: Optional[List[dict]] = None,
+        study_config=None,
     ) -> None:
-        """Refresh both the Design Space and Correlation Matrix tabs."""
+        """Refresh all tabs with new data.  Pass study_config for validation."""
+        # Detect a meaningful data change → reset any existing validation state
+        data_changed = (
+            self._df is None
+            or len(df) != len(self._df)
+            or list(df.columns) != list(self._df.columns)
+        )
+        if data_changed and (self._validation_results is not None
+                             or self._val_tabs_added):
+            self._reset_validation_state()
+
+        # Store for validation helpers
+        self._df           = df
+        self._params       = params
+        self._objectives   = objectives
+        self._study_config = study_config
+
+        # Enable/disable checkbox based on n_unique
+        self._update_val_checkbox_state()
+
         self._widget.refresh(df, params, objectives, suggestions)
         self._corr_widget.refresh(df, params, objectives)
+        self._importance_widget.refresh(df, params, objectives)
+        self._profiler_widget.refresh(df, params, objectives)
 
     def clear(self) -> None:
-        """Clear both tabs."""
+        """Clear all tabs and reset validation state."""
+        self._reset_validation_state()
+        self._df           = None
+        self._params       = []
+        self._objectives   = []
+        self._study_config = None
+        self._val_checkbox.setEnabled(False)
         self._widget.clear()
         self._corr_widget.clear()
+        self._importance_widget.clear()
+        self._profiler_widget.clear()
+
+    def set_validation_results(self, results) -> None:
+        """
+        Accept validation results from MainWindow and inject tabs (idempotent).
+
+        Called automatically when MainWindow's Results-tab validation completes
+        and the Design Space dialog is open (or about to be opened), so the 7
+        validation tabs appear here without the user needing to re-run.
+        """
+        if results is None:
+            return
+        # If we have different results, reset tabs so they're re-injected
+        if self._validation_results is not results:
+            if self._val_tabs_added:
+                while self._tabs.count() > 4:
+                    self._tabs.removeTab(self._tabs.count() - 1)
+                self._val_tabs_added = False
+            self._validation_results = results
+        # Inject tabs (no-op if already done)
+        self._ensure_val_tabs()
+        # Update checkbox UI to show "Complete"
+        self._val_checkbox.blockSignals(True)
+        self._val_checkbox.setChecked(True)
+        self._val_checkbox.setText("🔬  Surrogate Validation  ✅  Complete")
+        self._val_checkbox.setEnabled(True)
+        self._val_checkbox.blockSignals(False)
+        self._val_status_lbl.setText(
+            f"✅  Complete — {results.n_pass}/{results.n_checks} checks passed"
+        )
+        self._val_status_lbl.setVisible(True)
+        self._val_progress.setValue(100)
+
+    # ── Validation: checkbox state ─────────────────────────────────────────
+
+    def _update_val_checkbox_state(self) -> None:
+        """Enable the validation checkbox iff df has ≥ 30 unique numeric rows."""
+        if self._df is None or not self._params:
+            self._val_checkbox.setEnabled(False)
+            return
+
+        numeric_cols = [
+            p.name for p in self._params
+            if p.enabled
+            and p.ptype in (ParameterType.FLOAT, ParameterType.INT)
+            and p.name in self._df.columns
+        ]
+        if not numeric_cols:
+            self._val_checkbox.setEnabled(False)
+            return
+
+        try:
+            n_unique = len(
+                self._df.dropna(subset=numeric_cols)
+                        .drop_duplicates(subset=numeric_cols)
+            )
+        except Exception:
+            n_unique = len(self._df)
+
+        base_tip = (
+            "Run a rigorous validation of the surrogate model on the current\n"
+            "dataset:\n"
+            "  §0  Data quality check\n"
+            "  §1  RF + GP hold-out and cross-validated accuracy\n"
+            "  §2  Virtual BO benchmark (GP+EI vs RF+EI vs Greedy vs Random)\n"
+            "  §3  Expected Improvement marginals per parameter\n"
+            "  §5  Pass/fail summary\n\n"
+            "Runtime: 3–10 minutes depending on dataset size.\n"
+            "Results are shown as new tabs and included in the HTML report."
+        )
+        if n_unique >= 30:
+            self._val_checkbox.setEnabled(True)
+            self._val_checkbox.setToolTip(base_tip)
+        else:
+            self._val_checkbox.setEnabled(False)
+            self._val_checkbox.setToolTip(
+                base_tip
+                + f"\n\n⚠ Currently disabled: only {n_unique} unique rows "
+                  f"(need ≥ 30)."
+            )
+
+    # ── Validation: state reset ────────────────────────────────────────────
+
+    def _reset_validation_state(self) -> None:
+        """Stop worker, remove validation tabs, reset all state."""
+        if self._validation_worker is not None and self._validation_worker.isRunning():
+            self._validation_worker.terminate()
+            self._validation_worker.wait(3000)
+            self._validation_worker = None
+
+        # Remove validation tabs (keep base 4: Design Space, Correlation,
+        #                          Importance, Profiler)
+        if self._val_tabs_added:
+            while self._tabs.count() > 4:
+                self._tabs.removeTab(self._tabs.count() - 1)
+
+        self._validation_results = None
+        self._validation_worker  = None
+        self._val_tabs_added     = False
+        self._val_canvases.clear()
+        self._val_progress.setVisible(False)
+        self._val_status_lbl.setVisible(False)
+        if hasattr(self, "_val_checkbox"):
+            self._val_checkbox.blockSignals(True)
+            self._val_checkbox.setChecked(False)
+            self._val_checkbox.setText(
+                "🔬  Run Surrogate Validation (requires ≥ 30 unique samples)")
+            self._val_checkbox.blockSignals(False)
+
+    # ── Validation: checkbox toggle ────────────────────────────────────────
+
+    def _on_validation_toggled(self, checked: bool) -> None:
+        if checked:
+            if self._validation_results is not None:
+                # Results already exist — just show/switch to tabs
+                self._ensure_val_tabs()
+                return
+
+            # Extract data arrays
+            try:
+                X, y, feature_names = self._extract_xy()
+            except ValueError as exc:
+                QMessageBox.warning(self, "Validation Error",
+                                    f"Cannot start validation:\n{exc}")
+                self._val_checkbox.setChecked(False)
+                return
+
+            ctx_X, ctx_names = self._extract_context()
+            direction = (self._objectives[0].direction
+                         if self._objectives else "minimize")
+            target_name = (self._objectives[0].column_name
+                           if self._objectives else "objective")
+
+            # Show progress UI
+            self._val_progress.setValue(0)
+            self._val_progress.setVisible(True)
+            self._val_status_lbl.setText("Starting validation…")
+            self._val_status_lbl.setVisible(True)
+            self._val_checkbox.setText("🔬  Running Validation — please wait…")
+            self._val_checkbox.setEnabled(False)
+
+            # Import lazily to avoid circular imports at module load time
+            from validation_worker import ValidationWorker
+            self._validation_worker = ValidationWorker(
+                X=X, y=y,
+                feature_names=feature_names,
+                target_name=target_name,
+                direction=direction,
+                context_X=ctx_X,
+                context_names=ctx_names,
+                parent=self,
+            )
+            self._validation_worker.progress_updated.connect(self._on_val_progress)
+            self._validation_worker.validation_done.connect(self._on_val_done)
+            self._validation_worker.error_occurred.connect(self._on_val_error)
+            self._validation_worker.start()
+
+        else:
+            # Unchecked — stop running worker but keep any existing results
+            if self._validation_worker is not None and \
+                    self._validation_worker.isRunning():
+                self._validation_worker.terminate()
+                self._validation_worker.wait(3000)
+            self._val_progress.setVisible(False)
+            self._val_status_lbl.setVisible(False)
+            self._val_checkbox.setText(
+                "🔬  Run Surrogate Validation (requires ≥ 30 unique samples)")
+            self._val_checkbox.setEnabled(True)
+
+    # ── Validation: worker signal handlers ────────────────────────────────
+
+    def _on_val_progress(self, pct: int, msg: str) -> None:
+        self._val_progress.setValue(pct)
+        self._val_status_lbl.setText(msg)
+
+    def _on_val_done(self, results) -> None:
+        self._validation_results = results
+        self._val_progress.setValue(100)
+        self._val_status_lbl.setText(
+            f"✅  Complete — {results.n_pass}/{results.n_checks} checks passed"
+        )
+        self._val_checkbox.setText("🔬  Surrogate Validation  ✅  Complete")
+        self._val_checkbox.setEnabled(True)
+        self._ensure_val_tabs()
+
+    def _on_val_error(self, msg: str) -> None:
+        self._val_progress.setVisible(False)
+        self._val_status_lbl.setVisible(False)
+        self._val_checkbox.setText("🔬  Run Surrogate Validation  ❌  Error")
+        self._val_checkbox.setEnabled(True)
+        QMessageBox.critical(
+            self, "Validation Error",
+            f"The validation run failed:\n\n{msg[:600]}"
+        )
+
+    # ── Validation: inject result tabs ────────────────────────────────────
+
+    def _ensure_val_tabs(self) -> None:
+        """Inject validation figures as new tabs (called at most once)."""
+        if self._val_tabs_added or self._validation_results is None:
+            return
+        self._val_tabs_added = True
+
+        r = self._validation_results
+        tab_specs = [
+            ("s0_data_summary",        "📊 Data Quality"),
+            ("s1_predicted_vs_true",   "🎯 Surrogate Accuracy"),
+            ("s1_residuals",           "📉 Residuals"),
+            ("s2_bo_convergence",      "📈 BO Benchmark"),
+            ("s2_bo_convergence_norm", "📈 BO (Normalised)"),
+            ("s3_ei_marginals",        "🔍 EI Marginals"),
+            ("s5_passfail",            "✅ Validation Summary"),
+        ]
+        first_val_idx = self._tabs.count()
+        for key, tab_label in tab_specs:
+            fig = r.figures.get(key)
+            if fig is None:
+                continue
+            canvas = FigureCanvasQTAgg(fig)
+            canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self._val_canvases.append(canvas)   # track for showEvent redraw
+            page = QWidget()
+            page_vbox = QVBoxLayout(page)
+            page_vbox.setContentsMargins(4, 4, 4, 4)
+            page_vbox.addWidget(canvas)
+            self._tabs.addTab(page, tab_label)
+
+        # Switch to first validation tab
+        if self._tabs.count() > first_val_idx:
+            self._tabs.setCurrentIndex(first_val_idx)
+
+    # ── showEvent: force validation canvases to repaint when reshown ──────
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """Schedule a non-blocking repaint of validation canvases when reshown.
+
+        FigureCanvasQTAgg buffers can go stale after hide() + show().  Using
+        draw_idle() (non-blocking) rather than draw() prevents the UI from
+        freezing if there are many large validation figures.
+        """
+        super().showEvent(event)
+        for canvas in self._val_canvases:
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+    # ── Validation: data extraction helpers ──────────────────────────────
+
+    def _extract_xy(self):
+        """Convert stored df + params + objectives to numpy arrays."""
+        if self._df is None:
+            raise ValueError("No CSV loaded.")
+        if not self._objectives:
+            raise ValueError("No objective configured.")
+
+        feature_cols = [
+            p.name for p in self._params
+            if p.enabled
+            and p.ptype in (ParameterType.FLOAT, ParameterType.INT)
+            and p.name in self._df.columns
+        ]
+        if not feature_cols:
+            raise ValueError("No enabled numeric feature parameters found.")
+
+        obj_col = self._objectives[0].column_name
+        if obj_col not in self._df.columns:
+            raise ValueError(f"Objective column '{obj_col}' not found in CSV.")
+
+        sub = self._df[feature_cols + [obj_col]].dropna()
+        if len(sub) < 5:
+            raise ValueError(
+                f"Too few valid rows after removing NaNs ({len(sub)} rows)."
+            )
+
+        X = sub[feature_cols].values.astype(float)
+        y = sub[obj_col].values.astype(float)
+        return X, y, feature_cols
+
+    def _extract_context(self):
+        """Extract context variable arrays from stored df + study_config."""
+        if self._df is None or self._study_config is None:
+            return None, None
+        ctx_names = [
+            cv.column_name
+            for cv in getattr(self._study_config, "context_variables", [])
+            if cv.column_name in self._df.columns
+        ]
+        if not ctx_names:
+            return None, None
+        ctx_sub = self._df[ctx_names].copy()
+        ctx_sub = ctx_sub.fillna(ctx_sub.mean())
+        ctx_X = ctx_sub.values.astype(float)
+        return ctx_X, ctx_names

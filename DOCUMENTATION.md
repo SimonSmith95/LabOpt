@@ -1,4 +1,4 @@
-# BHOP — Bayesian Hyperparameter Optimisation for the Lab
+# LabOpt — Lab Optimisation Tool
 ## Complete Documentation
 
 ---
@@ -18,6 +18,9 @@
    - 3.8 [Saving and Resuming Sessions](#38-saving-and-resuming-sessions)
    - 3.9 [Design Space Visualisation](#39-design-space-visualisation)
    - 3.10 [Defining Parameter Constraints](#310-defining-parameter-constraints)
+   - 3.11 [Context Variables (Uncontrollable Environmental Conditions)](#311-context-variables-uncontrollable-environmental-conditions)
+   - 3.12 [Power Analysis — Sample Size Calculator](#312-power-analysis--sample-size-calculator)
+   - 3.13 [Surrogate Validation](#313-surrogate-validation)
 4. [Headless / Scripting Mode](#4-headless--scripting-mode)
 5. [Codebase Architecture](#5-codebase-architecture)
    - 5.1 [File Map](#51-file-map)
@@ -32,6 +35,7 @@
    - 6.6 [worker.py](#66-workerpy)
    - 6.7 [GUI Widgets](#67-gui-widgets)
    - 6.8 [main.py & BHOP.py](#68-mainpy--bhoppy)
+   - 6.9 [contextual_sampler.py](#69-contextual_samplerpy)
 7. [Validation Script (validate_perovskite.py)](#7-validation-script-validate_perovskitepy)
    - 7.1 [What It Validates and Why](#71-what-it-validates-and-why)
    - 7.2 [How to Run It](#72-how-to-run-it)
@@ -46,14 +50,27 @@
     - 11.1 [Data Assumptions](#111-data-assumptions)
     - 11.2 [Optimizer Assumptions](#112-optimizer-assumptions)
     - 11.3 [Validation Caveats](#113-validation-caveats)
-    - 11.4 [When to Use BHOP](#114-when-to-use-and-when-not-to-use-bhop)
+    - 11.4 [When to Use LabOpt](#114-when-to-use-and-when-not-to-use-labopt)
     - 11.5 [Reporting and Reproducibility](#115-reporting-and-reproducibility)
+12. [Design of Experiments (DoE)](#12-design-of-experiments-doe)
+    - 12.1 [What is a DoE and Why Does it Matter?](#121-what-is-a-doe-and-why-does-it-matter)
+    - 12.2 [Supported Strategies](#122-supported-strategies)
+    - 12.3 [The Surrogate Readiness Formula](#123-the-surrogate-readiness-formula)
+    - 12.4 [DoE Workflow in LabOpt](#124-doe-workflow-in-labopt)
+    - 12.5 [Assumptions and Limitations](#125-assumptions-and-limitations)
+    - 12.6 [Coverage Metrics Explained](#126-coverage-metrics-explained)
+    - 12.7 [Exporting DoE Results](#127-exporting-doe-results)
+13. [Session Naming & Multi-User Deployment](#13-session-naming--multi-user-deployment)
+    - 13.1 [Project Names and Researchers](#131-project-names-and-researchers)
+    - 13.2 [Environment Variables for Docker / Shared Lab](#132-environment-variables-for-docker--shared-lab)
+    - 13.3 [Session Browser](#133-session-browser)
+    - 13.4 [Backward Compatibility](#134-backward-compatibility)
 
 ---
 
 ## 1. Project Overview
 
-**BHOP** is a lab-facing Bayesian Optimisation tool. It wraps the
+**LabOpt** is a lab-facing optimisation tool. It wraps the
 [Optuna](https://optuna.org/) optimisation framework in a clean PySide6 GUI,
 making it practical for wet-lab or materials-science workflows where:
 
@@ -70,6 +87,7 @@ making it practical for wet-lab or materials-science workflows where:
 |---|---|
 | `main.py` | GUI entry point — call `python main.py` |
 | `main_window.py` | Full PySide6 application window |
+| `LabOpt_logo.png` | Application logo (toolbar + window icon) |
 | `parameter_config.py` | Data models shared across the whole app |
 | `csv_loader.py` | Reads CSV, auto-detects column types |
 | `sampler_utils.py` | Dead-region-aware parameter sampling |
@@ -79,7 +97,7 @@ making it practical for wet-lab or materials-science workflows where:
 | `param_card_widget.py` | UI widget for one parameter |
 | `batch_results_dialog.py` | Dialog to enter lab measurements |
 | `dead_region_dialog.py` | Dialog to define forbidden parameter zones |
-| `BHOP.py` | Headless scripting example (no GUI needed) |
+| `BHOP.py` | Headless scripting example (no GUI needed) — see `LabOpt` entry point |
 | `test_backend.py` | Pytest test suite for all backend modules |
 | `validate_perovskite.py` | Stand-alone validation suite for the perovskite dataset |
 | `test_data/` | Example CSV and auto-generated session files |
@@ -110,13 +128,15 @@ The dependencies are:
 | `numpy` | ≥ 1.26 | Numerical operations |
 | `matplotlib` | ≥ 3.8 | Plots (validation script) |
 | `sqlalchemy` | ≥ 2.0 | Optuna's SQLite backend |
-| `scikit-learn` | ≥ 1.4 | RF + GP surrogates (validation script) |
+| `scikit-learn` | ≥ 1.4 | RF surrogates (surrogate quality badge, importance, profiler) |
+| `scipy` | ≥ 1.11 | Scientific utilities |
+| `openpyxl` | ≥ 3.1 | Excel (.xlsx / .xls) file read / write |
 
 > **Note for Windows users:** If you see a `UnicodeEncodeError` when running
 > scripts in the terminal, the script already adds `sys.stdout.reconfigure`
 > at the top to handle this. See [Troubleshooting](#10-troubleshooting).
 
----
+
 
 ## 3. How to Use the Application (GUI Walkthrough)
 
@@ -129,7 +149,8 @@ python main.py
 The main window opens with an empty state. You will see:
 - **Left dock — ⚙ Settings tab** — Objectives selector, sampler, batch settings, warnings, Ask / Pause buttons
 - **Left dock — 📊 Results tab** — All Trials table, Best/Pareto table, Design Space button, Export button (auto-activated after each batch)
-- **Centre panel** — scrollable parameter cards (one per input column in your CSV)
+- **Left dock — 🔬 Power tab** — Sample-size calculator; shows the input form on the left and the result/plots in the centre area (see §3.12)
+- **Centre panel** — scrollable parameter cards (one per input column in your CSV); replaced by the Power Analysis plots when the 🔬 Power tab is active
 - **Toolbar** — Load CSV, Reload CSV, 📋 Enter Pending Results…
 - **Status bar** — trial count, best value, current status
 
@@ -139,7 +160,11 @@ The main window opens with an empty state. You will see:
 
 Go to **File → Load CSV** (or click the toolbar icon).
 
-Your CSV must have:
+LabOpt accepts both **CSV** (`.csv`) and **Excel** (`.xlsx`, `.xls`) files —
+the same dialog accepts both formats. Excel files are read from the first
+sheet using `openpyxl`; the column layout requirements are identical to CSV.
+
+Your data file must have:
 - **One column per experiment parameter** (inputs).
 - **One or more result columns** (outputs / objectives).
 - Optionally: rows where result columns are blank — those are treated as
@@ -203,6 +228,36 @@ For **multi-objective** optimisation, select more than one result column.
 The sampler switches automatically to NSGA-II and a Pareto-front table
 replaces the single-best display.
 
+#### Replicate Aggregation (optional)
+
+Before clicking **Apply Objectives →** you can tick **Aggregate replicates**
+and set a ±tolerance. Any rows in the CSV whose numeric parameter values agree
+within that tolerance are merged: objective values are averaged, and an
+`n_replicates` column is added to the All Trials table so you can see how
+many raw measurements were combined.
+
+- `tolerance = 1e-6` (default) → exact-match only.
+- `tolerance = 0.5` → merge rows within ±0.5 of every numeric parameter.
+- Categorical parameters always require an exact match regardless of tolerance.
+
+#### Results tab — live feedback after each batch
+
+After each submitted batch the **📊 Results** tab automatically updates:
+
+| Sub-tab | What it shows |
+|---|---|
+| **All Trials** | Every completed trial, colour-coded with an `n_replicates` column |
+| **Best / Pareto** | Best trial (single-obj) or the full Pareto front (multi-obj) |
+| **📈 Convergence** | Step-line of best-value-so-far vs. trial number; one line per objective |
+| **📈 Pareto** | 2-D scatter of Objective A vs Objective B (multi-objective only) — Pareto-optimal points highlighted as green stars, dominated points in grey, connected by a dashed step-line |
+
+A **Surrogate quality badge** below the export buttons shows the
+cross-validated R² of a Random Forest trained on all completed trials:
+- ✅ Green (R² > 0.85) — model predictions are reliable.
+- ⚠ Amber (0.60–0.85) — acceptable; more data will improve accuracy.
+- 🔴 Red (< 0.60) — model is unreliable; do not trust suggestions blindly.
+- Grey — insufficient data (< 15 completed rows).
+
 ---
 
 ### 3.5 Choosing Batch Size, n-Batches and Sampler
@@ -210,12 +265,36 @@ replaces the single-best display.
 | Setting | Description |
 |---|---|
 | **Batch size** | How many experiments to suggest per round |
-| **Number of batches** | Total rounds of ask → experiment → tell |
-| **Sampler** | `TPE` (recommended), `NSGAII` (multi-obj), `Random` (baseline) |
+| **Number of batches** | Total rounds of ask → experiment → tell. Set large (e.g. 50) and enable Auto-stop to let the model decide when to halt. |
+| **Sampler** | `TPE` (recommended), `NSGAII` (multi-obj), `Random` (baseline), `GP` (Gaussian Process) |
 
-> **TPE** (Tree-structured Parzen Estimator) is the default and works well
-> for most single-objective problems. It learns a probabilistic model of the
-> objective and balances exploration vs. exploitation automatically.
+#### Sampler details
+
+| Sampler | Best for | Notes |
+|---|---|---|
+| `TPE` | Single-objective, ≤ 20 parameters | Default. Multivariate Parzen estimator; good balance of exploration and exploitation. |
+| `NSGAII` | Multi-objective | Genetic algorithm. Batch size should ideally be a multiple of the population size. |
+| `Random` | Baselines / debugging | No model — uniform random sampling. Useful to confirm BO adds value. |
+| `GP` | Smooth continuous spaces with < 200 trials | Gaussian Process surrogate. Provides calibrated uncertainty estimates. Scales as O(n³) — switch to TPE above ~200 completed trials. |
+
+#### Auto-stop criterion
+
+Tick **Auto-stop when converged** in the Batch Settings group to let LabOpt
+halt automatically when the best objective value has not improved:
+
+- **Min improvement** — minimum relative change required per batch (default 1%).
+- **over N batches** — the window of consecutive batches to check (default 3).
+
+**Example**: with threshold 1% and window 3, LabOpt stops when the last 3 batches
+each produced less than 1% relative improvement over the previous best.
+
+**Recommended workflow**: set *Total batches* to a generous upper bound (e.g. 50)
+and rely on auto-stop to halt the study when it plateaus — you can always click
+"Ask Next Batch" again if you want to continue.
+
+> **Note**: `GP` sampler does not support inequality constraints via
+> `constraints_func`. Constraints are still enforced post-hoc by projection,
+> but the surrogate does not learn to avoid infeasible regions automatically.
 
 ---
 
@@ -264,6 +343,37 @@ Click **Submit All** to tell Optuna the results. The app then:
 3. Moves to the next batch (ask → experiment → tell).
 4. Updates the trials table in the centre panel.
 
+#### Outlier detection (automatic)
+
+While you type a result value, the dialog compares it against the surrogate
+model's prediction for that composition (using Out-of-Bag Random Forest
+predictions). If the entered value is more than 90% away from the prediction
+**or** more than 2.5 standard deviations away, the spinbox turns **orange**
+as a caution indicator.
+
+This is **advisory only** — the orange highlight does not prevent submission.
+It catches typos (e.g. typing `1200` instead of `120`) and instrument failures
+before they corrupt the surrogate.
+
+The highlight is disabled when fewer than 5 completed trials exist (not enough
+data to calibrate the model).
+
+#### Pre-submit validation gate
+
+When you click **Submit All**, LabOpt runs three automated checks before saving:
+
+1. **Constraint violations** — are the actual parameter values you entered
+   consistent with the algebraic constraints? (e.g. fractions summing to 1)
+2. **Large parameter deviations** — did you change any suggested parameter by
+   more than 20% of its full range? (flags accidental edits)
+3. **Outlier result** — is the entered measurement more than 90% away from the
+   model's prediction for that composition?
+
+If any check fails a single confirmation dialog appears listing all issues,
+with two buttons:
+- **Submit Anyway** — proceeds with the current values.
+- **Back / Re-enter** *(default)* — returns to the form so you can correct values.
+
 Click **Cancel** to close the dialog without submitting. The pending batch is
 still saved — see §3.8 for how to come back to it later.
 
@@ -271,13 +381,13 @@ still saved — see §3.8 for how to come back to it later.
 
 ### 3.8 Saving and Resuming Sessions
 
-BHOP **automatically saves** the session after every ask and every tell.
+LabOpt **automatically saves** the session after every ask and every tell.
 The session is stored as two files in the same folder as your CSV (or a chosen
 directory):
 
 ```
-bhop_study_20260822_232040.db           ← Optuna SQLite database
-bhop_study_20260822_232040_session.json ← Session metadata + pending batch
+labopt_study_20260822_232040.db           ← Optuna SQLite database
+labopt_study_20260822_232040_session.json ← Session metadata + pending batch
 ```
 
 To **resume**:
@@ -319,20 +429,22 @@ dangerously far from any observed data.
 
 Switch to the **📊 Results** tab in the left dock, then click **📊 Design
 Space…** (top-left of the Results tab). The window opens as a separate,
-resizable, non-modal dialog — you can keep it open alongside BHOP and switch
+resizable, non-modal dialog — you can keep it open alongside LabOpt and switch
 between them.
 
 The window remembers its size between uses within the same session and is
 capped to fit your screen on first open.
 
-#### Two tabs inside the dialog
+#### Four tabs inside the dialog
 
-The Design Space dialog has two tabs:
+The Design Space dialog has four tabs:
 
 | Tab | Contents |
 |---|---|
 | **📊 Design Space** | Pairplot / parallel coordinates / marginals — where the data lives in parameter space |
 | **🔗 Correlation Matrix** | Annotated heatmap showing Pearson or Spearman correlations between all numeric parameters and all objectives |
+| **📈 Importance** | Horizontal bar chart of permutation importances from a Random Forest; shows which parameters drive each objective. Requires ≥ 15 completed rows. |
+| **🔮 Profiler** | What-if / prediction profiler — adjust sliders for each numeric parameter and dropdowns for categoricals to see the surrogate's predicted objective value update in real-time. Requires ≥ 10 completed rows. |
 
 Switch between them freely while the dialog is open.
 
@@ -434,14 +546,14 @@ below "Apply Objectives →"). The Constraint Editor dialog opens.
    ```
    Residual param: MAPbI
    ```
-   This means BHOP will suggest CsPbI and FAPbI freely, then set
+   This means LabOpt will suggest CsPbI and FAPbI freely, then set
    `MAPbI = 1 − CsPbI − FAPbI` automatically.
 6. Click **Validate** to check that the expression is well-formed and the
    residual parameter exists in your CSV.
 7. Click **OK** to accept.
 
 > **Tip:** You only need a residual parameter for **equality** constraints.
-> For inequality constraints (`<=`, `>=`), leave the residual blank — BHOP
+> For inequality constraints (`<=`, `>=`), leave the residual blank — LabOpt
 > will project violated suggestions back onto the constraint boundary.
 
 #### Applying constraints to the study
@@ -493,6 +605,349 @@ Parameter names must **exactly match** your CSV column names (case-sensitive).
 | `temperature * time` | `<=` | `50000` | Processing budget cap |
 | `concentration` | `>=` | `0.05` | Minimum concentration |
 | `x1 + x2 + x3 + x4` | `=` | `1.0` | 4-component mixture |
+
+---
+
+### 3.11 Context Variables (Uncontrollable Environmental Conditions)
+
+Context variables allow the surrogate model to account for **environmental
+conditions that affect your experiment but cannot be controlled** — ambient
+humidity, atmospheric pressure, batch-to-batch reagent purity, and similar
+factors.
+
+#### The problem context variables solve
+
+Without context variables, LabOpt treats every non-objective column as a
+**controllable input** — something it can suggest values for. But some
+measured quantities are outputs of the environment, not inputs you set:
+
+- Humidity fluctuates and cannot be dialled in.
+- Atmospheric pressure at your lab location is fixed.
+- Reagent purity varies between supplier batches.
+
+If these are ignored, the surrogate cannot distinguish "this experiment had a
+poor yield because the composition was wrong" from "this experiment had a poor
+yield because the humidity spiked." Over time, this confuses the model and
+makes it penalise good parameter combinations that happened to run under
+unfavourable conditions.
+
+**Example:** If you are optimising synthesis temperature to maximise yield,
+and humidity affects yield strongly, the model might wrongly conclude that
+high temperature is bad — when in fact it was high humidity that caused the
+failures.
+
+#### What context variables do
+
+| Role | Controllable parameter | Context variable |
+|---|---|---|
+| You set it? | ✅ Yes | ❌ No (measured) |
+| Optuna suggests values? | ✅ Yes | ❌ No |
+| Surrogate learns from it? | ✅ Yes | ✅ Yes |
+| Appears in batch suggestions? | ✅ Yes | ❌ No |
+| Correctable after experiment? | Via param editing | ✅ Yes (dedicated cells) |
+
+#### Marking a column as a context variable (GUI)
+
+1. Load your CSV.
+2. In the **Objectives** panel, find the **Context Variables** section
+   (below the objective checkboxes).
+3. **Check** the columns that represent uncontrollable conditions.
+4. Click **Apply Objectives →** as usual.
+
+The context columns will no longer appear as parameter cards. Instead, a
+**🌡 Current Conditions** panel appears in the Settings tab.
+
+#### Entering current conditions before asking
+
+Before clicking **Ask Next Batch**, fill in the **🌡 Current Conditions**
+panel with today's estimated values:
+
+```
+Humidity (%):          [65.0]
+Atmospheric Pressure:  [1013.2]
+```
+
+These **planned context values** tell the contextual sampler what conditions
+the next experiments will run under, so it can pick the controllable
+parameters best suited to *those specific* conditions.
+
+> If you leave the panel blank, LabOpt falls back to standard Optuna
+> suggestions (no context conditioning). This is safe — context is optional.
+
+#### Correcting context values when entering results
+
+After running the experiments, the **Batch Results Dialog** shows editable
+context cells pre-filled with the planned values (light purple background).
+
+If actual conditions differed — for example, a humidity sensor showed 35%
+instead of the planned 10% — **edit the cell before clicking Submit**.
+
+```
+Humidity (%) — Planned: 10.0  →  Actual: [35.0]
+```
+
+Only the **actual** (possibly corrected) context values are stored in the
+Optuna trial. The planned value is discarded. This ensures the surrogate
+always trains on what truly happened during the experiment.
+
+#### What the model learns
+
+Context values are stored per trial and used as additional features in the
+RF surrogate. The model learns:
+
+```
+f(Temperature, Humidity) → Yield
+```
+
+The **Design Space Profiler** gains sliders for context variables, so you
+can ask: *"What yield would I expect at Temperature=150°C if humidity is 35%
+vs. 65%?"*
+
+The **Feature Importance** chart shows the relative contribution of context
+variables vs. controllable parameters.
+
+#### CSV format with context variables
+
+Your CSV can include context columns alongside your normal columns:
+
+```csv
+temperature,humidity_pct,atm_pressure_hpa,yield_pct
+150,62.3,1013.1,0.82
+180,71.5,1012.8,0.74
+160,58.1,1013.4,0.91
+```
+
+When loading this CSV and marking `humidity_pct` and `atm_pressure_hpa` as
+context variables, their historical values are automatically loaded into each
+trial's metadata for surrogate training.
+
+#### Caveats
+
+- Context variables must currently be **numeric** (FLOAT). Categorical context
+  support (e.g. `lab_technician`, `equipment_ID`) is planned for a future release.
+- A column cannot be both an **objective** and a **context variable**.
+  LabOpt validates this when you click **Apply Objectives →**.
+- The contextual RF sampler requires **≥ 15 completed trials** before it
+  activates. Below that threshold, standard Optuna TPE/GP is used.
+- Context conditioning improves suggestions but does not guarantee they are
+  optimal for the specified conditions — it is only as good as the surrogate's
+  fit to the historical data.
+
+---
+
+### 3.12 Power Analysis — Sample Size Calculator
+
+The **🔬 Power** tab in the left dock is a standalone statistical sample-size
+calculator. It answers the question:
+
+> *"Given that my measurements have a typical spread of σ and I need to detect
+> an improvement of at least Δ, how many experiments N do I need to be
+> confident the result is real?"*
+
+This is independent of the Bayesian optimisation — you can use it at any time,
+before or during an optimisation campaign, to assess whether your experiment
+budget is sufficient.
+
+#### Accessing the Power tab
+
+Click the **🔬 Power** tab in the left dock. The input form appears in the
+left panel; the result and plots appear in the centre of the main window
+(replacing the parameter cards while the tab is active). Switching back to
+⚙ Settings or 📊 Results restores the parameter cards.
+
+#### Input parameters
+
+| Field | What to enter |
+|---|---|
+| **Min. effect (Δ)** | The smallest improvement you *need* to reliably detect, in the same units as your objective column. E.g. if your yield is in %, enter `5` to detect a 5 percentage-point improvement. |
+| **Spread (σ)** | The expected measurement standard deviation (noise). Click **📊 From data** to auto-fill this from your loaded objective column. |
+| **Significance (α)** | Type I error rate — the probability of a false positive. Standard choices: 0.01, 0.05, 0.10. Default 0.05 means a 5% chance of concluding an improvement exists when it does not. |
+| **Desired power (1−β)** | The probability of detecting the effect if it truly exists. Standard choices: 0.70, 0.80, 0.90, 0.95. Default 0.80 means an 80% chance of detecting a true Δ. |
+| **Test type** | One-sample / paired: compare one group to a reference value, or before/after on the same samples. Two-sample (independent): compare two separate groups — the reported N is *per group*. |
+
+#### The "📊 From data" button
+
+If a CSV is loaded and objectives are configured, the **📊 From data** button
+is enabled. Clicking it sets σ to the standard deviation of the loaded
+objective column, giving you a data-driven noise estimate rather than a guess.
+
+The tooltip shows the estimated value and the number of data points used:
+`Set σ = 12.4 (std of 47 values) — Click to apply.`
+
+#### Outputs
+
+| Output | Meaning |
+|---|---|
+| **N = [number]** | The minimum number of experiments required to achieve the chosen power at the given α. For two-sample tests this is the required sample size *per group*. |
+| **Cohen's d** | The standardised effect size: `d = Δ / σ`. Interpretations: Small < 0.2, Medium 0.2–0.5, Large 0.5–0.8, Very large > 0.8. |
+| **Adequacy badge** | Traffic-light comparing your current trial count to the required N: ✅ adequate (n ≥ N), ⚠ borderline (50–99% of N), 🔴 underpowered (< 50% of N). |
+
+#### The two plots
+
+**Power Curve (left plot):** Shows achieved statistical power (%) vs. number
+of experiments N. A horizontal dashed line marks your chosen target power;
+a vertical dashed line marks the required N. If you have loaded an active
+study, a dotted green line shows the achieved power at your current trial
+count.
+
+**N vs. Effect Size (right plot):** Shows how the required N changes as a
+function of Δ (the minimum detectable effect), holding σ, α, and power
+constant. The vertical red dashed line marks your current Δ setting. This
+plot helps you understand how sensitive the required N is to your choice of
+minimum detectable effect.
+
+#### Mathematical background
+
+The required N is computed from the two-sided t-test formula:
+
+```
+Cohen's d  =  Δ / σ
+z_α        =  scipy.stats.norm.ppf(1 − α/2)     e.g. 1.96 for α = 0.05
+z_β        =  scipy.stats.norm.ppf(power)         e.g. 0.84 for power = 0.80
+
+N_one_sample   =  ceil( ((z_α + z_β) / d)² )
+N_two_sample   =  2 × N_one_sample               (N per group)
+```
+
+For typical settings (α = 0.05, power = 0.80) this simplifies to:
+`N ≈ 7.85 × (σ / Δ)²`
+
+#### Interpreting the results with a high-spread dataset
+
+If your objective has a large standard deviation (e.g. σ = 364,517) and you
+want to detect a change of Δ = 9,999, Cohen's d = 9,999 / 364,517 ≈ 0.027
+(a very small effect, much less than 0.2). This requires approximately
+**10,432 experiments** — because you are trying to find a signal that is
+only 2.7% of the typical noise level.
+
+Conversely, if Δ = 99,999 (about 27% of σ), d ≈ 0.274 (a medium effect),
+and the required N drops to roughly **104 experiments**. It is not the
+absolute size of σ that matters, but *how large the effect you care about is
+relative to the noise*.
+
+> **Practical guidance:** if the required N is far larger than your experiment
+> budget, you have three options: (1) increase Δ — only care about larger
+> improvements; (2) reduce σ — improve measurement precision or add more
+> replicates per condition; (3) accept a lower power (say 0.70) and acknowledge
+> that the study is exploratory.
+
+#### Caveats
+
+- The calculation assumes normally distributed measurement noise and a
+  two-sided test. For non-normal distributions (e.g. heavily skewed yield
+  data) the true required N may differ.
+- Power analysis describes the minimum sample size needed for a frequentist
+  hypothesis test. In the Bayesian optimisation workflow you are not running
+  a traditional hypothesis test — the power calculation helps you assess
+  whether you have *enough data for the surrogate to learn reliably*, but
+  there is no exact correspondence between the two frameworks.
+- The "adequate power" badge compares your **total trial count** to the
+  required N. If experiments are spread unevenly across parameter space, the
+  effective data for any one region may be much lower.
+
+---
+
+### 3.13 Surrogate Validation
+
+The **🔬 Surrogate Validation** checkbox (in the Results tab, next to the
+Export Report button) runs a rigorous five-section validation of the surrogate
+model on the currently loaded dataset — without requiring you to open the
+Design Space dialog.
+
+This is a **generalised** validation that works on any dataset, not just
+the perovskite example used by `validate_perovskite.py`.
+
+#### When is the checkbox enabled?
+
+The checkbox is enabled automatically once you apply objectives and your CSV
+has **≥ 30 unique rows** (fewer than that and the statistics are not
+meaningful). The exact count is the number of unique numeric-parameter
+combinations after dropping NaNs.
+
+#### Starting a validation run
+
+1. Switch to the **📊 Results** tab.
+2. Tick **🔬  Surrogate Validation** (next to the Export Report button).
+3. A progress bar and status label appear above the surrogate quality badge.
+4. Wait 3–10 minutes (depending on dataset size — see estimates below).
+
+The checkbox cannot be ticked twice while a run is in progress — it
+temporarily disables itself.
+
+#### What the engine checks (§0–§5)
+
+| Section | What it does | Pass condition |
+|---|---|---|
+| **§0 Data Quality** | Distribution of the objective; within-replicate std; n_unique | n_unique ≥ 30 |
+| **§1 Surrogate Accuracy** | RF + GP 70/30 hold-out and repeated 5-fold CV | Pearson r > 0.5; Spearman ρ > 0.5; CV RMSE < 30% of target range |
+| **§2 BO Benchmark** | GP+EI / RF+EI / Greedy / Random strategies on a fixed pool — does BO beat random? | GP+EI and RF+EI reach top-20% of pool faster than Random |
+| **§3 EI Marginals** | 1-D Expected Improvement sweep per parameter (other features held at median) | Top EI suggestion inside training data bounding box (±20%) |
+| **§5 Pass/Fail Summary** | Evaluates all 8 checks and produces a colour-coded table | — |
+
+#### The 8 pass/fail checks
+
+| # | Check | Pass condition |
+|---|---|---|
+| 1 | Enough unique data | n_unique ≥ 30 |
+| 2 | RF Pearson r (hold-out) | r > 0.5 |
+| 3 | GP Pearson r (hold-out) | r > 0.5 |
+| 4 | RF Spearman ρ (hold-out) | ρ > 0.5 |
+| 5 | CV RMSE (both models) | RMSE < 30% of target range |
+| 6 | GP+EI beats Random | GP+EI median steps ≤ Random median steps |
+| 7 | RF+EI beats Random | RF+EI median steps ≤ Random median steps |
+| 8 | EI suggestions in-range | All feature-wise argmax EI values within ±20% of training data range |
+
+The overall rating is:
+- 🟢 **GREEN** — all 8 checks passed.
+- 🟡 **YELLOW** — 6+ checks passed (≥ 75%).
+- 🔴 **RED** — fewer than 6 checks passed.
+
+#### Results after completion
+
+When the run finishes:
+- The checkbox shows **✅** and a summary label (e.g. `✅ 6/8 checks passed (YELLOW)`).
+- **7 new tabs** appear in the Design Space dialog (opened automatically if you click 📊 Design Space… later):
+  - 📊 Data Quality
+  - 🎯 Surrogate Accuracy
+  - 📉 Residuals
+  - 📈 BO Benchmark
+  - 📈 BO (Normalised)
+  - 🔍 EI Marginals
+  - ✅ Validation Summary
+- All 7 plots are embedded in the **📄 Export Report…** HTML output.
+
+#### Runtime estimates
+
+| n_unique rows | Approx. runtime |
+|---|---|
+| 30–50 | 1–2 minutes |
+| 50–100 | 2–4 minutes |
+| 100–200 | 4–8 minutes |
+
+The bottleneck is the §2 BO Benchmark (6 runs × 4 strategies × 25 BO steps
+× GP fitting). You can reduce the runtime by using datasets with fewer unique
+rows.
+
+#### Relationship with the Design Space dialog validation
+
+The Design Space dialog also has a validation checkbox. Both checkboxes run
+the same engine (`validate_generic.py` / `ValidationWorker`) but are
+independent triggers — you can use either entry point:
+
+- **Results tab** (this section) — no need to open the Design Space dialog.
+- **Design Space dialog** — useful if you already have the dialog open.
+
+If you run validation from the Results tab and then open the Design Space
+dialog, the 7 result tabs are automatically injected into the dialog —
+you do not need to re-run.
+
+#### Technical implementation
+
+The backend is implemented in:
+- **`validate_generic.py`** — `ValidationEngine` (pure Python, no Qt) — returns `ValidationResults` with figure objects and pass/fail metrics.
+- **`validation_worker.py`** — `ValidationWorker(QThread)` — runs the engine in a background thread; emits `progress_updated`, `validation_done`, `error_occurred` signals.
+
+Both files can be imported in headless scripts. See the module docstrings for the public API.
 
 ---
 
@@ -557,14 +1012,22 @@ PythonProject1/
 ├── session_manager.py       Save/load JSON session + SQLite path tracking
 ├── worker.py                QThread running the batch loop
 │
+├── surrogate_quality.py     Surrogate quality computation (cross-validated R², RMSE, Pearson r)
+├── report_generator.py      HTML report + PNG plot export
+│
 ├── param_card_widget.py     UI: one card per parameter in the left dock
 ├── batch_results_dialog.py  UI: dialog for entering batch results
 ├── dead_region_dialog.py    UI: dialog for defining dead regions
 ├── constraint_dialog.py     UI: dialog for defining algebraic parameter constraints
+├── design_space_widget.py   UI: design space, correlation, importance, profiler tabs
+├── power_analysis_widget.py UI: Power Analysis tab — input form + result panel + plots
+├── power_analysis_math.py   Pure-math backend for power analysis (no Qt / matplotlib)
 │
 ├── BHOP.py                  Headless scripting example
 ├── test_backend.py          Pytest test suite
-├── validate_perovskite.py   Stand-alone validation suite (perovskite data)
+├── validate_perovskite.py   Stand-alone validation suite (perovskite dataset only)
+├── validate_generic.py      Generalised surrogate validation engine — works on any CSV
+├── validation_worker.py     QThread wrapper running validate_generic in the background
 ├── requirements.txt         pip dependencies
 │
 └── test_data/
@@ -737,7 +1200,27 @@ Top-level configuration for an entire optimisation session.
 | `constraints` | `List[ParameterConstraint]` | `[]` | Algebraic constraints on parameter values |
 | `batch_size` | `int` | `1` | Suggestions per round |
 | `n_batches` | `int` | `10` | Total rounds |
-| `sampler_name` | `str` | `"TPE"` | `"TPE"`, `"NSGAII"`, or `"Random"` |
+| `sampler_name` | `str` | `"TPE"` | `"TPE"`, `"NSGAII"`, `"Random"`, or `"GP"` |
+| `replicate_aggregation` | `bool` | `False` | Enable replicate aggregation on CSV load |
+| `replicate_tolerance` | `float` | `1e-6` | Absolute ±tolerance for numeric parameters when merging replicates |
+| `auto_stop` | `bool` | `False` | Stop when the best value hasn't improved by the threshold |
+| `auto_stop_min_improvement` | `float` | `0.01` | Minimum relative improvement per batch (1% default) |
+| `auto_stop_n_batches` | `int` | `3` | Window of consecutive batches to check for convergence |
+| `context_variables` | `List[ContextConfig]` | `[]` | Uncontrollable environmental columns (see §3.11) — learned by the surrogate but never suggested |
+
+#### `ContextConfig`
+
+Configuration for one context variable (uncontrollable environmental condition).
+
+```python
+@dataclass
+class ContextConfig:
+    column_name: str           # CSV column name
+    description: str = ""      # Optional human-readable label (shown in GUI)
+```
+
+Context values are stored in each completed trial as `user_attrs["ctx_<column_name>"]`
+so the surrogate can access them as additional features during training.
 
 ---
 
@@ -912,12 +1395,12 @@ Provides save/load persistence for the entire application state.
 | `create_new_session(config, csv_path, session_dir)` | Creates a new session and returns the initial `SessionState`. The SQLite DB is not created yet — Optuna creates it lazily. |
 | `save(state)` | Writes state to disk **atomically** (write-to-.tmp then rename) to prevent corruption. |
 | `load(session_path)` | Loads a `_session.json`. Raises `FileNotFoundError` if the paired `.db` is missing. |
-| `list_recent_sessions(n=5)` | Returns the N most recent sessions from `~/.bhop_sessions.json`, filtering out any that no longer exist on disk. |
+| `list_recent_sessions(n=5)` | Returns the N most recent sessions from `~/.labopt_sessions.json`, filtering out any that no longer exist on disk. |
 | `mark_batch_pending(state, trials)` | Saves the pending batch to the session JSON and writes `pending_batch.csv` for the lab. |
 | `clear_pending_batch(state)` | Clears the pending batch and deletes `pending_batch.csv`. |
 | `match_pending_to_csv(state, df)` | Tries to match pending trial parameters against rows in a DataFrame (for auto-filling result dialogs). Returns `{trial_number: [values]}` or `None`. |
 
-The global recent-session registry is stored at `~/.bhop_sessions.json`
+The global recent-session registry is stored at `~/.labopt_sessions.json`
 (user's home directory).
 
 ---
@@ -933,7 +1416,7 @@ keeping the GUI responsive.
 |---|---|---|
 | `batch_ready` | `List[dict]` — `{"trial_number": int, "params": dict}` | After `ask_batch()` completes; GUI should open `BatchResultsDialog` |
 | `batch_complete` | `(batches_done: int, total_batches: int)` | After `tell_batch()` completes |
-| `optimization_done` | — | All batches done or `stop()` was called |
+| `optimization_done` | `str` — `"completed"`, `"converged"`, or `"cancelled"` | All batches done, auto-stop triggered, or stop() was called |
 | `error` | `str` — error message | On unhandled exception |
 
 #### Thread-safety pattern
@@ -1092,6 +1575,72 @@ Demonstrates:
 6. Telling the results.
 
 Run with `python BHOP.py` to see it in action without the GUI.
+
+---
+
+### 6.9 `contextual_sampler.py`
+
+Provides the RF-based contextual acquisition function used when context
+variables are defined. Fully independent of PySide6 — usable in headless
+scripting.
+
+#### `ContextualSurrogate`
+
+The central class. Fits a Random Forest on `(controllable_params + context_vars)
+→ objective` and uses Expected Improvement to recommend controllable parameter
+values given a fixed current context.
+
+```python
+class ContextualSurrogate:
+    def __init__(self, config: StudyConfig): ...
+    def fit(self, study: optuna.Study) -> bool: ...
+    def suggest(self, current_context: dict, n_return: int = 1) -> List[dict]: ...
+```
+
+**`fit(study) → bool`**
+- Reads all COMPLETE trials from `study`.
+- Controllable param values come from `trial.params`.
+- Context values come from `trial.user_attrs["ctx_<name>"]`.
+- Trials with missing context have those features imputed with the column mean.
+- Returns `True` if ≥ `MIN_TRIALS` (15) complete trials exist; `False` otherwise.
+
+**`suggest(current_context, n_return=1) → List[dict]`**
+- Generates 2000 Latin Hypercube candidates over the controllable parameter space.
+- Appends the fixed `current_context` values to each candidate's feature vector.
+- Scores each candidate with Expected Improvement (EI) using per-tree variance
+  from `rf.estimators_` for uncertainty estimation.
+- Returns the top `n_return` candidates sorted by EI, as plain `{name: value}` dicts.
+
+**EI formula (minimisation):**
+```
+EI(x) = (y_best - μ(x)) · Φ(z) + σ(x) · φ(z)
+where z = (y_best - μ(x)) / σ(x)
+```
+For maximisation, the sign of `(y_best - μ(x))` is flipped.
+
+#### Integration with `ask_batch`
+
+When `ask_batch(study, config, batch_size, context=current_context)` is called
+with a non-empty `context` dict and `config.context_variables` is non-empty:
+
+1. Standard Optuna `study.ask()` is called to create `batch_size` RUNNING trials
+   (preserving trial numbering and state management).
+2. If `ContextualSurrogate.fit()` succeeds, `suggest()` returns RF-optimised
+   param dicts conditioned on the current context.
+3. The RF-chosen param values override the Optuna-suggested params in the
+   `BatchSuggestion.params` field shown to the user.
+4. `tell_batch()` uses the original Optuna trial numbers; context values are
+   stored as `user_attrs` on the corrected COMPLETE trial.
+
+If `fit()` returns `False` (insufficient data), the Optuna-suggested params are
+used unmodified (standard BO behaviour).
+
+#### Multi-objective contextual suggestions
+
+For multi-objective studies, `ContextualSurrogate` fits one RF per objective.
+Candidates are scored by the **product** of per-objective EI values. This is a
+practical approximation — it does not compute the full multi-objective EI
+(EHVI), but is fast and reasonable for 2–3 objectives.
 
 ---
 
@@ -1323,9 +1872,15 @@ The final checklist uses these thresholds (all adjustable in `section5`):
 |---|---|---|---|
 | `parameters` | `List[ParameterConfig]` | `[]` | Ordered list of all input parameters |
 | `objectives` | `List[ObjectiveConfig]` | `[]` | 1 objective = single-obj; ≥2 = multi-obj |
+| `constraints` | `List[ParameterConstraint]` | `[]` | Algebraic constraints on parameter values |
 | `batch_size` | `int` | `1` | Experiments per round (1–20 is typical) |
 | `n_batches` | `int` | `10` | Total rounds; can be increased mid-session |
-| `sampler_name` | `str` | `"TPE"` | `"TPE"`, `"NSGAII"`, or `"Random"` |
+| `sampler_name` | `str` | `"TPE"` | `"TPE"`, `"NSGAII"`, `"Random"`, or `"GP"` |
+| `replicate_aggregation` | `bool` | `False` | Enable replicate merging on CSV load |
+| `replicate_tolerance` | `float` | `1e-6` | Absolute ±tolerance for merging numeric params |
+| `auto_stop` | `bool` | `False` | Enable convergence-based auto-stop |
+| `auto_stop_min_improvement` | `float` | `0.01` | Minimum relative improvement per batch (1%) |
+| `auto_stop_n_batches` | `int` | `3` | Window of consecutive batches to check |
 
 ### `ParameterConfig` — full field table
 
@@ -1466,7 +2021,7 @@ EI_XI = 0.1    # more exploration (useful when the landscape is noisy)
    - Expression: `CsPbI + FAPbI + MAPbI`
    - Operator: `=`
    - Target: `1.0`
-   - Residual param: `MAPbI`  ← BHOP will compute this automatically
+   - Residual param: `MAPbI`  ← LabOpt will compute this automatically
 4. Click **Validate**, then **OK**.
 5. Click **Apply Objectives →** as usual.
 
@@ -1601,7 +2156,7 @@ def make_gp():
 ## 11. Assumptions, Limitations & When to Trust the Results
 
 This section exists so you can make an **informed decision** about whether
-BHOP is appropriate for your experiment before committing real lab time to its
+LabOpt is appropriate for your experiment before committing real lab time to its
 suggestions.  Every tool has assumptions; understanding them protects you from
 misplaced confidence.
 
@@ -1611,7 +2166,7 @@ misplaced confidence.
 
 #### Replicate averaging
 When two or more rows in your CSV have identical parameter values (replicates),
-BHOP averages them into a single training point before fitting the surrogate.
+LabOpt averages them into a single training point before fitting the surrogate.
 
 - **Assumes**: measurement noise is independent and identically distributed
   (i.i.d.) — i.e. each replicate is an unbiased noisy observation of the
@@ -1635,25 +2190,33 @@ roughly the same everywhere in parameter space.
   showing systematically higher errors in one part of parameter space.
 
 #### Column independence
-BHOP treats each enabled CSV column as an independent free variable.
+LabOpt treats each enabled CSV column as an independent free variable — with one important exception: **context variables are explicitly modelled with interactions**.
 
-- **Breaks down when**: columns are physically coupled but not constrained
-  (e.g. temperature and pressure in a gas reaction).  Constraint expressions
-  help when the coupling is algebraic; if it is only physical, the surrogate
-  will explore physically impossible combinations.
-- **What to do**: use the **📐 Constraints…** dialog to add algebraic rules,
-  or disable one of the coupled columns and compute it from the other.
+The RF surrogate used by the contextual sampler learns:
+
+```
+f(controllable_params + context_vars) → objective
+```
+
+This means the model learns that, say, `temperature = 180°C` produces high yield at `humidity = 40%` but low yield at `humidity = 80%` — a cross-term that a strict independence assumption would miss. Context variables therefore *intentionally* break column independence in a beneficial direction.
+
+The independence concern still applies to **controllable parameters that are physically coupled but unconstrained**:
+
+- **Breaks down when**: two controllable columns are physically linked but no algebraic constraint captures it (e.g. temperature and pressure in a sealed reaction vessel).
+- **What to do**: use the **📐 Constraints…** dialog to add algebraic rules, or disable one of the coupled columns and compute it from the other.
 
 #### No hidden variables
-The surrogate assumes the columns in your CSV capture all relevant
-experimental factors.
+The surrogate can only learn from factors that are recorded in your CSV.
 
-- **Common hidden variables**: operator, ambient humidity, equipment age,
-  lot number of reagents, time-of-day.
-- **What this causes**: unexplained variance that looks like measurement noise
-  to the model, inflating RMSE and reducing prediction accuracy.
-- **Mitigation**: add categorical columns for controllable hidden variables
-  (e.g. `operator = "A"/"B"`, `batch = 1/2/3`).
+**Uncontrollable environmental factors** — ambient humidity, atmospheric pressure, reagent purity, equipment calibration drift — can be handled directly using **context variables** (§3.11). Mark these columns as context variables and the surrogate will learn their effect on the objective without treating them as optimisable inputs. This is the primary mechanism for addressing hidden environmental variables in LabOpt.
+
+The remaining risk is for factors that are **never measured and recorded at all**:
+
+- **Examples of truly hidden variables**: time-of-day effects, individual instrument behaviour that shifts without being logged, unknown reagent degradation not reflected in any column.
+- **What this causes**: unexplained variance that looks like measurement noise, inflating RMSE and causing the surrogate to give inconsistent suggestions.
+- **Mitigation for controllable hidden factors**: add them as parameters or categorical columns (e.g. `operator = "A"/"B"`, `batch = 1/2/3`) so the model can learn their effect.
+- **Mitigation for uncontrollable numeric factors**: add them as context variables (see §3.11).
+- **No mitigation**: completely unlogged factors — the only solution is better experimental record-keeping.
 
 ---
 
@@ -1670,7 +2233,7 @@ no better than random — the first few batches are essentially exploration.
 
 #### Batch parallelism reduces per-trial efficiency
 Standard sequential BO asks one experiment at a time, fits the surrogate,
-then asks again.  BHOP's batch mode asks `batch_size` experiments at once
+then asks again.  LabOpt's batch mode asks `batch_size` experiments at once
 using Optuna's **constant liar** approximation (each trial assumes the pending
 results equal the current best).  This means:
 
@@ -1690,7 +2253,7 @@ are skewed (common in degradation or lifetime data), EI will be overconfident.
   distribution is strongly right-skewed (e.g. lifetime data).
 
 #### Categorical parameters are unordered
-BHOP encodes categorical parameters using `CategoricalDistribution`.  Optuna
+LabOpt encodes categorical parameters using `CategoricalDistribution`.  Optuna
 does not know that `"low" < "medium" < "high"`.
 
 - **What to do**: for ordinal categories, replace them with a numeric column
@@ -1699,7 +2262,7 @@ does not know that `"low" < "medium" < "high"`.
 #### Equality constraint: residual coordinate system
 When an equality constraint is active (e.g. `A + B + C = 1`) with a residual
 parameter, the surrogate operates in the **N−1 dimensional** internal space
-of free parameters.  BHOP enforces the constraint by:
+of free parameters.  LabOpt enforces the constraint by:
 
 1. Failing the raw Optuna suggestion (if it violates the constraint).
 2. Adding a corrected COMPLETE trial with the feasible values.
@@ -1709,6 +2272,35 @@ However, the internal coordinate system is not the same as the physical
 fractions — the surrogate may sample unevenly across the feasible simplex,
 particularly in early iterations when the model is undetermined.  This is
 expected and resolves as more data accumulates.
+
+#### Power analysis and BO sample requirements
+
+The **🔬 Power Analysis** tab (§3.12) computes required sample sizes using the
+classical two-sided t-test formula.  This is a **useful planning tool** but
+answers a fundamentally different question than Bayesian Optimisation:
+
+| Goal | Appropriate tool | Typical N |
+|---|---|---|
+| *Find* the best parameters | Bayesian Optimisation | 30–150 (adaptive) |
+| *Confirm* an improvement is statistically significant | Power analysis (t-test) | `7.85 × (σ/Δ)²` |
+
+**BO typically needs far fewer experiments than the power N to find a good
+solution.**  This is because BO is *adaptive* — it concentrates experiments in
+promising regions rather than sampling randomly.  A surrogate trained on 40
+well-chosen trials often outperforms a random search with 200 trials.  The power
+N is the budget needed to *confirm* via a hypothesis test that the discovered
+optimum is better than baseline by at least Δ — it is not the budget needed to
+*find* that optimum.
+
+**Practical interpretation of the adequacy badge:**
+
+- ✅ **Adequate** (n ≥ power N): you have enough data to both find *and* statistically confirm improvements of Δ. Strong position.
+- ⚠ **Borderline** (50–99% of power N): BO suggestions are likely still useful — the surrogate can learn from this data. You may not have enough for a formal statistical test of the final result, but the exploration is not wasted.
+- 🔴 **Underpowered** (< 50% of power N): if σ >> Δ, measurements are so noisy relative to the effect you care about that the surrogate may struggle to learn any reliable pattern. Consider whether Δ is realistic for your system, or whether measurement precision can be improved.
+
+**When power N is the right number to target:**  After BO identifies a promising parameter set, run replicates at that condition and at the baseline. The power N tells you how many total measurements you need (split across conditions) to publish a statistically credible claim that the improvement is real.
+
+**The biggest risk:** If σ is very large relative to Δ (Cohen's d < 0.1), even BO will struggle — measurement noise drowns the signal completely. In this regime, improving measurement precision (reducing σ) is more valuable than running more experiments.
 
 ---
 
@@ -1732,12 +2324,12 @@ The validation suite (`validate_perovskite.py`) proves that the surrogate
 machinery works correctly on the perovskite stability dataset.  It does
 **not** prove that it will work on your dataset.
 
-**Before trusting BHOP suggestions for a new material system:**
+**Before trusting LabOpt suggestions for a new material system:**
 1. Collect ≥ 30 historical data points covering your parameter space.
 2. Adapt `validate_perovskite.py` to your CSV (change `FEATURES`, `TARGET`,
    and the domain-knowledge checks in `section4`).
 3. Run it and confirm that Pearson r > 0.5 on the hold-out.
-4. Only then use BHOP suggestions to guide new experiments.
+   4. Only then use LabOpt suggestions to guide new experiments.
 
 #### Surrogate r > 0.5 does not mean absolute predictions are accurate
 A Pearson r of 0.85 means the model ranks compositions well but does not
@@ -1747,10 +2339,10 @@ practical accuracy.
 
 ---
 
-### 11.4 When to Use (and When Not to Use) BHOP
+### 11.4 When to Use (and When Not to Use) LabOpt
 
 #### Good fit ✅
-| Situation | Why BHOP helps |
+| Situation | Why LabOpt helps |
 |---|---|
 | 3–15 continuous parameters | Well within TPE's reliable range |
 | Experiments take hours to days | BO's sequential learning is worth the setup cost |
@@ -1772,14 +2364,14 @@ practical accuracy.
 |---|---|
 | Real-time feedback loops (< minutes per experiment) | BO setup overhead exceeds benefit; use bandit algorithms |
 | Combinatorial discrete spaces (e.g. molecular graph search) | Use graph neural networks + genetic algorithms |
-| Safety-critical systems | BHOP has no built-in safety constraints or failure modes; add guardrails manually |
+| Safety-critical systems | LabOpt has no built-in safety constraints or failure modes; add guardrails manually |
 | Fewer than 5 total experiments planned | You have no budget for exploration; use expert knowledge directly |
 
 ---
 
 ### 11.5 Reporting and Reproducibility
 
-If you use BHOP in research, include the following in your methods section:
+If you use LabOpt in research, include the following in your methods section:
 
 - Optuna version (`pip show optuna`)
 - Sampler used (TPE / NSGAII / Random)
@@ -1790,6 +2382,217 @@ If you use BHOP in research, include the following in your methods section:
 
 This allows others to assess the quality of your surrogate model and
 reproduce your optimisation trajectory.
+
+---
+
+## 12. Design of Experiments (DoE)
+
+The DoE feature helps you plan your first batch of experiments *before* any
+LabOpt session has results.  A well-chosen initial design gives the surrogate
+model a global view of the parameter space from the start, which typically
+reduces the total number of experiments needed to reach the optimum by 20–40%.
+
+---
+
+### 12.1 What is a DoE and Why Does it Matter?
+
+When LabOpt starts a new session it has no data.  If you click "Ask Next
+Batch" immediately, the sampler uses a pseudo-random warm-up (Optuna's
+`n_startup_trials`).  Random sampling does **not** guarantee coverage:
+points can cluster by chance, leaving entire regions unexplored.
+
+A DoE distributes points *deliberately* so that:
+- Every "slice" of every parameter dimension is covered (LHS).
+- The minimum pairwise distance between points is maximised (maximin).
+- The L2-star discrepancy (deviation from a uniform distribution) is
+  minimised.
+
+The DoE phase sits *before* the main BO loop.  After entering your results
+the surrogate is seeded from day 1, and the "Start Optimisation" button
+hands off to BO with a well-informed prior.
+
+---
+
+### 12.2 Supported Strategies
+
+| Strategy | Best for | N formula | Requires |
+|---|---|---|---|
+| **LHS** (Latin Hypercube) | General purpose, mixed types | Any N | scipy |
+| **Sobol** | Large N, continuous, best joint coverage | Powers of 2 | scipy |
+| **Halton** | Continuous, any N, flexible | Any N | scipy |
+| **Full Factorial** | Few categorical / integer parameters | levels^n_params | stdlib |
+| **Plackett-Burman** | Screening — many factors, few runs | Next 4k ≥ k+1 | pyDOE2 |
+| **Box-Behnken** | RSM without extreme corner points | Tables (3–7 factors) | pyDOE2 |
+| **CCD** | Quadratic response surface | Factorial + axial | pyDOE2 |
+| **Random** | Baseline comparison only | Any N | stdlib |
+
+**Choosing a strategy:**
+- Default to **LHS** unless you have a specific reason to use another.
+- Use **Sobol** when N ≥ 32 and all parameters are continuous.
+- Use **Plackett-Burman** when you just want to screen which factors matter.
+- Use **Box-Behnken** or **CCD** when you are fitting a quadratic model.
+
+---
+
+### 12.3 The Surrogate Readiness Formula
+
+The DoE tab shows a readiness bar with a formula-based target:
+
+```
+target = max(10,  5 × n_params  +  2 × n_context)  +  max(0, (n_obj − 1) × 5)
+```
+
+Where:
+- `n_params` = enabled, non-residual controllable parameters
+- `n_context` = context variables
+- `n_obj` = number of optimisation objectives
+
+**Rationale:**
+- The "5 samples per parameter" rule comes from Jones et al. (1998) and
+  Sacks et al. (1989).  A GP with k parameters needs at least k+1 points
+  to fit any model; 5k gives enough data for 5-fold cross-validation.
+- Context variables add noise the model must separate; 2 extra points each.
+- Multi-objective problems require more points to approximate the Pareto front.
+- The floor of 10 matches the `MIN_TRIALS` constant in `surrogate_quality.py`.
+
+The readiness bar is **guidance, not a guarantee**.  The surrogate quality
+badge (R²) is the authoritative model-based indicator.
+
+---
+
+### 12.4 DoE Workflow in LabOpt
+
+1. **File → New Session…** — enter project name, researcher, session folder.
+2. **Apply Objectives →** — configure parameters and objectives.
+3. **Open the 🧪 DoE tab** — note the readiness target and formula.
+4. **Choose strategy and N** — start with LHS and N = readiness target.
+5. **Click "Generate DoE"** — review the pairplot and coverage metrics.
+6. **Export Pending CSV…** — take the parameter combinations to the lab.
+7. **Run the experiments** and record objective values.
+8. **Enter results** in the DoE table (or Import Results CSV…).
+9. **Click "Register Results →"** — trials are added to the Optuna study.
+10. **When the readiness bar turns green** → click **"▶ Start Optimisation"**.
+11. The ⚙ Settings tab becomes active — click **"Ask Next Batch"** to start BO.
+
+---
+
+### 12.5 Assumptions and Limitations
+
+**A. LHS uniformity is marginal, not joint.**
+LHS guarantees one point per equal-width bin in *each individual dimension*.
+It does NOT guarantee good coverage in 2D slices (pairs of dimensions).
+Sobol has better joint coverage for large N but requires N = 2^m exactly.
+
+**B. The "5 per parameter" rule is a heuristic lower bound.**
+Published benchmarks vary: some problems need 10× per parameter, others work
+with 3×.  The readiness bar is guidance; the R² badge is the real indicator.
+
+**C. Context variables are NOT part of the DoE point selection.**
+The DoE generator places points in the *controllable* parameter space only.
+Context variable values (humidity, batch number, etc.) are recorded as
+*measured* during each DoE experiment — they cannot be balanced by the design.
+
+**D. Equality constraints (compositional) are handled exactly.**
+The generator uses algebraic residual computation for `a + b + c = 1` style
+constraints — no wasted points.
+
+**E. Inequality constraints use rejection sampling.**
+If the feasible region is very small (< ~10% of the box), the generator may
+issue a warning and return fewer points than requested.  Relax the constraint
+or reduce N.
+
+**F. Box-Behnken requires exactly 3–7 continuous factors.**
+Categorical parameters are treated as discrete levels.
+
+**G. The DoE is a one-shot design — it does not adapt.**
+If results reveal an unexpected landscape, you can generate additional DoE
+batches and register them before starting BO.
+
+---
+
+### 12.6 Coverage Metrics Explained
+
+After generation the DoE tab shows:
+
+| Metric | Interpretation | Better when |
+|---|---|---|
+| **Maximin distance** | Minimum pairwise Euclidean distance (normalised) | Higher |
+| **L2-star discrepancy** | Deviation from uniform distribution | Lower |
+| **vs. Random baseline** | How much better than Optuna's default startup | Always positive |
+
+A LHS design with N=20 points in 4 dimensions typically achieves
+40–60% better maximin distance than a random draw of the same size.
+
+---
+
+### 12.7 Exporting DoE Results
+
+| Export | How | When to use |
+|---|---|---|
+| **Export Pending CSV…** | Parameter columns only, no objectives | Take to the lab bench |
+| **Import Results CSV…** | Match lab results back to DoE points | After experiments done |
+| **Export DoE Report…** | Self-contained HTML with pairplot, metrics, table | Archive / share |
+| **📈 Full Analysis…** | Interactive multi-tab dialog | Explore coverage in-app |
+
+---
+
+## 13. Session Naming & Multi-User Deployment
+
+### 13.1 Project Names and Researchers
+
+Every new session in LabOpt has:
+- **Project Name** (required) — displayed in the title bar and all menus.
+- **Researcher** (optional, defaults to `LABOPT_USER` env var or system login).
+- **Description** (optional) — free text, stored in the session JSON.
+
+Sessions are physically isolated on disk by owner name:
+
+```
+~/labopt_sessions/
+  alice/
+    perovskite_solar_cell_20260922_100734/
+      labopt_study_20260922_100734_session.json
+      labopt_study_20260922_100734.db
+      doe_pending.csv
+```
+
+### 13.2 Environment Variables for Docker / Shared Lab
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LABOPT_SESSION_DIR` | `~/labopt_sessions` | Root directory for all sessions. Set to a mounted volume path. |
+| `LABOPT_USER` | `os.getlogin()` | Pre-fills the Researcher field for all new sessions. |
+
+**Example docker-compose.yml snippet:**
+
+```yaml
+services:
+  labopt:
+    image: labopt:latest
+    environment:
+      - LABOPT_SESSION_DIR=/data/sessions
+      - LABOPT_USER=alice
+    volumes:
+      - /shared/labopt_data:/data/sessions
+```
+
+### 13.3 Session Browser
+
+**File → Browse All Sessions…** opens a dialog showing all sessions found
+under `LABOPT_SESSION_DIR`, with columns for:
+- Project Name
+- Owner (Researcher)
+- Created (date / time)
+- Trials (completed Optuna trials)
+- Status (DoE in progress / BO running / Pending results / New)
+
+Double-click any row to load that session.
+
+### 13.4 Backward Compatibility
+
+Old sessions (without `project_name`) load normally.  The title bar falls
+back to the internal `study_name` timestamp.  Old session directories are
+not moved.
 
 ---
 

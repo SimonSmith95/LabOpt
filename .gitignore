@@ -1,0 +1,117 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# LabOpt — .gitignore
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── PyInstaller build output ──────────────────────────────────────────────────
+dist/
+build/
+*.spec.bak
+
+# ── Python bytecode & caches ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+.env/
+ENV/
+Lib/
+Scripts/
+pyvenv.cfg
+
+# ── IDE / editor settings ─────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+*.secret
+secrets.py
+config_local.py
+
+# ── Application log files ─────────────────────────────────────────────────────
+*.log
+*.log.*
+
+# ── Session data (Optuna SQLite databases + session JSON files) ───────────────
+# These contain actual experimental data and should NOT be public.
+# Users keep sessions in their home directory (~/.labopt/) or a configured folder.
+*.db
+*_session.json
+
+# ── Experimental data (CSV / Excel files with real lab measurements) ──────────
+# Committed example CSVs in test_data/ are excluded via the directory rule below.
+# Add exceptions below with !path/to/example.csv if needed.
+*.xlsx
+*.xls
+
+# ── Test data directory ───────────────────────────────────────────────────────
+# Contains session databases, real/synthetic CSVs, and generated reports.
+test_data/
+
+# ── Validation output ─────────────────────────────────────────────────────────
+validation_results/
+
+# ── Generated HTML reports and their plot directories ─────────────────────────
+# Reports are generated at runtime and can be large; do not commit them.
+labopt_report_*/
+bhop_report_*/
+*_report_*.html
+*_plots/
+
+# ── Coverage / test artefacts ─────────────────────────────────────────────────
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+
+# ── Distribution / packaging artefacts ───────────────────────────────────────
+*.egg-info/
+*.egg
+MANIFEST
+dist/
+pip-wheel-metadata/
+share/python-wheels/
+
+# ── Type checking ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# ── Jupyter notebooks ─────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── macOS artefacts ───────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── Windows artefacts ─────────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── Temporary files ───────────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.swp
+*.orig

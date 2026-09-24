@@ -186,6 +186,129 @@ def validate_subranges(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Near-duplicate detection (Feature 4)
+# ──────────────────────────────────────────────────────────────────────────────
+
+from parameter_config import ParameterType, StudyConfig  # noqa: E402  (after optuna import)
+
+NEAR_DUPLICATE_THRESHOLD = 0.05   # 5 % of normalised parameter range
+
+
+def find_near_duplicates(
+    suggestions: list[dict],
+    existing_trials: list[dict],
+    config: StudyConfig,
+    threshold: float = NEAR_DUPLICATE_THRESHOLD,
+) -> list[dict]:
+    """
+    Compare each suggested parameter set against all completed trials using
+    normalised Euclidean distance.
+
+    Parameters
+    ----------
+    suggestions     : list of param-value dicts for the new batch.
+    existing_trials : list of dicts — each must contain a ``"number"`` key
+                      (the actual Optuna trial number) plus one key per
+                      parameter.  Any key named ``"number"`` is treated as
+                      the trial identifier and is excluded from distance
+                      computation.
+    config          : StudyConfig supplying parameter ranges / types.
+    threshold       : distance below which a suggestion is flagged (0.05 = 5 %).
+
+    Returns
+    -------
+    List of dicts, one per flagged suggestion::
+
+        {
+            "suggestion_idx"      : int,   # 0-based index into *suggestions*
+            "message"             : str,   # human-readable warning
+            "closest_trial_number": int,   # actual Optuna trial number
+            "closest_params"      : dict,  # param values of the closest trial
+            "distance"            : float, # normalised distance (0–1)
+        }
+
+    An empty list means no near-duplicates were found.
+    """
+    if not existing_trials:
+        return []
+
+    numeric_params = [
+        p for p in config.parameters
+        if p.enabled and p.ptype in (ParameterType.INT, ParameterType.FLOAT)
+    ]
+    cat_params = [
+        p for p in config.parameters
+        if p.enabled and p.ptype == ParameterType.CATEGORICAL
+    ]
+
+    def _norm(val: float, p) -> float:
+        rng = p.full_max - p.full_min
+        return (val - p.full_min) / rng if rng > 0 else 0.0
+
+    n_active = len(numeric_params) + len(cat_params)
+    if n_active == 0:
+        return []
+
+    results: list[dict] = []
+
+    for s_idx, suggestion in enumerate(suggestions):
+        min_dist = float("inf")
+        closest_num = -1
+        closest_params: dict = {}
+
+        for existing in existing_trials:
+            trial_number = existing.get("number", -1)
+            # Exclude the "number" sentinel from distance computation
+            params_only = {k: v for k, v in existing.items() if k != "number"}
+
+            dist_sq = 0.0
+            for p in numeric_params:
+                sv = suggestion.get(p.name)
+                ev = params_only.get(p.name)
+                if sv is not None and ev is not None:
+                    dist_sq += (_norm(float(sv), p) - _norm(float(ev), p)) ** 2
+            for p in cat_params:
+                sv = suggestion.get(p.name)
+                ev = params_only.get(p.name)
+                if sv is not None and ev is not None:
+                    dist_sq += 0.0 if sv == ev else 1.0
+
+            dist = (dist_sq / n_active) ** 0.5
+            if dist < min_dist:
+                min_dist = dist
+                closest_num = trial_number
+                closest_params = params_only
+
+        if min_dist < threshold:
+            # Build a short human-readable composition string
+            comp_parts = []
+            for p in numeric_params:
+                v = closest_params.get(p.name)
+                if v is not None:
+                    comp_parts.append(f"{p.name}={float(v):.4g}")
+            for p in cat_params:
+                v = closest_params.get(p.name)
+                if v is not None:
+                    comp_parts.append(f"{p.name}={v}")
+            comp_str = ", ".join(comp_parts) if comp_parts else "—"
+
+            msg = (
+                f"Suggestion {s_idx + 1} is very similar to "
+                f"Optuna trial #{closest_num} ({comp_str}), "
+                f"distance {min_dist * 100:.1f}%."
+            )
+            results.append({
+                "suggestion_idx":       s_idx,
+                "message":              msg,
+                "closest_trial_number": closest_num,
+                "closest_params":       closest_params,
+                "distance":             min_dist,
+            })
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
