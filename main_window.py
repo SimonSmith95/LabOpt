@@ -830,8 +830,16 @@ class MainWindow(QMainWindow):
         self._obj_group = QGroupBox("Objectives")
         self._obj_inner_layout = QVBoxLayout(self._obj_group)
         self._obj_inner_layout.addWidget(
-            QLabel("Load a CSV to configure objectives.")
+            QLabel("Load a CSV to configure objectives, or define a study from scratch:")
         )
+        _define_btn = QPushButton("📐  Define Study Manually…")
+        _define_btn.setToolTip(
+            "Define parameters, objectives, and context variables without loading a CSV.\n"
+            "Useful for brand-new studies where no data exists yet.\n"
+            "You can then use the 🧪 DoE tab to generate experiment points."
+        )
+        _define_btn.clicked.connect(self._action_define_study_manually)
+        self._obj_inner_layout.addWidget(_define_btn)
         vbox.addWidget(self._obj_group)
 
         # ── Sampler ───────────────────────────────────────────────────
@@ -1204,6 +1212,49 @@ class MainWindow(QMainWindow):
         )
         if path:
             self._do_load_csv(path)
+
+    def _action_define_study_manually(self) -> None:
+        """
+        Open the StudyDefinitionDialog so the user can define parameters,
+        objectives and context variables without a pre-existing CSV.
+
+        On accept, an empty DataFrame (headers only, 0 rows) is created and
+        used as if it were a loaded CSV.  The user can then click
+        'Apply Objectives →' to create the session and move to the DoE tab.
+        """
+        from study_definition_dialog import StudyDefinitionDialog
+        dlg = StudyDefinitionDialog(parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        df  = dlg.empty_dataframe    # headers only, 0 rows
+        cfg = dlg.study_config
+
+        # Use the DataFrame exactly as if it had been loaded from a CSV
+        self._df      = df
+        self._csv_path = ""   # no actual file on disk
+        self._csv_path_label.setText("  Study defined manually (no CSV)")
+
+        # Build the objectives selector from the empty DataFrame
+        self._populate_objectives_selector(df)
+
+        # Auto-check objective columns with their saved directions
+        obj_map = {o.column_name: o.direction for o in cfg.objectives}
+        for col, cb, dir_combo in self._obj_col_rows:
+            if col in obj_map:
+                cb.setChecked(True)
+                dir_combo.setCurrentText(obj_map[col])
+
+        # Auto-check context variable columns
+        ctx_set = {cv.column_name for cv in cfg.context_variables}
+        for col, ctx_cb in self._ctx_col_checkboxes:
+            if col in ctx_set:
+                ctx_cb.setChecked(True)
+
+        self._set_status(
+            "Study defined manually — click 'Apply Objectives →' to continue, "
+            "then use the 🧪 DoE tab to generate experiment points."
+        )
 
     def _action_reload_csv(self) -> None:
         if self._csv_path:

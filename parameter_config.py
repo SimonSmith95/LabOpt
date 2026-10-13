@@ -379,9 +379,12 @@ class DoEState:
     n_points: int
     seed: int
     points: List[dict]
-    results: List[Any]          # List[Optional[List[float]]]
+    results: List[Any]          # List[Optional[List[float]]] — objective values
     complete: bool = False
     registered_trial_numbers: List[int] = field(default_factory=list)
+    # Actual measured context-variable values per DoE run (filled by the user).
+    # Parallel to points/results — None = not yet recorded for that row.
+    context_values: List[Any] = field(default_factory=list)  # List[Optional[List[float]]]
 
     def to_dict(self) -> dict:
         return {
@@ -392,6 +395,7 @@ class DoEState:
             "results": self.results,
             "complete": self.complete,
             "registered_trial_numbers": self.registered_trial_numbers,
+            "context_values": self.context_values,
         }
 
     @classmethod
@@ -404,4 +408,5 @@ class DoEState:
             results=d["results"],
             complete=d.get("complete", False),
             registered_trial_numbers=d.get("registered_trial_numbers", []),
+            context_values=d.get("context_values", []),
         )

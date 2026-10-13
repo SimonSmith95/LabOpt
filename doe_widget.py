@@ -133,6 +133,7 @@ class DoEWidget(QWidget):
         # Pending DoE points (generated but not yet registered)
         self._doe_df: Optional[pd.DataFrame] = None  # generated points
         self._obj_cols: List[str] = []               # objective column names
+        self._ctx_cols: List[str] = []               # context variable column names
 
         self._build_ui()
         self._set_enabled(False)
@@ -380,6 +381,7 @@ class DoEWidget(QWidget):
         self._set_enabled(True)
         cfg = session_state.study_config
         self._obj_cols = [o.column_name for o in cfg.objectives]
+        self._ctx_cols = [cv.column_name for cv in getattr(cfg, 'context_variables', [])]
 
         # Compute target
         rt = compute_readiness_target(cfg)
@@ -532,6 +534,7 @@ class DoEWidget(QWidget):
             seed=seed,
             points=df.to_dict(orient="records"),
             results=[None] * actual_n,
+            context_values=[None] * actual_n,
         )
         self._session_state.doe_state = doe_state
         SessionManager.save(self._session_state)
@@ -579,22 +582,29 @@ class DoEWidget(QWidget):
         self._progress_lbl.setText(f"Generated {actual_n} points  ({strategy})")
 
     def _populate_table_from_doe(self, doe: DoEState) -> None:
-        """Fill the table with DoE points and (optionally) existing results."""
+        """Fill the table with DoE points, context variable slots, and results."""
         if self._session_state is None:
             return
         param_cols = list(doe.points[0].keys()) if doe.points else []
-        obj_cols = self._obj_cols
-        all_cols = ["✓"] + param_cols + obj_cols
+        ctx_cols   = self._ctx_cols    # context variables — user fills in measured values
+        obj_cols   = self._obj_cols
+        # Layout: ✓ | params (read-only) | context vars (editable,green) | objectives (editable)
+        all_cols = ["✓"] + param_cols + [f"🌡 {c}" for c in ctx_cols] + obj_cols
 
         self._table.setColumnCount(len(all_cols))
         self._table.setHorizontalHeaderLabels(all_cols)
         self._table.setRowCount(len(doe.points))
 
+        from PySide6.QtGui import QColor
+        _CTX_BG = QColor("#1a3a2a")   # dark green tint
+
         for r, point in enumerate(doe.points):
+            result   = doe.results[r]        if r < len(doe.results)        else None
+            ctx_vals = doe.context_values[r] if r < len(doe.context_values) else None
+
             # Status column
-            result = doe.results[r] if r < len(doe.results) else None
             status_item = QTableWidgetItem("✓" if result is not None else "")
-            status_item.setFlags(Qt.ItemIsEnabled)   # read-only
+            status_item.setFlags(Qt.ItemIsEnabled)
             if result is not None:
                 status_item.setForeground(
                     self._table.palette().color(self._table.palette().ColorRole.Highlight)
@@ -606,13 +616,32 @@ class DoEWidget(QWidget):
                 val = point.get(col, "")
                 item = QTableWidgetItem(str(val) if not isinstance(val, float)
                                         else f"{val:.5g}")
-                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # read-only
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 item.setToolTip(f"{col} = {val}")
                 self._table.setItem(r, ci, item)
 
+            # Context variable columns (editable — user records actual measured conditions)
+            ctx_start = 1 + len(param_cols)
+            for ci_ctx, ctx_col in enumerate(ctx_cols):
+                col_idx = ctx_start + ci_ctx
+                if ctx_vals is not None and ci_ctx < len(ctx_vals) and ctx_vals[ci_ctx] is not None:
+                    text = f"{ctx_vals[ci_ctx]:.6g}"
+                else:
+                    text = ""
+                item = QTableWidgetItem(text)
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                item.setBackground(_CTX_BG)
+                item.setToolTip(
+                    f"Context variable: {ctx_col}\n"
+                    "Enter the actual measured value for this experiment run.\n"
+                    "This is used by the contextual surrogate model."
+                )
+                self._table.setItem(r, col_idx, item)
+
             # Objective columns (editable)
+            obj_start = ctx_start + len(ctx_cols)
             for oi, obj in enumerate(obj_cols):
-                col_idx = 1 + len(param_cols) + oi
+                col_idx = obj_start + oi
                 if result is not None and oi < len(result):
                     text = f"{result[oi]:.6g}"
                 else:
@@ -666,13 +695,22 @@ class DoEWidget(QWidget):
                             matched = False
                             break
                 if matched:
-                    # Fill objective values into the table
+                    ctx_start_col = 1 + len(param_cols)
+                    obj_start_col = ctx_start_col + len(self._ctx_cols)
+                    # Fill context variable values if present in CSV
+                    for ci_ctx, ctx_col in enumerate(self._ctx_cols):
+                        if ctx_col in row.index and not pd.isna(row[ctx_col]):
+                            col_idx = ctx_start_col + ci_ctx
+                            item = self._table.item(r, col_idx)
+                            if item:
+                                item.setText(f"{float(row[ctx_col]):.6g}")
+                    # Fill objective values
                     obj_values = []
                     for oi, obj in enumerate(self._obj_cols):
                         if obj in row.index and not pd.isna(row[obj]):
                             val = float(row[obj])
                             obj_values.append(val)
-                            col_idx = 1 + len(param_cols) + oi
+                            col_idx = obj_start_col + oi
                             item = self._table.item(r, col_idx)
                             if item:
                                 item.setText(f"{val:.6g}")
@@ -714,6 +752,14 @@ class DoEWidget(QWidget):
         rows = []
         for i, pt in enumerate(doe.points):
             row = dict(pt)
+            # Include context variable values
+            ctx_vals = doe.context_values[i] if i < len(doe.context_values) else None
+            for ci_ctx, ctx_col in enumerate(self._ctx_cols):
+                if ctx_vals is not None and ci_ctx < len(ctx_vals):
+                    row[ctx_col] = ctx_vals[ci_ctx]
+                else:
+                    row[ctx_col] = None
+            # Include objective values
             result = doe.results[i] if i < len(doe.results) else None
             for oi, obj_col in enumerate(self._obj_cols):
                 if result is not None and oi < len(result):
@@ -753,15 +799,36 @@ class DoEWidget(QWidget):
 
         doe = self._session_state.doe_state
         param_cols = list(doe.points[0].keys()) if doe.points else []
-        n_obj = len(self._obj_cols)
+        ctx_start = 1 + len(param_cols)
+        obj_start = ctx_start + len(self._ctx_cols)
+
+        # Ensure context_values list is long enough
+        while len(doe.context_values) < len(doe.points):
+            doe.context_values.append(None)
 
         trial_dicts = []
         row_indices_with_results = []
         for r in range(len(doe.points)):
+            # Read context values from table (if any context cols defined)
+            ctx_row: Optional[list] = None
+            if self._ctx_cols:
+                ctx_vals = []
+                for ci_ctx in range(len(self._ctx_cols)):
+                    col_idx = ctx_start + ci_ctx
+                    item = self._table.item(r, col_idx)
+                    text = item.text().strip() if item else ""
+                    try:
+                        ctx_vals.append(float(text) if text else None)
+                    except ValueError:
+                        ctx_vals.append(None)
+                if any(v is not None for v in ctx_vals):
+                    ctx_row = ctx_vals
+                    doe.context_values[r] = ctx_row
+
             obj_values = []
             all_filled = True
             for oi, obj_col in enumerate(self._obj_cols):
-                col_idx = 1 + len(param_cols) + oi
+                col_idx = obj_start + oi
                 item = self._table.item(r, col_idx)
                 text = item.text().strip() if item else ""
                 if not text:
@@ -775,13 +842,18 @@ class DoEWidget(QWidget):
 
             if all_filled and obj_values:
                 params = doe.points[r]
+                # Build user_attrs: include context values so surrogate can use them
+                user_attrs: dict = {"source": "DoE"}
+                if ctx_row is not None:
+                    for ci_ctx, ctx_col in enumerate(self._ctx_cols):
+                        if ci_ctx < len(ctx_row) and ctx_row[ci_ctx] is not None:
+                            user_attrs[f"ctx_{ctx_col}"] = ctx_row[ci_ctx]
                 trial_dicts.append({
                     "params": params,
                     "values": obj_values,
-                    "user_attrs": {"source": "DoE"},
+                    "user_attrs": user_attrs,
                 })
                 row_indices_with_results.append(r)
-                # Update doe_state results
                 doe.results[r] = obj_values
 
         if not trial_dicts:
