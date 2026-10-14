@@ -837,3 +837,56 @@ def get_pareto_front(study: optuna.Study) -> List[FrozenTrial]:
             return [study.best_trial]
     except Exception:
         return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Study rebuild (used by the trial-invalidation feature)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def rebuild_study_without_trials(
+    config: StudyConfig,
+    storage_path: str,
+    study_name: str,
+    trial_dicts: List[dict],
+) -> optuna.Study:
+    """
+    Delete the existing Optuna study and recreate it with only *trial_dicts*.
+
+    This is the cleanest way to remove bad/invalid trials from the surrogate.
+    Because Optuna rebuilds its internal model completely fresh on every
+    ``ask()`` call, the resulting surrogate is **mathematically identical** to
+    one that was never populated with the excluded trials — a true undo.
+
+    Parameters
+    ----------
+    config       : StudyConfig — used to create the new study and distributions.
+    storage_path : absolute path to the SQLite .db file.
+    study_name   : name of the Optuna study inside that file.
+    trial_dicts  : list of trial dicts (same format as ``load_historical_trials``)
+                   containing ONLY the trials that should survive the rebuild.
+
+    Returns
+    -------
+    The new, freshly-populated ``optuna.Study``.
+    """
+    storage_url = f"sqlite:///{storage_path}"
+
+    # Delete the existing study (ignore errors if it doesn't exist yet)
+    try:
+        optuna.delete_study(study_name=study_name, storage=storage_url)
+        logger.info(
+            "Deleted study '%s' for rebuild (%d trial(s) will be kept).",
+            study_name, len(trial_dicts),
+        )
+    except Exception as exc:
+        logger.warning("Could not delete study '%s': %s", study_name, exc)
+
+    # Create a fresh empty study
+    new_study = build_study(config, storage_path, study_name)
+
+    # Re-populate with the surviving trials
+    if trial_dicts:
+        added, skipped = load_historical_trials(new_study, trial_dicts, config)
+        logger.info("Rebuilt study: %d added, %d skipped.", added, skipped)
+
+    return new_study

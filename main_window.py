@@ -61,6 +61,7 @@ from optuna_builder import (
     build_study,
     get_pareto_front,
     load_historical_trials,
+    rebuild_study_without_trials,
     tell_batch,
 )
 from param_card_widget import ParamCardWidget
@@ -572,6 +573,9 @@ class MainWindow(QMainWindow):
         # Surrogate validation state (Results-tab checkbox trigger)
         self._validation_results = None  # ValidationResults | None
         self._validation_worker  = None  # ValidationWorker  | None
+        # Trial numbers the user has marked as invalid via the trials table checkboxes.
+        # These are excluded when "Invalidate Unchecked" rebuilds the study.
+        self._invalid_trial_numbers: set = set()
 
         # Objective-row widgets [(col_name_label, direction_combo), ...]
         self._obj_row_widgets: List[tuple] = []
@@ -777,7 +781,7 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        self._pending_results_btn = QPushButton("📋  Enter Pending Results…")
+        self._pending_results_btn = QPushButton("Enter Pending Results…")
         self._pending_results_btn.setToolTip(
             "Reopen the results dialog for the current pending batch.\n"
             "Use this when you come back after running experiments —\n"
@@ -832,7 +836,7 @@ class MainWindow(QMainWindow):
         self._obj_inner_layout.addWidget(
             QLabel("Load a CSV to configure objectives, or define a study from scratch:")
         )
-        _define_btn = QPushButton("📐  Define Study Manually…")
+        _define_btn = QPushButton("Define Study Manually…")
         _define_btn.setToolTip(
             "Define parameters, objectives, and context variables without loading a CSV.\n"
             "Useful for brand-new studies where no data exists yet.\n"
@@ -981,7 +985,7 @@ class MainWindow(QMainWindow):
         _btn_vbox.addWidget(self._pause_btn)
 
         settings_outer.addWidget(_btn_container)
-        self._left_tabs.addTab(settings_widget, "⚙  Settings")
+        self._left_tabs.addTab(settings_widget, "Settings")
 
         # ══════════════════════════════════════════════════════════════
         # Tab 2 — 📊 Results
@@ -992,14 +996,6 @@ class MainWindow(QMainWindow):
         rvbox.setSpacing(4)
 
         rbtn_row = QHBoxLayout()
-        design_space_btn = QPushButton("📊  Design Space…")
-        design_space_btn.setToolTip(
-            "Open the Design Space + Correlation Matrix window.\n"
-            "Shows historical data in parameter space and how variables\n"
-            "correlate with each other and the objective."
-        )
-        design_space_btn.clicked.connect(self._action_open_design_space)
-        rbtn_row.addWidget(design_space_btn)
         rbtn_row.addStretch()
         export_btn = QPushButton("Export CSV")
         export_btn.setToolTip("Export all completed trial results to a CSV file.")
@@ -1017,7 +1013,7 @@ class MainWindow(QMainWindow):
 
         # ── Export Report + Surrogate Validation checkbox ──────────────
         rbtn_row2 = QHBoxLayout()
-        export_report_btn = QPushButton("📄  Export Report…")
+        export_report_btn = QPushButton("Export Report…")
         export_report_btn.setToolTip(
             "Generate a self-contained HTML report of the optimisation session.\n"
             "Includes: session metadata, best results, all plots (embedded as\n"
@@ -1028,7 +1024,7 @@ class MainWindow(QMainWindow):
         rbtn_row2.addWidget(export_report_btn)
         rbtn_row2.addStretch()
 
-        self._val_checkbox_main = QCheckBox("🔬  Surrogate Validation")
+        self._val_checkbox_main = QCheckBox("Surrogate Validation")
         self._val_checkbox_main.setEnabled(False)
         self._val_checkbox_main.setToolTip(
             "Run a rigorous validation of the surrogate model on the current dataset:\n"
@@ -1063,15 +1059,49 @@ class MainWindow(QMainWindow):
         self._quality_badge.setWordWrap(True)
         self._quality_badge.setAlignment(Qt.AlignCenter)
         self._quality_badge.setToolTip(
-            "Cross-validated R² of a Random Forest fitted on all completed trials.\n"
-            f"Green: R² > 0.85 (good)  |  Amber: R² 0.60–0.85 (moderate)\n"
-            f"Red: R² < 0.60 (poor)    |  Grey: fewer than {MIN_TRIALS} completed trials."
+            "Hover after loading data for surrogate quality details."
         )
         self._quality_badge.setStyleSheet(
             "background-color: #45475a; color: #cdd6f4; "
             "padding: 4px 8px; border-radius: 4px;"
         )
         rvbox.addWidget(self._quality_badge)
+
+        # ── Trial management buttons (invalidate / rebuild / restore) ─────
+        rbtn_row3 = QHBoxLayout()
+        self._invalidate_btn = QPushButton("Exclude Unchecked (0)")
+        self._invalidate_btn.setToolTip(
+            "Remove unchecked trials from the surrogate model.\n\n"
+            "Uncheck any rows in the All Trials table that have bad / erroneous data,\n"
+            "then click this button.  The study is rebuilt without those trials —\n"
+            "mathematically identical to the surrogate state before they were added.\n\n"
+            "This is a true undo: the rebuilt surrogate produces exactly the same\n"
+            "suggestions it would have if those experiments had never been run."
+        )
+        self._invalidate_btn.setEnabled(False)
+        self._invalidate_btn.clicked.connect(self._action_invalidate_unchecked)
+        rbtn_row3.addWidget(self._invalidate_btn)
+
+        self._rebuild_from_csv_btn = QPushButton("Rebuild from CSV")
+        self._rebuild_from_csv_btn.setToolTip(
+            "Nuclear option: delete ALL trials and rebuild the study from the\n"
+            "current CSV from scratch.  Use this when the CSV itself has been\n"
+            "cleaned (bad rows removed) and you want a completely fresh surrogate.\n\n"
+            "A confirmation dialog will show how many trials will be deleted."
+        )
+        self._rebuild_from_csv_btn.setEnabled(False)
+        self._rebuild_from_csv_btn.clicked.connect(self._action_rebuild_from_csv)
+        rbtn_row3.addWidget(self._rebuild_from_csv_btn)
+
+        self._restore_all_btn = QPushButton("Include All")
+        self._restore_all_btn.setToolTip(
+            "Re-check all trials in the All Trials table (undo any unchecking).\n"
+            "Does NOT change the Optuna study — only resets the checkbox states."
+        )
+        self._restore_all_btn.setEnabled(False)
+        self._restore_all_btn.clicked.connect(self._action_restore_all_valid)
+        rbtn_row3.addWidget(self._restore_all_btn)
+        rvbox.addLayout(rbtn_row3)
 
         self._results_tabs = QTabWidget()
 
@@ -1087,14 +1117,8 @@ class MainWindow(QMainWindow):
         self._pareto_table.setAlternatingRowColors(True)
         self._results_tabs.addTab(self._pareto_table, "Best / Pareto")
 
-        self._convergence_widget = ConvergenceWidget()
-        self._results_tabs.addTab(self._convergence_widget, "\U0001f4c8  Convergence")
-
-        self._pareto_widget = ParetoWidget()
-        self._results_tabs.addTab(self._pareto_widget, "📈  Pareto")
-
         rvbox.addWidget(self._results_tabs, stretch=1)
-        self._left_tabs.addTab(results_widget, "📊  Results")
+        self._left_tabs.addTab(results_widget, "Results")
 
         # ══════════════════════════════════════════════════════════════
         # Tab 3 — 🔬 Power Analysis
@@ -1103,14 +1127,14 @@ class MainWindow(QMainWindow):
         # and _build_centre can share self._centre_stack).
         # ══════════════════════════════════════════════════════════════
         self._power = PowerAnalysisCoordinator()
-        self._left_tabs.addTab(self._power.input_panel, "🔬  Power")
+        self._left_tabs.addTab(self._power.input_panel, "Power Analysis")
         self._centre_stack.addWidget(self._power.result_panel)  # index 1
 
         # ══════════════════════════════════════════════════════════════
         # Tab 4 — 🧪 DoE
         # ══════════════════════════════════════════════════════════════
         self._doe_widget = DoEWidget(parent=self)
-        self._left_tabs.addTab(self._doe_widget, "🧪  DoE")
+        self._left_tabs.addTab(self._doe_widget, "DoE")
         self._doe_widget.readiness_changed.connect(self._on_doe_readiness_changed)
         self._doe_widget.start_bo_requested.connect(self._on_start_bo_from_doe)
 
@@ -1141,6 +1165,16 @@ class MainWindow(QMainWindow):
         load_updated_btn = QPushButton("Load Updated CSV…")
         load_updated_btn.clicked.connect(self._action_load_updated_csv)
         banner_h.addWidget(load_updated_btn)
+        _dismiss_btn = QPushButton("✕")
+        _dismiss_btn.setFixedSize(22, 22)
+        _dismiss_btn.setFlat(True)
+        _dismiss_btn.setToolTip(
+            "Dismiss this notice.\n"
+            "The pending batch is still saved — use the toolbar button\n"
+            "'📋 Enter Pending Results…' to submit your measurements later."
+        )
+        _dismiss_btn.clicked.connect(self._resume_banner.hide)
+        banner_h.addWidget(_dismiss_btn)
         self._resume_banner.hide()
         vbox.addWidget(self._resume_banner)
 
@@ -1165,9 +1199,270 @@ class MainWindow(QMainWindow):
         # Add scroll area as page 0 of the centre stacked widget.
         # Page 1 (power result panel) is added in _build_left_dock().
         self._centre_stack.addWidget(self._scroll)   # index 0
+        # index 1: self._power.result_panel  (added in _build_left_dock)
+
+        # ── Page 2: Embedded Design Space panel ──────────────────────────
+        # Full-featured tabbed analysis view (pairplot, correlation, importance,
+        # profiler, convergence, Pareto, validation) embedded permanently.
+        # Shown whenever the 📊 Results tab is active.
+        self._design_space_panel = DesignSpaceDialog(parent=self, embedded=True)
+        self._centre_stack.addWidget(self._design_space_panel)  # index 2
+
+        # Aliases so existing code continues to work without changes:
+        self._design_space_dlg   = self._design_space_panel
+        self._convergence_widget = self._design_space_panel._convergence_widget
+        self._pareto_widget      = self._design_space_panel._pareto_widget
+
+        # Wire up "Use This Sampler" signal from the Sampler Compare tab so
+        # clicking the button immediately changes the active sampler in the study config.
+        self._design_space_panel.sampler_switch_requested.connect(
+            self._on_sampler_switch_requested
+        )
+
+        # ── Page 3: DoE visualisation panel ──────────────────────────────
+        # Pairplot (left) + coverage metrics bar chart (right).
+        # Shown when the user switches to the 🧪 DoE tab.
+        self._doe_panel = self._build_doe_panel()
+        self._centre_stack.addWidget(self._doe_panel)      # index 3
+
         vbox.addWidget(self._centre_stack)
 
         self.setCentralWidget(centre)
+
+    # ── DoE centre panel ──────────────────────────────────────────────────
+
+    def _build_doe_panel(self) -> QWidget:
+        """
+        Create the DoE centre panel widget.
+
+        Left side : pairplot of the generated DoE points (up to 5 parameters).
+                    Coloured by objective value when results have been entered.
+        Right side : bar chart comparing maximin distance and L2 discrepancy
+                     of the DoE design against a random baseline.
+
+        Both canvases are updated by _refresh_doe_panel() when the DoE tab
+        becomes active.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+
+        panel = QWidget()
+        panel_layout = QHBoxLayout(panel)
+        panel_layout.setContentsMargins(4, 4, 4, 4)
+        panel_layout.setSpacing(6)
+
+        # ── Left: pairplot ────────────────────────────────────────────────
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(2)
+
+        lbl_pair = QLabel("DoE Design Space")
+        lbl_pair.setStyleSheet("color: #89b4fa; font-weight: bold; font-size: 11px;")
+        left_layout.addWidget(lbl_pair)
+
+        self._doe_pairplot_fig = Figure(facecolor="#1e1e2e", layout="constrained")
+        self._doe_pairplot_canvas = FigureCanvasQTAgg(self._doe_pairplot_fig)
+        self._doe_pairplot_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        left_layout.addWidget(self._doe_pairplot_canvas, stretch=1)
+
+        self._doe_pairplot_placeholder = QLabel(
+            "Generate a DoE design in the 🧪 DoE tab\n"
+            "to see the parameter space visualisation here."
+        )
+        self._doe_pairplot_placeholder.setAlignment(Qt.AlignCenter)
+        self._doe_pairplot_placeholder.setStyleSheet(
+            "color: #6c6f85; font-style: italic; font-size: 12px;"
+        )
+        left_layout.addWidget(self._doe_pairplot_placeholder)
+        self._doe_pairplot_canvas.hide()
+
+        panel_layout.addWidget(left, stretch=3)
+
+        # ── Right: coverage metrics ───────────────────────────────────────
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(2)
+
+        lbl_cov = QLabel("📏  Coverage Metrics")
+        lbl_cov.setStyleSheet("color: #89b4fa; font-weight: bold; font-size: 11px;")
+        right_layout.addWidget(lbl_cov)
+
+        self._doe_metrics_fig = Figure(facecolor="#1e1e2e", layout="constrained")
+        self._doe_metrics_canvas = FigureCanvasQTAgg(self._doe_metrics_fig)
+        self._doe_metrics_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_layout.addWidget(self._doe_metrics_canvas, stretch=1)
+
+        self._doe_metrics_placeholder = QLabel(
+            "Coverage metrics appear\nafter DoE generation."
+        )
+        self._doe_metrics_placeholder.setAlignment(Qt.AlignCenter)
+        self._doe_metrics_placeholder.setStyleSheet(
+            "color: #6c6f85; font-style: italic; font-size: 12px;"
+        )
+        right_layout.addWidget(self._doe_metrics_placeholder)
+        self._doe_metrics_canvas.hide()
+
+        panel_layout.addWidget(right, stretch=2)
+        return panel
+
+    def _refresh_doe_panel(self) -> None:
+        """
+        Update the DoE centre panel with the current DoE pairplot and
+        coverage metrics.  Called each time the 🧪 DoE tab becomes visible.
+        """
+        doe_df = getattr(self._doe_widget, '_doe_df', None)
+        if doe_df is None or doe_df.empty:
+            self._doe_pairplot_placeholder.show()
+            self._doe_pairplot_canvas.hide()
+            self._doe_metrics_placeholder.show()
+            self._doe_metrics_canvas.hide()
+            return
+
+        numeric_cols = doe_df.select_dtypes(include='number').columns.tolist()
+        if not numeric_cols:
+            self._doe_pairplot_placeholder.show()
+            self._doe_pairplot_canvas.hide()
+            return
+
+        import numpy as np
+        import matplotlib.colors as mcolors
+        import matplotlib.cm as cm
+        from matplotlib.gridspec import GridSpec
+
+        _BG   = "#1e1e2e"
+        _FG   = "#cdd6f4"
+        _GRID = "#313244"
+        _BLUE = "#89b4fa"
+        _GRN  = "#a6e3a1"
+        _RED  = "#f38ba8"
+
+        doe_state = (
+            self._session_state.doe_state if self._session_state else None
+        )
+        obj_cols = getattr(self._doe_widget, '_obj_cols', [])
+
+        # ── Colour by objective if results exist ──────────────────────────
+        colours = [_BLUE] * len(doe_df)
+        result_label = ""
+        if doe_state and obj_cols and any(r is not None for r in doe_state.results):
+            y_vals = [r[0] if r is not None else None for r in doe_state.results]
+            numeric_y = [v for v in y_vals if v is not None]
+            if numeric_y:
+                vmin, vmax = min(numeric_y), max(numeric_y)
+                norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+                cmap = cm.viridis
+                colours = [
+                    cmap(norm(v)) if v is not None else (0.35, 0.35, 0.35, 0.6)
+                    for v in y_vals
+                ]
+                result_label = f"  (coloured by {obj_cols[0]})"
+
+        # ── Pairplot ──────────────────────────────────────────────────────
+        self._doe_pairplot_fig.clear()
+        n_show = min(len(numeric_cols), 5)  # max 5 params to keep it readable
+        cols = numeric_cols[:n_show]
+        n = len(cols)
+
+        if n == 1:
+            ax = self._doe_pairplot_fig.add_subplot(111)
+            ax.set_facecolor(_BG)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(_GRID)
+            ax.hist(doe_df[cols[0]].values, bins=min(12, len(doe_df)),
+                    color=_BLUE, alpha=0.75, edgecolor=_BG)
+            ax.set_xlabel(cols[0], color=_FG, fontsize=8)
+            ax.tick_params(colors=_FG, labelsize=7)
+            ax.set_title(f"Distribution — {cols[0]}", color=_FG, fontsize=9)
+        else:
+            gs = GridSpec(n, n, figure=self._doe_pairplot_fig,
+                          hspace=0.06, wspace=0.06)
+            for i in range(n):
+                for j in range(n):
+                    ax = self._doe_pairplot_fig.add_subplot(gs[i, j])
+                    ax.set_facecolor(_BG)
+                    for sp in ax.spines.values():
+                        sp.set_edgecolor(_GRID)
+                    ax.tick_params(colors=_FG, labelsize=5)
+                    xi = doe_df[cols[i]].values
+                    xj = doe_df[cols[j]].values
+                    if i == j:
+                        ax.hist(xi, bins=min(8, len(doe_df)),
+                                color=_BLUE, alpha=0.7, edgecolor=_BG)
+                    elif i > j:
+                        ax.scatter(xj, xi, c=colours,
+                                   s=15, alpha=0.85, linewidths=0)
+                    else:
+                        ax.set_visible(False)
+                    if i == n - 1:
+                        ax.set_xlabel(cols[j], color=_FG, fontsize=6)
+                    else:
+                        ax.set_xticklabels([])
+                    if j == 0:
+                        ax.set_ylabel(cols[i], color=_FG, fontsize=6)
+                    else:
+                        ax.set_yticklabels([])
+
+        hidden_note = (
+            f"  (+{len(numeric_cols) - n_show} more)"
+            if len(numeric_cols) > n_show else ""
+        )
+        self._doe_pairplot_fig.suptitle(
+            f"DoE Pairplot  ({len(doe_df)} points{result_label}{hidden_note})",
+            color=_FG, fontsize=9,
+        )
+        self._doe_pairplot_fig.patch.set_facecolor(_BG)
+        self._doe_pairplot_canvas.draw_idle()
+        self._doe_pairplot_placeholder.hide()
+        self._doe_pairplot_canvas.show()
+
+        # ── Coverage metrics ──────────────────────────────────────────────
+        if doe_state is not None:
+            try:
+                from doe_math import coverage_metrics
+                metrics = coverage_metrics(doe_df)
+                mm    = metrics.get("maximin_distance") or 0.0
+                discr = metrics.get("discrepancy")     or 0.0
+                ref_mm = metrics.get("random_maximin_ref") or 0.0
+                ref_d  = metrics.get("random_discr_ref")  or 0.0
+
+                self._doe_metrics_fig.clear()
+                axes = self._doe_metrics_fig.subplots(2, 1)
+                for ax in axes:
+                    ax.set_facecolor(_BG)
+                    for sp in ax.spines.values():
+                        sp.set_edgecolor(_GRID)
+                    ax.tick_params(colors=_FG, labelsize=7)
+
+                # Maximin — higher is better
+                axes[0].bar(["DoE", "Random"], [mm, ref_mm],
+                            color=[_GRN, _RED], alpha=0.85, edgecolor=_BG)
+                axes[0].set_title("Maximin Distance  (↑ better)",
+                                  color=_FG, fontsize=8)
+                for v, x in zip([mm, ref_mm], [0, 1]):
+                    axes[0].text(x, v + max(mm, ref_mm) * 0.04,
+                                 f"{v:.4f}", ha="center", va="bottom",
+                                 color=_FG, fontsize=7)
+
+                # Discrepancy — lower is better
+                axes[1].bar(["DoE", "Random"], [discr, ref_d],
+                            color=[_GRN, _RED], alpha=0.85, edgecolor=_BG)
+                axes[1].set_title("L2 Discrepancy  (↓ better)",
+                                  color=_FG, fontsize=8)
+                for v, x in zip([discr, ref_d], [0, 1]):
+                    axes[1].text(x, v + max(discr, ref_d) * 0.04,
+                                 f"{v:.4f}", ha="center", va="bottom",
+                                 color=_FG, fontsize=7)
+
+                self._doe_metrics_fig.patch.set_facecolor(_BG)
+                self._doe_metrics_canvas.draw_idle()
+                self._doe_metrics_placeholder.hide()
+                self._doe_metrics_canvas.show()
+            except Exception:
+                pass
 
     # ══════════════════════════════════════════════════════════════════════
     # Status bar
@@ -1365,7 +1660,7 @@ class MainWindow(QMainWindow):
         apply_btn.clicked.connect(self._action_apply_objectives)
         self._obj_inner_layout.addWidget(apply_btn)
 
-        constraint_btn = QPushButton("📐  Constraints…")
+        constraint_btn = QPushButton("Constraints…")
         constraint_btn.setToolTip(
             "Define rules that constrain how parameter values relate to each other.\n"
             "Examples:\n"
@@ -1544,6 +1839,9 @@ class MainWindow(QMainWindow):
         # Refresh DoE widget with new session + study
         self._doe_widget.refresh(self._session_state, self._study)
 
+        # Refresh Benchmark + Sampler Compare tabs with the new study
+        self._design_space_panel.set_study(self._study, config)
+
         # Status message describes whether aggregation occurred
         if repl_enabled and n_agg < n_raw:
             self._set_status(
@@ -1612,7 +1910,7 @@ class MainWindow(QMainWindow):
 
         # Build the group box
         from parameter_config import ContextConfig
-        grp = QGroupBox("🌡  Current Conditions")
+        grp = QGroupBox("Current Conditions")
         grp.setToolTip(
             "Enter expected environmental conditions for the NEXT batch of experiments.\n"
             "These values are used to condition the surrogate suggestions.\n"
@@ -1701,18 +1999,18 @@ class MainWindow(QMainWindow):
 
         if sampler == "TPE" and n_enabled > TPE_PARAM_WARNING_THRESHOLD:
             warnings.append(
-                f"⚠ TPE may struggle with {n_enabled} parameters "
+                f"TPE may struggle with {n_enabled} parameters "
                 f"(recommended ≤ {TPE_PARAM_WARNING_THRESHOLD}). "
                 "Consider switching to NSGAII or reducing parameters."
             )
         if n_enabled > 0 and n_trials < MIN_TRIALS_PER_PARAM_RATIO * n_enabled:
             warnings.append(
-                f"⚠ Only {n_trials} historical trials for {n_enabled} parameters. "
+                f"Only {n_trials} historical trials for {n_enabled} parameters. "
                 "Initial suggestions may be poor — add more data first."
             )
         if sampler == "TPE" and n_trials > 0 and batch_size > n_trials:
             warnings.append(
-                f"⚠ Batch size ({batch_size}) exceeds historical trial count ({n_trials}). "
+                f"Batch size ({batch_size}) exceeds historical trial count ({n_trials}). "
                 "TPE batch quality degrades without sufficient prior data."
             )
 
@@ -1724,7 +2022,7 @@ class MainWindow(QMainWindow):
             )
             if n_completed > 200:
                 warnings.append(
-                    f"⚠ GP may be slow for {n_completed} completed trials (> 200). "
+                    f"GP may be slow for {n_completed} completed trials (> 200). "
                     "Consider switching to TPE for faster suggestions."
                 )
 
@@ -1867,8 +2165,8 @@ class MainWindow(QMainWindow):
                          if self._session_state and self._session_state.pending_batch
                          else 0)
             self._resume_label.setText(
-                f"⚠  <b>{n_pending}</b> pending trial(s) awaiting lab results.\n"
-                "Click <b>📋 Enter Pending Results…</b> in the toolbar when you "
+                f"<b>{n_pending}</b> pending trial(s) awaiting lab results.\n"
+                "Click <b>Enter Pending Results…</b> in the toolbar when you "
                 "have your measurements."
             )
             self._resume_banner.show()
@@ -2105,7 +2403,7 @@ class MainWindow(QMainWindow):
         self._val_status_lbl_main.setVisible(False)
         self._val_checkbox_main.blockSignals(True)
         self._val_checkbox_main.setChecked(False)
-        self._val_checkbox_main.setText("🔬  Surrogate Validation")
+        self._val_checkbox_main.setText("Surrogate Validation")
         self._val_checkbox_main.setEnabled(False)
         self._val_checkbox_main.blockSignals(False)
 
@@ -2225,6 +2523,9 @@ class MainWindow(QMainWindow):
         # Refresh DoE widget with loaded session + study
         self._doe_widget.refresh(self._session_state, self._study)
 
+        # Refresh Benchmark + Sampler Compare tabs with the loaded study
+        self._design_space_panel.set_study(self._study, cfg)
+
         _log.info(
             "Session loaded: %s  (%d trials)",
             state.display_name,
@@ -2302,14 +2603,39 @@ class MainWindow(QMainWindow):
         # Include n_replicates column so users can see how many raw rows were merged
         all_cols   = ["Trial #"] + param_cols + obj_cols + ["n_replicates"]
 
-        def _fill_table(table: QTableWidget, trials: list) -> None:
+        all_cols_cb = ["✓"] + all_cols   # trials table: checkbox col first
+
+        from PySide6.QtGui import QColor
+        _INVALID_BG = QColor("#3d1a1a")   # dark red for unchecked/invalid rows
+
+        def _fill_table(table: QTableWidget, trials: list,
+                        with_checkboxes: bool = False) -> None:
+            cols = all_cols_cb if with_checkboxes else all_cols
+            offset = 1 if with_checkboxes else 0
             table.setRowCount(len(trials))
-            table.setColumnCount(len(all_cols))
-            table.setHorizontalHeaderLabels(all_cols)
+            table.setColumnCount(len(cols))
+            table.setHorizontalHeaderLabels(cols)
             for r, trial in enumerate(sorted(trials, key=lambda t: t.number)):
-                table.setItem(r, 0, QTableWidgetItem(str(trial.number)))
+                if with_checkboxes:
+                    cb_item = QTableWidgetItem()
+                    cb_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                    is_invalid = trial.number in self._invalid_trial_numbers
+                    cb_item.setCheckState(
+                        Qt.Unchecked if is_invalid else Qt.Checked
+                    )
+                    if is_invalid:
+                        cb_item.setBackground(_INVALID_BG)
+                    cb_item.setToolTip(
+                        "Uncheck to mark this trial as invalid.\n"
+                        "Then click 'Invalidate Unchecked' to rebuild the surrogate\n"
+                        "without it — a mathematically exact undo of adding that trial."
+                    )
+                    table.setItem(r, 0, cb_item)
+
+                table.setItem(r, offset, QTableWidgetItem(str(trial.number)))
                 for ci, pname in enumerate(param_cols, start=1):
-                    table.setItem(r, ci, QTableWidgetItem(str(trial.params.get(pname, ""))))
+                    table.setItem(r, offset + ci,
+                                  QTableWidgetItem(str(trial.params.get(pname, ""))))
                 for oi in range(len(obj_cols)):
                     if trial.values and oi < len(trial.values):
                         val = trial.values[oi]
@@ -2317,9 +2643,8 @@ class MainWindow(QMainWindow):
                         val = trial.value
                     else:
                         val = ""
-                    table.setItem(r, len(param_cols) + 1 + oi, QTableWidgetItem(str(val)))
-                # n_replicates: from user_attrs if set (historical trials with aggregation),
-                # otherwise 1 (live batch tells)
+                    table.setItem(r, offset + len(param_cols) + 1 + oi,
+                                  QTableWidgetItem(str(val)))
                 n_rep = 1
                 if trial.user_attrs:
                     try:
@@ -2327,13 +2652,27 @@ class MainWindow(QMainWindow):
                     except (TypeError, ValueError):
                         n_rep = 1
                 table.setItem(
-                    r, len(param_cols) + 1 + len(obj_cols),
+                    r, offset + len(param_cols) + 1 + len(obj_cols),
                     QTableWidgetItem(str(n_rep)),
                 )
+                if with_checkboxes and trial.number in self._invalid_trial_numbers:
+                    for c in range(len(cols)):
+                        it = table.item(r, c)
+                        if it:
+                            it.setBackground(_INVALID_BG)
             table.resizeColumnsToContents()
+            if with_checkboxes:
+                table.setColumnWidth(0, 28)
 
-        _fill_table(self._trials_table, completed)
+        _fill_table(self._trials_table, completed, with_checkboxes=True)
+        # Connect checkbox changes to update _invalid_trial_numbers and button label
+        self._trials_table.itemChanged.connect(self._on_trial_checkbox_changed)
         _fill_table(self._pareto_table, get_pareto_front(self._study))
+
+        # Enable trial management buttons now that trials exist
+        self._invalidate_btn.setEnabled(True)
+        self._rebuild_from_csv_btn.setEnabled(True)
+        self._restore_all_btn.setEnabled(True)
 
         # Refresh the convergence plot
         objectives = (
@@ -2380,19 +2719,24 @@ class MainWindow(QMainWindow):
 
     def _on_left_tab_changed(self, index: int) -> None:
         """
-        Show/hide the power result panel in the centre area.
+        Switch the centre panel to the view that makes sense for the active tab.
 
-        Index 2 = 🔬 Power tab → show result panel.
-        Any other tab → show param cards.
+          0 — ⚙ Settings  → param cards (scroll area)
+          1 — 📊 Results   → convergence plot + Pareto scatter (side by side)
+          2 — 🔬 Power     → power analysis result panel
+          3 — 🧪 DoE       → DoE pairplot + coverage metrics
 
-        Uses setCurrentWidget() instead of setCurrentIndex() so the correct
-        widget is always shown regardless of the order they were inserted into
-        the stack (_build_left_dock runs before _build_centre, so insertion
-        order is not the same as the logical page numbers in the comments).
+        Uses setCurrentWidget() so the correct page is shown regardless of the
+        order widgets were inserted into the stack.
         """
-        if index == 2:
+        if index == 1:    # 📊 Results → embedded Design Space panel
+            self._centre_stack.setCurrentWidget(self._design_space_panel)
+        elif index == 2:  # 🔬 Power
             self._centre_stack.setCurrentWidget(self._power.result_panel)
-        else:
+        elif index == 3:  # 🧪 DoE
+            self._refresh_doe_panel()
+            self._centre_stack.setCurrentWidget(self._doe_panel)
+        else:             # ⚙ Settings (index 0) or any other
             self._centre_stack.setCurrentWidget(self._scroll)
 
     def _update_quality_badge(self) -> None:
@@ -2428,36 +2772,101 @@ class MainWindow(QMainWindow):
         r_str     = f"{pearson_r:.2f}" if pearson_r is not None else "n/a"
         rmse_str  = f"{rmse:.4g}"      if rmse      is not None else "n/a"
 
+        # Shared methodology preamble — shown in every tooltip state
+        _METHOD_TIP = (
+            "Method: Random Forest trained on all completed trials.\n"
+            "Repeated 5-fold cross-validation (5 repeats, 25 total scores).\n"
+            "\n"
+            "R\u00b2 tiers (cross-validated):\n"
+            "  R\u00b2 > 0.85   Strong predictive performance\n"
+            "  0.70 \u2013 0.85  Good predictive performance\n"
+            "  0.50 \u2013 0.70  Useful predictive performance\n"
+            "  0.30 \u2013 0.50  Moderate signal\n"
+            "  0.00 \u2013 0.30  Weak predictive performance\n"
+            "\n"
+        )
+
         if status == "insufficient":
-            text  = f"Surrogate quality: Insufficient data ({n}/{MIN_TRIALS})"
+            text  = f"Surrogate  {n}/{MIN_TRIALS} trials"
             style = (
                 "background-color: #45475a; color: #cdd6f4; "
                 "padding: 4px 8px; border-radius: 4px;"
             )
-        elif status == "good":
-            text  = (f"✅ Surrogate: Good  "
-                     f"(CV R²={r2_str}, r={r_str}, RMSE={rmse_str}, n={n})")
+            tip = (
+                _METHOD_TIP
+                + f"Current: Fewer than {MIN_TRIALS} completed trials.\n"
+                "R\u00b2 cannot be estimated reliably with so few data points."
+            )
+        elif status == "strong":
+            text  = f"Surrogate \u2014 Strong  R\u00b2={r2_str}  r={r_str}  n={n}"
             style = (
                 "background-color: #2ecc71; color: #1e1e2e; "
                 "padding: 4px 8px; border-radius: 4px; font-weight: bold;"
             )
+            tip = (
+                _METHOD_TIP
+                + "Current: Strong predictive performance (R\u00b2 > 0.85).\n"
+                "The surrogate has identified a clear and consistent relationship\n"
+                "in the data. Suggestions are likely well-guided."
+            )
+        elif status == "good":
+            text  = f"Surrogate \u2014 Good  R\u00b2={r2_str}  r={r_str}  n={n}"
+            style = (
+                "background-color: #27ae60; color: #ffffff; "
+                "padding: 4px 8px; border-radius: 4px; font-weight: bold;"
+            )
+            tip = (
+                _METHOD_TIP
+                + "Current: Good predictive performance (R\u00b2 0.70\u20130.85).\n"
+                "The surrogate captures the objective reasonably well.\n"
+                "Suggestions are likely reliable."
+            )
+        elif status == "useful":
+            text  = f"Surrogate \u2014 Useful  R\u00b2={r2_str}  r={r_str}  n={n}"
+            style = (
+                "background-color: #2980b9; color: #ffffff; "
+                "padding: 4px 8px; border-radius: 4px;"
+            )
+            tip = (
+                _METHOD_TIP
+                + "Current: Useful predictive performance (R\u00b2 0.50\u20130.70).\n"
+                "The surrogate captures meaningful structure in the data.\n"
+                "Suggestions are informative but carry moderate uncertainty."
+            )
         elif status == "moderate":
-            text  = (f"⚠ Surrogate: Moderate — more data recommended  "
-                     f"(CV R²={r2_str}, r={r_str}, n={n})")
+            text  = f"Surrogate \u2014 Moderate  R\u00b2={r2_str}  r={r_str}  n={n}"
             style = (
                 "background-color: #f39c12; color: #1e1e2e; "
                 "padding: 4px 8px; border-radius: 4px;"
             )
-        else:  # poor
-            text  = (f"🔴 Surrogate: Poor — suggestions less reliable  "
-                     f"(CV R²={r2_str}, r={r_str}, n={n})")
+            tip = (
+                _METHOD_TIP
+                + "Current: Moderate signal (R\u00b2 0.30\u20130.50).\n"
+                "The model has some predictive value but limited accuracy.\n"
+                "Possible contributing factors include measurement noise,\n"
+                "a complex response surface, insufficient data coverage,\n"
+                "or a genuinely modest learnable signal. More experiments,\n"
+                "better feature selection, or a revised experimental design\n"
+                "may or may not improve this."
+            )
+        else:  # weak (R2 <= 0.30)
+            text  = f"Surrogate \u2014 Weak  R\u00b2={r2_str}  r={r_str}  n={n}"
             style = (
                 "background-color: #e74c3c; color: #ffffff; "
                 "padding: 4px 8px; border-radius: 4px;"
             )
+            tip = (
+                _METHOD_TIP
+                + "Current: Weak predictive performance (R\u00b2 \u2264 0.30).\n"
+                "The model has not identified a clear learnable pattern.\n"
+                "Suggestions may offer limited benefit over random exploration.\n"
+                "This does not mean optimisation will fail, but treat results\n"
+                "with caution."
+            )
 
         self._quality_badge.setText(text)
         self._quality_badge.setStyleSheet(style)
+        self._quality_badge.setToolTip(tip)
 
     def _update_status_bar(self) -> None:
         if not self._study:
@@ -2640,7 +3049,7 @@ class MainWindow(QMainWindow):
             self._val_progress_main.setVisible(True)
             self._val_status_lbl_main.setText("Starting validation…")
             self._val_status_lbl_main.setVisible(True)
-            self._val_checkbox_main.setText("🔬  Running…")
+            self._val_checkbox_main.setText("Running validation…")
             self._val_checkbox_main.setEnabled(False)
 
             from validation_worker import ValidationWorker
@@ -2667,7 +3076,7 @@ class MainWindow(QMainWindow):
                 self._validation_worker.wait(3000)
             self._val_progress_main.setVisible(False)
             self._val_status_lbl_main.setVisible(False)
-            self._val_checkbox_main.setText("🔬  Surrogate Validation")
+            self._val_checkbox_main.setText("Surrogate Validation")
             self._update_main_val_checkbox()   # re-enable if still ≥ 30 rows
 
     def _on_main_val_progress(self, pct: int, msg: str) -> None:
@@ -3007,6 +3416,40 @@ class MainWindow(QMainWindow):
         )
         self._compact_readiness_lbl.setTextFormat(Qt.TextFormat.RichText)
 
+    def _on_sampler_switch_requested(self, sampler_name: str) -> None:
+        """
+        Called when the user clicks '🔀 Use This Sampler' in the Sampler Compare tab.
+
+        Updates the sampler combo in the Settings tab, syncs the session config,
+        and persists the change so it takes effect on the next 'Ask Next Batch'.
+        """
+        # Map display names to combo entries
+        _name_map = {
+            "TPE": "TPE",
+            "Random": "Random",
+            "CmaEs": "Random",   # CmaEs → falls back; NSGAII unsupported in combo
+            "NSGAii": "NSGAII",
+            "QMC": "Random",
+        }
+        combo_name = _name_map.get(sampler_name, sampler_name)
+        # Try to set the combo to the exact name first, then the mapped name
+        for candidate in (sampler_name, combo_name):
+            idx = self._sampler_combo.findText(candidate)
+            if idx >= 0:
+                self._sampler_combo.setCurrentIndex(idx)
+                break
+
+        # Persist to session config
+        if self._session_state:
+            self._session_state.study_config.sampler_name = self._sampler_combo.currentText()
+            from session_manager import SessionManager
+            SessionManager.save(self._session_state)
+
+        self._set_status(
+            f"Active sampler switched to: {self._sampler_combo.currentText()}. "
+            "Click 'Ask Next Batch' to use it."
+        )
+
     def _on_start_bo_from_doe(self) -> None:
         """
         Called when the user clicks 'Start Optimisation' in the DoE tab.
@@ -3218,42 +3661,213 @@ class MainWindow(QMainWindow):
 
     def _action_open_design_space(self) -> None:
         """
-        Open (or raise) the Design Space visualisation window.
+        Switch to the 📊 Results tab where the Design Space is permanently embedded.
 
-        Creates the dialog the first time; thereafter reuses the same
-        window so the user can keep it open alongside LabOpt.
+        The Design Space is no longer a floating popup — it lives in the right
+        panel of the Results tab alongside Convergence, Pareto and Validation.
         """
-        if self._df is None or not self._session_state:
+        self._left_tabs.setCurrentIndex(1)   # switch to Results tab
+        if self._df is not None and self._session_state:
+            cfg = self._session_state.study_config
+            self._design_space_dlg.refresh(
+                df=self._df,
+                params=cfg.parameters,
+                objectives=cfg.objectives,
+                suggestions=None,
+                study_config=cfg,
+            )
+            if self._validation_results is not None:
+                try:
+                    self._design_space_dlg.set_validation_results(
+                        self._validation_results
+                    )
+                except Exception:
+                    pass
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Trial invalidation / surrogate rebuild
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _on_trial_checkbox_changed(self, item: QTableWidgetItem) -> None:
+        """Update _invalid_trial_numbers and the Invalidate button label."""
+        if item.column() != 0 or not (item.flags() & Qt.ItemIsUserCheckable):
+            return
+        row = item.row()
+        # Trial number is in column 1 (offset=1 due to checkbox in col 0)
+        trial_num_item = self._trials_table.item(row, 1)
+        if trial_num_item is None:
+            return
+        try:
+            trial_num = int(trial_num_item.text())
+        except ValueError:
+            return
+
+        from PySide6.QtGui import QColor
+        _INVALID_BG = QColor("#3d1a1a")
+
+        if item.checkState() == Qt.Unchecked:
+            self._invalid_trial_numbers.add(trial_num)
+            # Colour the whole row red
+            for c in range(self._trials_table.columnCount()):
+                it = self._trials_table.item(row, c)
+                if it:
+                    it.setBackground(_INVALID_BG)
+        else:
+            self._invalid_trial_numbers.discard(trial_num)
+            # Restore default background
+            for c in range(self._trials_table.columnCount()):
+                it = self._trials_table.item(row, c)
+                if it:
+                    it.setBackground(
+                        self._trials_table.palette().color(
+                            self._trials_table.palette().ColorRole.Base
+                            if row % 2 == 0
+                            else self._trials_table.palette().ColorRole.AlternateBase
+                        )
+                    )
+
+        n_invalid = len(self._invalid_trial_numbers)
+        self._invalidate_btn.setText(
+            f"🗑 Invalidate Unchecked ({n_invalid})"
+            if n_invalid else "🗑 Invalidate Unchecked (0)"
+        )
+
+    def _action_invalidate_unchecked(self) -> None:
+        """
+        Rebuild the Optuna study excluding all trials marked invalid (unchecked).
+
+        This is a true undo — the rebuilt surrogate is mathematically identical
+        to the state before those trials were added.
+        """
+        if not self._study or not self._session_state:
+            QMessageBox.warning(self, "No Study", "No active session.")
+            return
+
+        if not self._invalid_trial_numbers:
             QMessageBox.information(
-                self,
-                "No Data",
-                "Load a CSV and apply objectives first, then open the Design Space.",
+                self, "Nothing to Invalidate",
+                "No trials are currently unchecked.\n\n"
+                "Uncheck rows in the All Trials table to mark them as invalid,\n"
+                "then click this button to remove them from the surrogate."
             )
             return
 
-        # Create once, reuse thereafter
-        if self._design_space_dlg is None:
-            self._design_space_dlg = DesignSpaceDialog(parent=self)
+        n_invalid = len(self._invalid_trial_numbers)
+        from optuna.trial import TrialState
+        completed = [t for t in self._study.trials if t.state == TrialState.COMPLETE]
+        n_keep = len(completed) - n_invalid
 
-        cfg = self._session_state.study_config
-        self._design_space_dlg.refresh(
-            df=self._df,
-            params=cfg.parameters,
-            objectives=cfg.objectives,
-            suggestions=None,   # suggestions already set by _refresh_design_space if pending
-            study_config=cfg,
+        reply = QMessageBox.question(
+            self, "Invalidate Trials?",
+            f"Remove {n_invalid} unchecked trial(s) from the surrogate model?\n\n"
+            f"The study will be rebuilt with {n_keep} remaining trial(s).\n"
+            f"This is reversible only by reloading the CSV or session.\n\n"
+            f"Trial numbers to remove: {sorted(self._invalid_trial_numbers)}",
+            QMessageBox.Yes | QMessageBox.No,
         )
-        # Push any validation results from the Results tab into the dialog
-        if self._validation_results is not None:
-            try:
-                self._design_space_dlg.set_validation_results(
-                    self._validation_results
-                )
-            except Exception:
-                pass
-        self._design_space_dlg.show()
-        self._design_space_dlg.raise_()
-        self._design_space_dlg.activateWindow()
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            cfg = self._session_state.study_config
+            # Build trial_dicts from surviving COMPLETE trials only
+            surviving = [t for t in completed
+                         if t.number not in self._invalid_trial_numbers]
+            trial_dicts = []
+            for t in surviving:
+                values = list(t.values) if t.values else ([t.value] if t.value is not None else [])
+                trial_dicts.append({
+                    "params": dict(t.params),
+                    "values": values,
+                    "user_attrs": dict(t.user_attrs) if t.user_attrs else {},
+                })
+
+            self._study = rebuild_study_without_trials(
+                cfg,
+                self._session_state.storage_path,
+                self._session_state.study_name,
+                trial_dicts,
+            )
+            self._invalid_trial_numbers.clear()
+            self._invalidate_btn.setText("🗑 Invalidate Unchecked (0)")
+
+            self._refresh_results_tables()
+            self._update_status_bar()
+            self._set_status(
+                f"Surrogate rebuilt: {n_keep} trial(s) kept, "
+                f"{n_invalid} removed.  Surrogate is now at t-{n_invalid} state."
+            )
+            _log.info("Invalidated %d trial(s); study rebuilt with %d.", n_invalid, n_keep)
+        except Exception as exc:
+            QMessageBox.critical(self, "Rebuild Error", str(exc))
+
+    def _action_rebuild_from_csv(self) -> None:
+        """
+        Nuclear option: delete ALL trials and rebuild the study from the
+        current CSV.  Use when the CSV has been cleaned (bad rows removed).
+        """
+        if not self._study or not self._session_state:
+            QMessageBox.warning(self, "No Study", "No active session.")
+            return
+        if self._df is None or self._df.empty:
+            QMessageBox.warning(
+                self, "No CSV",
+                "No CSV data is currently loaded.\n"
+                "Load a cleaned CSV first, then click Rebuild from CSV."
+            )
+            return
+
+        from optuna.trial import TrialState
+        n_existing = len([t for t in self._study.trials if t.state == TrialState.COMPLETE])
+        reply = QMessageBox.question(
+            self, "Rebuild Study from CSV?",
+            f"Delete all {n_existing} existing trial(s) and rebuild the\n"
+            f"surrogate from the current CSV ({len(self._df)} rows)?\n\n"
+            "Use this when you have already cleaned the CSV by removing\n"
+            "bad rows.  All in-memory trial history will be replaced.\n\n"
+            "This cannot be undone without reloading the original session.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            cfg = self._session_state.study_config
+            trial_dicts = load_trials_from_csv(self._df, cfg)
+            self._study = rebuild_study_without_trials(
+                cfg,
+                self._session_state.storage_path,
+                self._session_state.study_name,
+                trial_dicts,
+            )
+            self._invalid_trial_numbers.clear()
+            self._invalidate_btn.setText("🗑 Invalidate Unchecked (0)")
+
+            self._refresh_results_tables()
+            self._update_status_bar()
+            n_new = len([t for t in self._study.trials if t.state == TrialState.COMPLETE])
+            self._set_status(
+                f"Study rebuilt from CSV: {n_new} trial(s) loaded "
+                f"(was {n_existing})."
+            )
+            _log.info("Rebuilt study from CSV: %d → %d trials.", n_existing, n_new)
+        except Exception as exc:
+            QMessageBox.critical(self, "Rebuild Error", str(exc))
+
+    def _action_restore_all_valid(self) -> None:
+        """Re-check all rows in the All Trials table (undo all unchecking)."""
+        self._invalid_trial_numbers.clear()
+        # Unblock signals temporarily so we don't re-trigger _on_trial_checkbox_changed
+        self._trials_table.blockSignals(True)
+        for r in range(self._trials_table.rowCount()):
+            cb_item = self._trials_table.item(r, 0)
+            if cb_item and (cb_item.flags() & Qt.ItemIsUserCheckable):
+                cb_item.setCheckState(Qt.Checked)
+        self._trials_table.blockSignals(False)
+        # Restore all row backgrounds
+        self._refresh_results_tables()
+        self._invalidate_btn.setText("🗑 Invalidate Unchecked (0)")
+        self._set_status("All trials restored to valid state.")
 
     def _action_about(self) -> None:
         QMessageBox.information(

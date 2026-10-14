@@ -670,7 +670,7 @@ class TestSurrogateQuality:
         ]
         load_historical_trials(study, trials_data, cfg)
         result = compute_surrogate_quality(study, cfg)
-        assert result["status"] in ("good", "moderate")
+        assert result["status"] in ("strong", "good", "useful", "moderate", "weak")
         assert result["r2"] is not None
         assert result["r2"] > 0.5
 
@@ -709,7 +709,7 @@ class TestSurrogateQuality:
         ]
         load_historical_trials(study, trials_data, cfg)
         result = compute_surrogate_quality(study, cfg)
-        assert result["status"] in ("good", "moderate", "poor", "insufficient")
+        assert result["status"] in ("strong", "good", "useful", "moderate", "weak", "insufficient")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

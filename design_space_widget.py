@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QSizeGrip,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -962,6 +964,15 @@ class ConvergenceWidget(QWidget):
             col = obj_colours[obj_idx % len(obj_colours)]
             arrow = "\u2193" if direction == "minimize" else "\u2191"
             label = f"{obj.column_name} ({arrow})"
+
+            # ── Individual trial values (semi-transparent dots) ────────────
+            # Shown under the running-best line so the user can see the full
+            # spread of observations.  This is especially informative for
+            # CSV-loaded datasets where the "trial order" is just the CSV row
+            # order rather than a true sequential BO trajectory.
+            ax.scatter(trial_numbers, values,
+                       color=col, s=10, alpha=0.25, zorder=2,
+                       linewidths=0)
 
             ax.step(trial_numbers, running_best, where="post",
                     color=col, linewidth=2.0, label=label, zorder=3)
@@ -1962,6 +1973,886 @@ class ParetoWidget(QWidget):
         self._canvas.show()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Dry-run Benchmark Worker + Widget
+# ══════════════════════════════════════════════════════════════════════════════
+
+from PySide6.QtCore import Signal as _Signal, QThread as _QThread
+
+
+class _BenchmarkWorker(_QThread):
+    """
+    Background thread that runs one Optuna study per sampler on a benchmark
+    function and emits convergence data when done.
+    """
+
+    progress = _Signal(str)          # human-readable status message
+    done     = _Signal(dict)         # {sampler_name: [best_so_far, ...]}
+    error    = _Signal(str)
+
+    def __init__(
+        self,
+        func_name: str,
+        n_inputs: int,
+        n_objectives: int,
+        n_context: int,
+        n_trials: int,
+        seed: int,
+        sampler_names: list,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.func_name     = func_name
+        self.n_inputs      = n_inputs
+        self.n_objectives  = n_objectives
+        self.n_context     = n_context
+        self.n_trials      = n_trials
+        self.seed          = seed
+        self.sampler_names = sampler_names
+        self._abort        = False
+
+    def stop(self) -> None:
+        self._abort = True
+
+    def run(self) -> None:  # noqa: N802
+        try:
+            import optuna as _optuna
+            from optuna.distributions import FloatDistribution
+            from benchmark_math import evaluate, auto_select_benchmark, BENCHMARK_N_OBJ
+
+            _optuna.logging.set_verbosity(_optuna.logging.ERROR)
+
+            func = self.func_name
+            if func == "Auto":
+                func = auto_select_benchmark(self.n_inputs, self.n_objectives)
+
+            # Effective dimensionality = n_inputs + n_context (context vars ignored by objective)
+            d = max(self.n_inputs + self.n_context, 2)
+            n_obj = BENCHMARK_N_OBJ.get(func, 1)
+
+            # Build distributions dict
+            dists = {f"x{i}": FloatDistribution(0.0, 1.0) for i in range(d)}
+
+            # Objective callable
+            def _objective(trial):
+                x = [trial.suggest_float(f"x{i}", 0.0, 1.0) for i in range(d)]
+                result = evaluate(x, func, n_obj=n_obj)
+                if isinstance(result, list):
+                    return result
+                return [result]
+
+            directions = ["minimize"] * n_obj
+            results: dict = {}
+
+            for s_name in self.sampler_names:
+                if self._abort:
+                    return
+                self.progress.emit(f"Running {s_name} on {func}…")
+
+                sampler = _make_benchmark_sampler(s_name, self.seed, n_obj)
+                study = _optuna.create_study(
+                    directions=directions,
+                    sampler=sampler,
+                )
+
+                convergence: list = []
+                best = float("inf") if n_obj == 1 else None
+                hv_vals: list = []
+
+                for trial_num in range(self.n_trials):
+                    if self._abort:
+                        return
+                    try:
+                        study.optimize(_objective, n_trials=1, show_progress_bar=False)
+                        t = study.trials[-1]
+                        if t.values:
+                            if n_obj == 1:
+                                v = t.values[0]
+                                if v is not None and v == v:  # not NaN
+                                    best = min(best, v)
+                                convergence.append(best)
+                            else:
+                                # Track hypervolume
+                                from benchmark_math import compute_hypervolume
+                                all_vals = [
+                                    tr.values for tr in study.trials
+                                    if tr.values and all(v is not None for v in tr.values)
+                                ]
+                                if all_vals:
+                                    hv = compute_hypervolume(all_vals)
+                                else:
+                                    hv = 0.0
+                                convergence.append(hv)
+                    except Exception:
+                        if convergence:
+                            convergence.append(convergence[-1])
+                        else:
+                            convergence.append(float("nan"))
+
+                results[s_name] = convergence
+
+            self.done.emit(results)
+
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+def _make_benchmark_sampler(name: str, seed: int, n_obj: int):
+    """
+    Return an Optuna sampler object by name.
+    NSGAIISampler does not accept a *seed* keyword in all Optuna versions, so
+    we try with seed first and fall back to the no-seed constructor.
+    """
+    import optuna as _optuna
+    if name == "TPE":
+        return _optuna.samplers.TPESampler(seed=seed)
+    elif name == "Random":
+        return _optuna.samplers.RandomSampler(seed=seed)
+    elif name == "CmaEs" and n_obj == 1:
+        return _optuna.samplers.CmaEsSampler(seed=seed)
+    elif name == "NSGAii":
+        try:
+            return _optuna.samplers.NSGAIISampler(seed=seed)
+        except TypeError:
+            return _optuna.samplers.NSGAIISampler()
+    elif name == "QMC":
+        try:
+            return _optuna.samplers.QMCSampler(seed=seed)
+        except TypeError:
+            return _optuna.samplers.QMCSampler()
+    else:
+        return _optuna.samplers.TPESampler(seed=seed)
+
+
+class BenchmarkWidget(QWidget):
+    """
+    Dry-run benchmark tab.
+
+    Lets the user configure a synthetic problem (N inputs, N objectives,
+    N context), pick a benchmark function, and compare several samplers
+    side-by-side via an embedded convergence plot.  No real data required.
+
+    Public API
+    ----------
+    refresh(n_inputs_hint=4)
+        Pre-fill the N-inputs spinbox from the current study (optional).
+    clear()
+        Reset the canvas to placeholder state.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._worker: Optional[_BenchmarkWorker] = None
+        self._build_ui()
+
+    # ── UI construction ────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        from benchmark_math import ALL_BENCHMARKS
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # ── Settings toggle (always visible) ──────────────────────────────
+        self._settings_toggle_btn = QPushButton("⚙  Settings  ▸")
+        self._settings_toggle_btn.setFixedHeight(24)
+        self._settings_toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 2px 8px; font-size: 11px; }"
+        )
+        self._settings_toggle_btn.setToolTip("Expand / collapse benchmark configuration.")
+        self._settings_toggle_btn.clicked.connect(self._toggle_settings)
+        layout.addWidget(self._settings_toggle_btn)
+
+        # ── Controls container (hidden by default) ─────────────────────────
+        self._settings_container = QWidget()
+        _ctrl_outer = QVBoxLayout(self._settings_container)
+        _ctrl_outer.setContentsMargins(0, 0, 0, 0)
+        _ctrl_outer.setSpacing(0)
+
+        ctrl_grp = QGroupBox("Benchmark Settings")
+        ctrl_form = QGridLayout(ctrl_grp)
+        ctrl_form.setSpacing(6)
+
+        row = 0
+        ctrl_form.addWidget(QLabel("N inputs:"), row, 0)
+        self._n_inputs_spin = QSpinBox()
+        self._n_inputs_spin.setRange(2, 20)
+        self._n_inputs_spin.setValue(4)
+        self._n_inputs_spin.setToolTip("Number of controllable input parameters.")
+        ctrl_form.addWidget(self._n_inputs_spin, row, 1)
+
+        ctrl_form.addWidget(QLabel("N objectives:"), row, 2)
+        self._n_obj_spin = QSpinBox()
+        self._n_obj_spin.setRange(1, 3)
+        self._n_obj_spin.setValue(1)
+        self._n_obj_spin.setToolTip(
+            "1 → single-objective (Branin/Hartmann/Ackley)\n"
+            "2 → bi-objective ZDT1/ZDT2\n"
+            "3 → tri-objective DTLZ2"
+        )
+        self._n_obj_spin.valueChanged.connect(self._on_config_changed)
+        ctrl_form.addWidget(self._n_obj_spin, row, 3)
+
+        ctrl_form.addWidget(QLabel("N context:"), row, 4)
+        self._n_ctx_spin = QSpinBox()
+        self._n_ctx_spin.setRange(0, 5)
+        self._n_ctx_spin.setValue(0)
+        self._n_ctx_spin.setToolTip(
+            "Extra noise dimensions appended to the input vector.\n"
+            "Context variables are passed to the benchmark but ignored by the objective."
+        )
+        ctrl_form.addWidget(self._n_ctx_spin, row, 5)
+
+        row += 1
+        ctrl_form.addWidget(QLabel("Benchmark:"), row, 0)
+        self._func_combo = QComboBox()
+        self._func_combo.addItem("Auto")
+        for b in ALL_BENCHMARKS:
+            self._func_combo.addItem(b)
+        self._func_combo.setToolTip(
+            "Auto: chooses based on N inputs / N objectives.\n"
+            "Branin: 2-D, 1-objective classic.\n"
+            "Hartmann6: 6-D, 1-objective.\n"
+            "Ackley: any-D, 1-objective, many local minima.\n"
+            "ZDT1/ZDT2: 2-objective, any-D.\n"
+            "DTLZ2: 3-objective, any-D."
+        )
+        ctrl_form.addWidget(self._func_combo, row, 1)
+
+        ctrl_form.addWidget(QLabel("N trials:"), row, 2)
+        self._n_trials_spin = QSpinBox()
+        self._n_trials_spin.setRange(5, 500)
+        self._n_trials_spin.setValue(50)
+        self._n_trials_spin.setToolTip("Number of BO trials per sampler.")
+        ctrl_form.addWidget(self._n_trials_spin, row, 3)
+
+        ctrl_form.addWidget(QLabel("Seed:"), row, 4)
+        self._seed_spin = QSpinBox()
+        self._seed_spin.setRange(0, 99999)
+        self._seed_spin.setValue(42)
+        ctrl_form.addWidget(self._seed_spin, row, 5)
+
+        row += 1
+        ctrl_form.addWidget(QLabel("Samplers:"), row, 0)
+        self._sampler_checks: dict = {}
+        sampler_col = 1
+        for s in ["TPE", "Random", "CmaEs", "NSGAii", "QMC"]:
+            cb = QCheckBox(s)
+            cb.setChecked(s in ("TPE", "Random", "QMC"))
+            self._sampler_checks[s] = cb
+            ctrl_form.addWidget(cb, row, sampler_col)
+            sampler_col += 1
+
+        _ctrl_outer.addWidget(ctrl_grp)
+        self._settings_container.hide()   # collapsed by default
+        layout.addWidget(self._settings_container)
+
+        # ── Run button (always visible, outside collapsible section) ──────
+        self._run_btn = QPushButton("▶  Run Benchmark")
+        self._run_btn.setMinimumHeight(34)
+        self._run_btn.clicked.connect(self._action_run)
+        layout.addWidget(self._run_btn)
+
+        # ── Status label ──────────────────────────────────────────────────
+        self._status_lbl = QLabel("")
+        self._status_lbl.setStyleSheet(f"color: {_FG}; font-size: 11px;")
+        layout.addWidget(self._status_lbl)
+
+        # ── Canvas ────────────────────────────────────────────────────────
+        self._fig = Figure(facecolor=_BG, layout="constrained")
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setStyleSheet(f"background-color: {_BG};")
+        layout.addWidget(self._canvas, stretch=1)
+
+        # ── Placeholder ───────────────────────────────────────────────────
+        self._placeholder = QLabel(
+            "Configure a benchmark above and click ▶ Run Benchmark."
+        )
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setStyleSheet(
+            f"color: {_FG}; font-size: 13px; font-style: italic;"
+        )
+        layout.addWidget(self._placeholder)
+        self._canvas.hide()
+
+        self._on_config_changed()
+
+    def _toggle_settings(self) -> None:
+        """Show/hide the collapsible settings group box."""
+        if self._settings_container.isVisible():
+            self._settings_container.hide()
+            self._settings_toggle_btn.setText("⚙  Settings  ▸")
+        else:
+            self._settings_container.show()
+            self._settings_toggle_btn.setText("⚙  Settings  ▾")
+
+    def _on_config_changed(self) -> None:
+        """Enable/disable CmaEs and NSGAii checkboxes based on N objectives."""
+        n_obj = self._n_obj_spin.value()
+        self._sampler_checks["CmaEs"].setEnabled(n_obj == 1)
+        self._sampler_checks["NSGAii"].setEnabled(n_obj > 1)
+        if n_obj > 1:
+            self._sampler_checks["CmaEs"].setChecked(False)
+        if n_obj == 1:
+            self._sampler_checks["NSGAii"].setChecked(False)
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def refresh(self, n_inputs_hint: int = 4) -> None:
+        """Pre-fill N inputs from the current study (called by DesignSpaceDialog)."""
+        self._n_inputs_spin.setValue(max(2, n_inputs_hint))
+
+    def clear(self) -> None:
+        self._fig.clear()
+        self._canvas.draw_idle()
+        self._canvas.hide()
+        self._placeholder.show()
+        self._status_lbl.setText("")
+
+    # ── Actions ────────────────────────────────────────────────────────────
+
+    def _action_run(self) -> None:
+        # Stop any running worker
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.stop()
+            self._worker.wait(2000)
+
+        selected = [s for s, cb in self._sampler_checks.items() if cb.isChecked()]
+        if not selected:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "No Samplers", "Select at least one sampler.")
+            return
+
+        self._run_btn.setEnabled(False)
+        self._status_lbl.setText("Starting benchmark…")
+        self._canvas.hide()
+        self._placeholder.hide()
+
+        self._worker = _BenchmarkWorker(
+            func_name    = self._func_combo.currentText(),
+            n_inputs     = self._n_inputs_spin.value(),
+            n_objectives = self._n_obj_spin.value(),
+            n_context    = self._n_ctx_spin.value(),
+            n_trials     = self._n_trials_spin.value(),
+            seed         = self._seed_spin.value(),
+            sampler_names= selected,
+            parent       = self,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.done.connect(self._on_done)
+        self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(lambda: self._run_btn.setEnabled(True))
+        self._worker.start()
+
+    def _on_progress(self, msg: str) -> None:
+        self._status_lbl.setText(msg)
+
+    def _on_error(self, msg: str) -> None:
+        self._status_lbl.setText(f"❌  Error: {msg[:120]}")
+        self._run_btn.setEnabled(True)
+
+    def _on_done(self, results: dict) -> None:
+        """Draw convergence lines for all samplers."""
+        from benchmark_math import auto_select_benchmark, BENCHMARK_N_OBJ
+
+        func = self._func_combo.currentText()
+        n_obj = self._n_obj_spin.value()
+        if func == "Auto":
+            func = auto_select_benchmark(self._n_inputs_spin.value(), n_obj)
+
+        is_multi = BENCHMARK_N_OBJ.get(func, 1) > 1
+        y_label = "Hypervolume ↑" if is_multi else "Best objective value ↓"
+
+        self._fig.clear()
+        ax = self._fig.add_subplot(111)
+        ax.set_facecolor(_AX_BG)
+        for spine in ax.spines.values():
+            spine.set_color(_GRID)
+        ax.tick_params(colors=_FG, labelsize=8)
+        ax.grid(color=_GRID, linewidth=0.5, alpha=0.5)
+
+        # ── Determine winner (best final convergence value) ────────────────
+        best_s_name: Optional[str] = None
+        best_final: Optional[float] = None
+        for s_name, conv in results.items():
+            if not conv:
+                continue
+            final = conv[-1]
+            if not np.isfinite(final):
+                continue
+            if best_final is None:
+                best_final, best_s_name = final, s_name
+            elif is_multi:
+                if final > best_final:  # higher HV is better
+                    best_final, best_s_name = final, s_name
+            else:
+                if final < best_final:  # lower value is better
+                    best_final, best_s_name = final, s_name
+
+        palette = [_HIST, _SUGGEST, _PARETO, _SUGGEST2, "#cba6f7", "#94e2d5"]
+        for idx, (s_name, conv) in enumerate(results.items()):
+            if not conv:
+                continue
+            is_winner = (s_name == best_s_name)
+            xs = list(range(1, len(conv) + 1))
+            col = palette[idx % len(palette)]
+            lw  = 1.6 if is_winner else 0.9
+            ax.step(xs, conv, where="post",
+                    color=col, linewidth=lw,
+                    label=s_name + (" ★" if is_winner else ""),
+                    alpha=1.0 if is_winner else 0.75,
+                    zorder=4 if is_winner else 3)
+            # Small end-point dot
+            ax.scatter(xs[-1:], conv[-1:],
+                       color=col, s=40 if is_winner else 10,
+                       zorder=5, alpha=1.0)
+            # Annotate winner's final value
+            if is_winner and np.isfinite(conv[-1]):
+                ax.annotate(
+                    f" {conv[-1]:.4g}",
+                    xy=(xs[-1], conv[-1]),
+                    color=col, fontsize=8, fontweight="bold",
+                    va="center", ha="left",
+                    zorder=6,
+                )
+
+        n_trials = self._n_trials_spin.value()
+        n_inputs = self._n_inputs_spin.value()
+        n_ctx    = self._n_ctx_spin.value()
+        ctx_str  = f" + {n_ctx} ctx" if n_ctx else ""
+
+        ax.set_xlabel("Trial number", color=_FG, fontsize=9)
+        ax.set_ylabel(y_label, color=_FG, fontsize=9)
+        ax.set_title(
+            f"Benchmark: {func}  ·  d={n_inputs}{ctx_str}  ·  {n_obj} obj  ·  {n_trials} trials",
+            color=_FG, fontsize=9, pad=6,
+        )
+        ax.xaxis.label.set_color(_FG)
+        ax.yaxis.label.set_color(_FG)
+        if results:
+            ax.legend(loc="best", facecolor=_BG, edgecolor=_GRID,
+                      labelcolor=_FG, fontsize=8)
+
+        self._fig.patch.set_facecolor(_BG)
+        self._canvas.draw_idle()
+        self._canvas.show()
+        self._placeholder.hide()
+        winner_note = f"  ·  Winner: {best_s_name}" if best_s_name else ""
+        self._status_lbl.setText(
+            f"✅  Done — {len(results)} sampler(s) × {n_trials} trials on {func}{winner_note}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Live Sampler Comparison Worker + Widget
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _SamplerCompareWorker(_QThread):
+    """Background thread for compare_samplers_on_data()."""
+
+    progress = _Signal(str, int)   # (message, pct 0–100)
+    done     = _Signal(dict)
+    error    = _Signal(str)
+
+    def __init__(self, study, config, sampler_names, n_sim_trials, seed, parent=None):
+        super().__init__(parent)
+        self._study        = study
+        self._config       = config
+        self._samplers     = sampler_names
+        self._n_sim        = n_sim_trials
+        self._seed         = seed
+
+    def run(self) -> None:  # noqa: N802
+        try:
+            from surrogate_quality import compare_samplers_on_data
+
+            def _cb(name: str, pct: int) -> None:
+                self.progress.emit(f"Comparing {name}…", pct)
+
+            results = compare_samplers_on_data(
+                study        = self._study,
+                config       = self._config,
+                sampler_names= self._samplers,
+                n_sim_trials = self._n_sim,
+                seed         = self._seed,
+                progress_cb  = _cb,
+            )
+            self.done.emit(results)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class SamplerComparisonWidget(QWidget):
+    """
+    Live sampler comparison tab.
+
+    Runs a virtual BO loop on the currently loaded real data using a Random
+    Forest surrogate and compares multiple Optuna samplers side by side.
+
+    Plots
+    -----
+    Top  : convergence curves (best value or hypervolume per simulated trial)
+    Bottom: bar chart — CV R², Spearman ρ, RMSE per sampler
+
+    One-click switch
+    ----------------
+    After running, the user selects a sampler in the combo and clicks
+    "🔀 Use This Sampler" — emits `sampler_switch_requested(str)`.
+
+    Public API
+    ----------
+    set_study(study, config)
+        Called from DesignSpaceDialog when the active study changes.
+    clear()
+        Reset to placeholder state.
+
+    Signals
+    -------
+    sampler_switch_requested(str)   — sampler name chosen by the user
+    """
+
+    sampler_switch_requested = _Signal(str)
+
+    _SAMPLER_NAMES = ["TPE", "Random", "CmaEs", "NSGAii", "QMC"]
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._study  = None
+        self._config = None
+        self._worker: Optional[_SamplerCompareWorker] = None
+        self._last_results: Optional[dict] = None
+        self._build_ui()
+
+    # ── UI construction ────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # ── Settings toggle (always visible) ──────────────────────────────
+        self._settings_toggle_btn = QPushButton("⚙  Settings  ▸")
+        self._settings_toggle_btn.setFixedHeight(24)
+        self._settings_toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 2px 8px; font-size: 11px; }"
+        )
+        self._settings_toggle_btn.setToolTip("Expand / collapse comparison configuration.")
+        self._settings_toggle_btn.clicked.connect(self._toggle_settings)
+        layout.addWidget(self._settings_toggle_btn)
+
+        # ── Controls container (hidden by default) ─────────────────────────
+        self._settings_container = QWidget()
+        _ctrl_outer = QVBoxLayout(self._settings_container)
+        _ctrl_outer.setContentsMargins(0, 0, 0, 0)
+        _ctrl_outer.setSpacing(0)
+
+        ctrl_grp = QGroupBox("Comparison Settings")
+        ctrl_grid = QGridLayout(ctrl_grp)
+        ctrl_grid.setSpacing(6)
+
+        ctrl_grid.addWidget(QLabel("Sim trials:"), 0, 0)
+        self._n_sim_spin = QSpinBox()
+        self._n_sim_spin.setRange(5, 200)
+        self._n_sim_spin.setValue(30)
+        self._n_sim_spin.setToolTip(
+            "Number of virtual forward BO steps per sampler.\n"
+            "Each step asks the sampler for a suggestion, evaluates it\n"
+            "with an RF surrogate, and tells the result back."
+        )
+        ctrl_grid.addWidget(self._n_sim_spin, 0, 1)
+
+        ctrl_grid.addWidget(QLabel("Seed:"), 0, 2)
+        self._seed_spin = QSpinBox()
+        self._seed_spin.setRange(0, 99999)
+        self._seed_spin.setValue(42)
+        ctrl_grid.addWidget(self._seed_spin, 0, 3)
+
+        ctrl_grid.addWidget(QLabel("Samplers:"), 1, 0)
+        self._sampler_checks: dict = {}
+        col = 1
+        for s in self._SAMPLER_NAMES:
+            cb = QCheckBox(s)
+            cb.setChecked(s in ("TPE", "Random", "QMC"))
+            self._sampler_checks[s] = cb
+            ctrl_grid.addWidget(cb, 1, col)
+            col += 1
+
+        _ctrl_outer.addWidget(ctrl_grp)
+        self._settings_container.hide()   # collapsed by default
+        layout.addWidget(self._settings_container)
+
+        # ── Run button (always visible, outside collapsible section) ──────
+        self._run_btn = QPushButton("▶  Compare Samplers")
+        self._run_btn.setMinimumHeight(34)
+        self._run_btn.setEnabled(False)
+        self._run_btn.setToolTip(
+            "Run a virtual BO comparison using the loaded real data as ground truth.\n"
+            "Requires ≥ 10 completed trials in the current study."
+        )
+        self._run_btn.clicked.connect(self._action_run)
+        layout.addWidget(self._run_btn)
+
+        # ── Status ────────────────────────────────────────────────────────
+        self._status_lbl = QLabel("")
+        self._status_lbl.setStyleSheet(f"color: {_FG}; font-size: 11px;")
+        layout.addWidget(self._status_lbl)
+
+        # ── Canvas ────────────────────────────────────────────────────────
+        self._fig = Figure(facecolor=_BG, layout="constrained")
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setStyleSheet(f"background-color: {_BG};")
+        layout.addWidget(self._canvas, stretch=1)
+
+        # ── Switch row (hidden until results are available) ───────────────
+        self._switch_grp = QGroupBox("Switch Active Sampler")
+        switch_row = QHBoxLayout(self._switch_grp)
+        switch_row.addWidget(QLabel("Use sampler:"))
+        self._switch_combo = QComboBox()
+        self._switch_combo.setFixedWidth(180)
+        switch_row.addWidget(self._switch_combo)
+        self._switch_btn = QPushButton("🔀  Use This Sampler")
+        self._switch_btn.setFixedWidth(180)
+        switch_row.addWidget(self._switch_btn)
+        switch_row.addStretch()
+        self._switch_grp.hide()
+        layout.addWidget(self._switch_grp)
+
+        # ── Placeholder ───────────────────────────────────────────────────
+        self._placeholder = QLabel(
+            "Load data and apply objectives to enable sampler comparison.\n"
+            "Requires ≥ 10 completed trials in the active study."
+        )
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setStyleSheet(
+            f"color: {_FG}; font-size: 13px; font-style: italic;"
+        )
+        layout.addWidget(self._placeholder)
+        self._canvas.hide()
+
+    def _toggle_settings(self) -> None:
+        """Show/hide the collapsible settings group box."""
+        if self._settings_container.isVisible():
+            self._settings_container.hide()
+            self._settings_toggle_btn.setText("⚙  Settings  ▸")
+        else:
+            self._settings_container.show()
+            self._settings_toggle_btn.setText("⚙  Settings  ▾")
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def set_study(self, study, config) -> None:
+        """Called from DesignSpaceDialog when the active study/config changes."""
+        self._study  = study
+        self._config = config
+
+        if study is None or config is None:
+            self._run_btn.setEnabled(False)
+            self._status_lbl.setText("")
+            return
+
+        # Check if there are enough completed trials
+        try:
+            from optuna.trial import TrialState
+            n = len([t for t in study.trials if t.state == TrialState.COMPLETE])
+        except Exception:
+            n = 0
+
+        if n >= 10:
+            self._run_btn.setEnabled(True)
+            self._status_lbl.setText(
+                f"{n} completed trials available — click ▶ Compare Samplers."
+            )
+        else:
+            self._run_btn.setEnabled(False)
+            self._status_lbl.setText(
+                f"Need ≥ 10 completed trials ({n} so far)."
+            )
+
+    def clear(self) -> None:
+        self._study  = None
+        self._config = None
+        self._last_results = None
+        self._run_btn.setEnabled(False)
+        self._status_lbl.setText("")
+        self._fig.clear()
+        self._canvas.draw_idle()
+        self._canvas.hide()
+        self._switch_grp.hide()
+        self._placeholder.setText(
+            "Load data and apply objectives to enable sampler comparison.\n"
+            "Requires ≥ 10 completed trials in the active study."
+        )
+        self._placeholder.show()
+
+    # ── Actions ────────────────────────────────────────────────────────────
+
+    def _action_run(self) -> None:
+        if self._study is None or self._config is None:
+            return
+
+        selected = [s for s, cb in self._sampler_checks.items() if cb.isChecked()]
+        if not selected:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "No Samplers", "Select at least one sampler.")
+            return
+
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.wait(2000)
+
+        self._run_btn.setEnabled(False)
+        self._switch_grp.hide()
+        self._canvas.hide()
+        self._placeholder.hide()
+        self._status_lbl.setText("Starting comparison…")
+
+        self._worker = _SamplerCompareWorker(
+            study        = self._study,
+            config       = self._config,
+            sampler_names= selected,
+            n_sim_trials = self._n_sim_spin.value(),
+            seed         = self._seed_spin.value(),
+            parent       = self,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.done.connect(self._on_done)
+        self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(lambda: self._run_btn.setEnabled(True))
+        self._worker.start()
+
+    def _on_progress(self, msg: str, pct: int) -> None:
+        self._status_lbl.setText(f"{msg}  ({pct}%)")
+
+    def _on_error(self, msg: str) -> None:
+        self._status_lbl.setText(f"❌  {msg[:180]}")
+        self._run_btn.setEnabled(True)
+
+    def _on_done(self, results: dict) -> None:
+        self._last_results = results
+
+        # First sampler's data carries the shared quality metrics + holdout scatter
+        first_data = next(iter(results.values()), {})
+        y_true  = first_data.get("y_true_holdout")
+        y_pred  = first_data.get("y_pred_holdout")
+        r2      = first_data.get("r2")
+        rmse    = first_data.get("rmse")
+        pr      = first_data.get("pearson_r")
+        status  = first_data.get("status", "insufficient")
+
+        has_scatter = (y_true is not None and y_pred is not None
+                       and len(y_true) >= 2)
+        has_metrics = r2 is not None
+
+        # Build figure: top = scatter, bottom = quality bar chart (if available)
+        self._fig.clear()
+        n_rows = 2 if has_metrics else 1
+        axes_list = self._fig.subplots(n_rows, 1)
+        if n_rows == 1:
+            axes_list = [axes_list]
+
+        # Top panel: predicted vs actual (30% hold-out)
+        ax_top = axes_list[0]
+        ax_top.set_facecolor(_AX_BG)
+        for spine in ax_top.spines.values():
+            spine.set_color(_GRID)
+        ax_top.tick_params(colors=_FG, labelsize=9)
+        ax_top.grid(color=_GRID, linewidth=0.5, alpha=0.5)
+        ax_top.xaxis.label.set_color(_FG)
+        ax_top.yaxis.label.set_color(_FG)
+
+        if has_scatter:
+            from scipy.stats import pearsonr as _pearsonr
+            ax_top.scatter(y_true, y_pred, color=_HIST, s=30,
+                           alpha=0.72, edgecolors="none", zorder=3)
+            lo = float(min(y_true.min(), y_pred.min()))
+            hi = float(max(y_true.max(), y_pred.max()))
+            pad = (hi - lo) * 0.05 if hi > lo else 1.0
+            ax_top.plot([lo - pad, hi + pad], [lo - pad, hi + pad],
+                        color=_FG, linewidth=0.9, linestyle="--",
+                        alpha=0.45, label="Perfect")
+            try:
+                ho_r, _ = _pearsonr(y_true, y_pred)
+            except Exception:
+                ho_r = float("nan")
+            ho_rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+            ax_top.text(
+                0.97, 0.05,
+                f"r = {ho_r:.3f}\nRMSE = {ho_rmse:.4g}",
+                transform=ax_top.transAxes, ha="right", va="bottom",
+                fontsize=8, color=_FG,
+                bbox=dict(boxstyle="round,pad=0.3",
+                          fc=_AX_BG, ec=_GRID, alpha=0.8),
+            )
+            obj_name = (
+                self._config.objectives[0].column_name
+                if self._config and getattr(self._config, "objectives", [])
+                else "Objective"
+            )
+            ax_top.set_xlabel(f"Actual  {obj_name}", fontsize=8)
+            ax_top.set_ylabel(f"Predicted  {obj_name}", fontsize=8)
+            ax_top.set_title(
+                f"Surrogate: Predicted vs Actual  (30% hold-out, n={len(y_true)})",
+                color=_FG, fontsize=9, pad=4,
+            )
+        else:
+            ax_top.text(
+                0.5, 0.5,
+                "Insufficient data for hold-out scatter.\n"
+                "Load ≥ 10 completed trials and run the comparison.",
+                ha="center", va="center", color=_FG, fontsize=10,
+                transform=ax_top.transAxes,
+            )
+            ax_top.set_axis_off()
+
+        # Bottom panel: surrogate quality bar chart
+        if has_metrics and n_rows == 2:
+            ax_bar = axes_list[1]
+            ax_bar.set_facecolor(_AX_BG)
+            for spine in ax_bar.spines.values():
+                spine.set_color(_GRID)
+            ax_bar.tick_params(colors=_FG, labelsize=8)
+
+            metrics = {}
+            if r2   is not None: metrics["CV R\u00b2"]     = float(np.clip(r2,   -1, 1))
+            if pr   is not None: metrics["Spearman \u03c1"] = float(np.clip(pr,   -1, 1))
+            if rmse is not None: metrics["RMSE (norm)"]     = float(
+                np.clip(rmse / (rmse + 1), 0, 1)
+            )
+
+            if metrics:
+                xs_bar   = list(range(len(metrics)))
+                m_vals   = list(metrics.values())
+                cols_bar = [
+                    _PARETO if v > 0.75 else _SUGGEST2 if v > 0.50 else _SUGGEST
+                    for v in m_vals
+                ]
+                ax_bar.bar(xs_bar, m_vals, color=cols_bar, alpha=0.85, edgecolor=_BG)
+                ax_bar.set_xticks(xs_bar)
+                ax_bar.set_xticklabels(list(metrics.keys()), color=_FG, fontsize=8)
+                ax_bar.set_ylim(0, 1.15)
+                for xi, val in zip(xs_bar, m_vals):
+                    ax_bar.text(xi, val + 0.02, f"{val:.2f}",
+                                ha="center", va="bottom", color=_FG, fontsize=8)
+                ax_bar.set_title(
+                    f"Surrogate Quality  (status: {status})"
+                    "  —  how much to trust the predicted vs actual above",
+                    color=_FG, fontsize=8, pad=4,
+                )
+                ax_bar.xaxis.label.set_color(_FG)
+                ax_bar.yaxis.label.set_color(_FG)
+                ax_bar.grid(axis="y", color=_GRID, linewidth=0.4, alpha=0.5)
+
+        self._fig.patch.set_facecolor(_BG)
+        self._canvas.draw_idle()
+        self._canvas.show()
+        self._placeholder.hide()
+
+        n_sim = self._n_sim_spin.value()
+        self._status_lbl.setText(
+            f"Done — {len(results)} sampler(s) × {n_sim} sim trials"
+        )
+
+
 class DesignSpaceDialog(QDialog):
     """
     Non-modal window hosting a tabbed interface:
@@ -1981,25 +2872,43 @@ class DesignSpaceDialog(QDialog):
         dlg.raise_()
     """
 
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setModal(False)
-        self.setWindowTitle("Design Space — LabOpt")
+    # Bubbled up from SamplerComparisonWidget
+    sampler_switch_requested = _Signal(str)
 
-        # ── Size: fit within screen ────────────────────────────────────────
-        screen = (
-            QApplication.primaryScreen()
-            if QApplication.instance() is not None
-            else None
-        )
-        if screen is not None:
-            avail = screen.availableGeometry()
-            w = min(avail.width()  - 80, 1200)
-            h = min(avail.height() - 80, 820)
+    def __init__(self, parent: QWidget | None = None,
+                 embedded: bool = False) -> None:
+        """
+        Parameters
+        ----------
+        embedded : bool
+            When True the dialog behaves as a plain QWidget embedded in a
+            layout rather than as a floating window.  Bottom buttons
+            (Fullscreen, Close) are hidden and no window chrome is shown.
+        """
+        super().__init__(parent)
+        self._embedded = embedded
+
+        if embedded:
+            # Embed as a child widget — no title bar, no resize border
+            self.setWindowFlags(Qt.Widget)
         else:
-            w, h = 1000, 720
-        self.resize(w, h)
-        self.setMinimumSize(500, 380)
+            self.setModal(False)
+            self.setWindowTitle("Design Space — LabOpt")
+
+            # ── Size: fit within screen ────────────────────────────────────
+            screen = (
+                QApplication.primaryScreen()
+                if QApplication.instance() is not None
+                else None
+            )
+            if screen is not None:
+                avail = screen.availableGeometry()
+                w = min(avail.width()  - 80, 1200)
+                h = min(avail.height() - 80, 820)
+            else:
+                w, h = 1000, 720
+            self.resize(w, h)
+            self.setMinimumSize(500, 380)
 
         # ── Validation state ──────────────────────────────────────────────
         self._validation_results = None   # ValidationResults | None
@@ -2022,16 +2931,52 @@ class DesignSpaceDialog(QDialog):
         self._tabs = QTabWidget()
 
         self._widget = DesignSpaceWidget(self)
-        self._tabs.addTab(self._widget, "📊  Design Space")
+        self._tabs.addTab(self._widget, "Design Space")
 
         self._corr_widget = CorrelationWidget(self)
-        self._tabs.addTab(self._corr_widget, "🔗  Correlation Matrix")
+        self._tabs.addTab(self._corr_widget, "Correlation Matrix")
 
         self._importance_widget = ImportanceWidget(self)
-        self._tabs.addTab(self._importance_widget, "📈  Importance")
+        self._tabs.addTab(self._importance_widget, "Parameter Importance")
 
         self._profiler_widget = ProfilerWidget(self)
-        self._tabs.addTab(self._profiler_widget, "🔮  Profiler")
+        self._tabs.addTab(self._profiler_widget, "Prediction Profiler")
+
+        # ── Convergence + Pareto tabs (always present, updated externally) ──
+        # These are at fixed positions 4 and 5 (before any validation tabs).
+        self._convergence_widget = ConvergenceWidget(self)
+        self._tabs.addTab(self._convergence_widget, "Convergence")
+
+        self._pareto_widget = ParetoWidget(self)
+        self._tabs.addTab(self._pareto_widget, "Pareto Front")
+
+        # ── Benchmark + Sampler Compare tabs (positions 6 and 7) ──────────
+        self._benchmark_widget = BenchmarkWidget(self)
+        self._tabs.addTab(self._benchmark_widget, "Benchmark")
+
+        self._sampler_compare_widget = SamplerComparisonWidget(self)
+        self._sampler_compare_widget.sampler_switch_requested.connect(
+            self.sampler_switch_requested
+        )
+        self._tabs.addTab(self._sampler_compare_widget, "Sampler Comparison")
+
+        # ── Tab selector row: compact dropdown replaces the native tab bar ──
+        # Hiding the tab bar and using a QComboBox gives a much cleaner look,
+        # especially with 8+ tabs that would otherwise overflow horizontally.
+        self._tabs.tabBar().hide()
+        self._tab_combo = QComboBox()
+        self._tab_combo.setMinimumWidth(220)
+        self._tab_combo.setToolTip("Select which analysis panel to display.")
+        for i in range(self._tabs.count()):
+            self._tab_combo.addItem(self._tabs.tabText(i))
+        # Bidirectional sync: combo → tabs and tabs → combo
+        self._tab_combo.currentIndexChanged.connect(self._tabs.setCurrentIndex)
+        self._tabs.currentChanged.connect(self._tab_combo.setCurrentIndex)
+        _tab_row = QHBoxLayout()
+        _tab_row.addWidget(QLabel("View:"))
+        _tab_row.addWidget(self._tab_combo)
+        _tab_row.addStretch()
+        vbox.addLayout(_tab_row)
 
         # ── Validation header row (ABOVE the tab widget) ───────────────────
         _val_row = QHBoxLayout()
@@ -2076,20 +3021,25 @@ class DesignSpaceDialog(QDialog):
         self._tabs.currentChanged.connect(self._on_tab_selected)
 
         # ── Bottom row: size grip + fullscreen + close ────────────────────
-        bottom_row = QHBoxLayout()
-        size_grip = QSizeGrip(self)
-        bottom_row.addWidget(size_grip, alignment=Qt.AlignLeft | Qt.AlignBottom)
-        bottom_row.addStretch()
-        self._fullscreen_btn = QPushButton("⛶  Fullscreen")
-        self._fullscreen_btn.setFixedWidth(115)
-        self._fullscreen_btn.setToolTip("Expand to fill the screen.")
-        self._fullscreen_btn.clicked.connect(self._toggle_fullscreen)
-        bottom_row.addWidget(self._fullscreen_btn)
-        close_btn = QPushButton("Close")
-        close_btn.setFixedWidth(90)
-        close_btn.clicked.connect(self.hide)
-        bottom_row.addWidget(close_btn)
-        vbox.addLayout(bottom_row)
+        # Hidden when embedded in the main window (no floating chrome needed).
+        if not embedded:
+            bottom_row = QHBoxLayout()
+            size_grip = QSizeGrip(self)
+            bottom_row.addWidget(size_grip, alignment=Qt.AlignLeft | Qt.AlignBottom)
+            bottom_row.addStretch()
+            self._fullscreen_btn = QPushButton("⛶  Fullscreen")
+            self._fullscreen_btn.setFixedWidth(115)
+            self._fullscreen_btn.setToolTip("Expand to fill the screen.")
+            self._fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+            bottom_row.addWidget(self._fullscreen_btn)
+            close_btn = QPushButton("Close")
+            close_btn.setFixedWidth(90)
+            close_btn.clicked.connect(self.hide)
+            bottom_row.addWidget(close_btn)
+            vbox.addLayout(bottom_row)
+        else:
+            # No bottom buttons in embedded mode — fullscreen not applicable.
+            self._fullscreen_btn = None
 
     # ── Fullscreen toggle ─────────────────────────────────────────────────
 
@@ -2188,6 +3138,24 @@ class DesignSpaceDialog(QDialog):
         self._importance_widget.clear()
         self._profiler_widget.clear()
 
+    def set_study(self, study, config) -> None:
+        """
+        Update the active Optuna study and config.
+
+        Passed through to SamplerComparisonWidget so the user can run a live
+        sampler comparison.  Also hints BenchmarkWidget with the number of
+        enabled input parameters.
+        """
+        self._sampler_compare_widget.set_study(study, config)
+
+        # Hint the benchmark widget with how many parameters the study has
+        if config is not None:
+            try:
+                n_inputs = sum(1 for p in config.parameters if p.enabled)
+            except Exception:
+                n_inputs = 4
+            self._benchmark_widget.refresh(n_inputs_hint=max(2, n_inputs))
+
     def set_validation_results(self, results) -> None:
         """
         Accept validation results from MainWindow and inject tabs (idempotent).
@@ -2201,7 +3169,9 @@ class DesignSpaceDialog(QDialog):
         # If we have different results, reset tabs so they're re-injected
         if self._validation_results is not results:
             if self._val_tabs_added:
-                while self._tabs.count() > 4:
+                # Keep base 8 tabs (0-7): Design Space, Correlation, Importance,
+                # Profiler, Convergence, Pareto, Benchmark, Sampler Compare
+                while self._tabs.count() > 8:
                     self._tabs.removeTab(self._tabs.count() - 1)
                 self._val_tabs_added = False
             self._validation_results = results
@@ -2210,7 +3180,7 @@ class DesignSpaceDialog(QDialog):
         # Update checkbox UI to show "Complete"
         self._val_checkbox.blockSignals(True)
         self._val_checkbox.setChecked(True)
-        self._val_checkbox.setText("🔬  Surrogate Validation  ✅  Complete")
+        self._val_checkbox.setText("Surrogate Validation — Complete")
         self._val_checkbox.setEnabled(True)
         self._val_checkbox.blockSignals(False)
         self._val_status_lbl.setText(
@@ -2276,11 +3246,16 @@ class DesignSpaceDialog(QDialog):
             self._validation_worker.wait(3000)
             self._validation_worker = None
 
-        # Remove validation tabs (keep base 4: Design Space, Correlation,
-        #                          Importance, Profiler)
+        # Remove validation tabs (keep base 8: Design Space, Correlation,
+        #                          Importance, Profiler, Convergence, Pareto,
+        #                          Benchmark, Sampler Compare)
         if self._val_tabs_added:
-            while self._tabs.count() > 4:
+            while self._tabs.count() > 8:
                 self._tabs.removeTab(self._tabs.count() - 1)
+            # Sync the tab-selector dropdown
+            if hasattr(self, "_tab_combo"):
+                while self._tab_combo.count() > 8:
+                    self._tab_combo.removeItem(self._tab_combo.count() - 1)
 
         self._validation_results = None
         self._validation_worker  = None
@@ -2374,7 +3349,7 @@ class DesignSpaceDialog(QDialog):
     def _on_val_error(self, msg: str) -> None:
         self._val_progress.setVisible(False)
         self._val_status_lbl.setVisible(False)
-        self._val_checkbox.setText("🔬  Run Surrogate Validation  ❌  Error")
+        self._val_checkbox.setText("Surrogate Validation — Error")
         self._val_checkbox.setEnabled(True)
         QMessageBox.critical(
             self, "Validation Error",
@@ -2391,13 +3366,13 @@ class DesignSpaceDialog(QDialog):
 
         r = self._validation_results
         tab_specs = [
-            ("s0_data_summary",        "📊 Data Quality"),
-            ("s1_predicted_vs_true",   "🎯 Surrogate Accuracy"),
-            ("s1_residuals",           "📉 Residuals"),
-            ("s2_bo_convergence",      "📈 BO Benchmark"),
-            ("s2_bo_convergence_norm", "📈 BO (Normalised)"),
-            ("s3_ei_marginals",        "🔍 EI Marginals"),
-            ("s5_passfail",            "✅ Validation Summary"),
+            ("s0_data_summary",        "Data Quality"),
+            ("s1_predicted_vs_true",   "Surrogate Accuracy"),
+            ("s1_residuals",           "Residuals"),
+            ("s2_bo_convergence",      "BO Benchmark"),
+            ("s2_bo_convergence_norm", "BO (Normalised)"),
+            ("s3_ei_marginals",        "EI Marginals"),
+            ("s5_passfail",            "Validation Summary"),
         ]
         first_val_idx = self._tabs.count()
         for key, tab_label in tab_specs:
@@ -2412,6 +3387,7 @@ class DesignSpaceDialog(QDialog):
             page_vbox.setContentsMargins(4, 4, 4, 4)
             page_vbox.addWidget(canvas)
             self._tabs.addTab(page, tab_label)
+            self._tab_combo.addItem(tab_label)   # keep dropdown in sync
 
         # Switch to first validation tab
         if self._tabs.count() > first_val_idx:
