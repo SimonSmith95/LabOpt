@@ -1910,3 +1910,254 @@ class TestContextualIntegration:
         assert len(new_trials) == 2
         for t in new_trials:
             assert "ctx_humidity_pct" in t.user_attrs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Objective Boundaries — unit tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+from parameter_config import BoundaryVariableConfig, ObjectiveBoundary
+
+
+class TestObjectiveBoundary:
+    """Tests for ObjectiveBoundary dataclass (parameter_config.py)."""
+
+    def test_satisfied_leq(self):
+        b = ObjectiveBoundary("impurity spec", "impurity_level", "<=", 5.0)
+        ok, v = b.is_satisfied({"impurity_level": 3.0})
+        assert ok
+        assert v <= 0
+
+    def test_violated_leq(self):
+        b = ObjectiveBoundary("impurity spec", "impurity_level", "<=", 5.0)
+        ok, v = b.is_satisfied({"impurity_level": 8.0})
+        assert not ok
+        assert abs(v - 3.0) < 1e-9
+
+    def test_satisfied_geq(self):
+        b = ObjectiveBoundary("cr", "crystallinity", ">=", 0.85)
+        ok, v = b.is_satisfied({"crystallinity": 0.90})
+        assert ok
+        assert v <= 0
+
+    def test_violated_geq(self):
+        b = ObjectiveBoundary("cr", "crystallinity", ">=", 0.85)
+        ok, v = b.is_satisfied({"crystallinity": 0.70})
+        assert not ok
+        assert abs(v - 0.15) < 1e-9
+
+    def test_expression_sum(self):
+        b = ObjectiveBoundary("total impurity", "impurity_A + impurity_B", "<=", 2.0)
+        ok, v = b.is_satisfied({"impurity_A": 0.8, "impurity_B": 0.9})
+        assert ok  # 1.7 <= 2.0
+
+    def test_expression_sum_violated(self):
+        b = ObjectiveBoundary("total impurity", "impurity_A + impurity_B", "<=", 2.0)
+        ok, v = b.is_satisfied({"impurity_A": 1.5, "impurity_B": 1.2})
+        assert not ok  # 2.7 > 2.0
+
+    def test_validate_expression_valid(self):
+        b = ObjectiveBoundary("purity spec", "impurity_level * 2", "<=", 10.0)
+        errs = b.validate_expression(["impurity_level"])
+        assert errs == []
+
+    def test_validate_expression_unknown_column(self):
+        b = ObjectiveBoundary("purity spec", "unknown_col", "<=", 0.1)
+        errs = b.validate_expression(["purity"])
+        assert any("Unknown column" in e for e in errs)
+
+    def test_validate_expression_empty(self):
+        b = ObjectiveBoundary("purity spec", "", "<=", 0.1)
+        errs = b.validate_expression(["purity"])
+        assert errs  # should have errors
+
+    def test_serialisation_round_trip(self):
+        b = ObjectiveBoundary("purity specification", "purity", ">=", 95.0)
+        d = b.to_dict()
+        b2 = ObjectiveBoundary.from_dict(d)
+        assert b2.name == b.name
+        assert b2.expression == b.expression
+        assert b2.operator == b.operator
+        assert abs(b2.target - b.target) < 1e-12
+
+
+class TestBoundaryVariableConfig:
+    """Tests for BoundaryVariableConfig dataclass (parameter_config.py)."""
+
+    def test_serialisation_round_trip(self):
+        bv = BoundaryVariableConfig("swelling")
+        d = bv.to_dict()
+        bv2 = BoundaryVariableConfig.from_dict(d)
+        assert bv2.column_name == "swelling"
+
+
+class TestStudyConfigWithBoundaries:
+    """Tests for StudyConfig objective_boundaries / boundary_variables fields."""
+
+    def test_to_dict_includes_boundaries(self):
+        from parameter_config import StudyConfig, ObjectiveConfig, ParameterConfig, ParameterType
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("x", ParameterType.FLOAT, full_min=0, full_max=1)],
+            objectives=[ObjectiveConfig("y", "minimize")],
+            objective_boundaries=[ObjectiveBoundary("sw", "swelling", "<=", 0.05)],
+            boundary_variables=[BoundaryVariableConfig("swelling")],
+        )
+        d = cfg.to_dict()
+        assert "objective_boundaries" in d
+        assert len(d["objective_boundaries"]) == 1
+        assert d["objective_boundaries"][0]["name"] == "sw"
+        assert "boundary_variables" in d
+        assert d["boundary_variables"][0]["column_name"] == "swelling"
+
+    def test_from_dict_restores_boundaries(self):
+        from parameter_config import StudyConfig, ObjectiveConfig, ParameterConfig, ParameterType
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("x", ParameterType.FLOAT, full_min=0, full_max=1)],
+            objectives=[ObjectiveConfig("y", "minimize")],
+            objective_boundaries=[ObjectiveBoundary("sw", "swelling", "<=", 0.05)],
+            boundary_variables=[BoundaryVariableConfig("swelling")],
+        )
+        d = cfg.to_dict()
+        cfg2 = StudyConfig.from_dict(d)
+        assert len(cfg2.objective_boundaries) == 1
+        assert cfg2.objective_boundaries[0].name == "sw"
+        assert len(cfg2.boundary_variables) == 1
+        assert cfg2.boundary_variables[0].column_name == "swelling"
+
+    def test_default_empty_boundaries(self):
+        from parameter_config import StudyConfig
+        cfg = StudyConfig()
+        assert cfg.objective_boundaries == []
+        assert cfg.boundary_variables == []
+
+
+class TestTellBatchBoundaryValues:
+    """Tests for tell_batch() storing bnd_ user_attrs."""
+
+    def test_tell_batch_stores_bnd_user_attrs(self, tmp_path):
+        from parameter_config import StudyConfig, ObjectiveConfig, ParameterConfig, ParameterType
+        from optuna_builder import build_study, ask_batch, tell_batch
+        from optuna.trial import TrialState
+
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("x", ParameterType.FLOAT, full_min=0, full_max=1)],
+            objectives=[ObjectiveConfig("y", "minimize")],
+            objective_boundaries=[ObjectiveBoundary("sw", "swelling", "<=", 0.05)],
+            boundary_variables=[BoundaryVariableConfig("swelling")],
+        )
+        db = str(tmp_path / "study.db")
+        study = build_study(cfg, db, "test_bnd_tell")
+
+        trials = ask_batch(study, cfg, batch_size=1)
+        tell_batch(
+            study,
+            [t.number for t in trials],
+            [[0.5]],
+            config=cfg,
+            boundary_values=[{"swelling": 0.03}],
+        )
+
+        complete = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        assert len(complete) == 1
+        assert "bnd_swelling" in complete[0].user_attrs
+        assert abs(complete[0].user_attrs["bnd_swelling"] - 0.03) < 1e-9
+
+    def test_tell_batch_bnd_violation_marked(self, tmp_path):
+        """Violated boundary does NOT prevent trial from being COMPLETE — data is kept."""
+        from parameter_config import StudyConfig, ObjectiveConfig, ParameterConfig, ParameterType
+        from optuna_builder import build_study, ask_batch, tell_batch
+        from optuna.trial import TrialState
+
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("x", ParameterType.FLOAT, full_min=0, full_max=1)],
+            objectives=[ObjectiveConfig("y", "minimize")],
+            objective_boundaries=[ObjectiveBoundary("sw", "swelling", "<=", 0.05)],
+            boundary_variables=[BoundaryVariableConfig("swelling")],
+        )
+        db = str(tmp_path / "study_viol.db")
+        study = build_study(cfg, db, "test_bnd_violation")
+
+        trials = ask_batch(study, cfg, batch_size=1)
+        # Enter a violating boundary value — swelling > 0.05
+        tell_batch(
+            study,
+            [t.number for t in trials],
+            [[0.7]],
+            config=cfg,
+            boundary_values=[{"swelling": 0.08}],
+        )
+
+        complete = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        assert len(complete) == 1  # trial kept (not deleted)
+        assert complete[0].user_attrs["bnd_swelling"] == pytest.approx(0.08)
+
+
+class TestLoadHistoricalTrialsBoundary:
+    """Tests for load_historical_trials() carrying bnd_ from boundary_values."""
+
+    def test_boundary_values_stored_in_user_attrs(self, tmp_path):
+        from parameter_config import StudyConfig, ObjectiveConfig, ParameterConfig, ParameterType
+        from optuna_builder import build_study, load_historical_trials
+        from optuna.trial import TrialState
+
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("x", ParameterType.FLOAT, full_min=0, full_max=1)],
+            objectives=[ObjectiveConfig("y", "minimize")],
+            objective_boundaries=[ObjectiveBoundary("sw", "swelling", "<=", 0.05)],
+            boundary_variables=[BoundaryVariableConfig("swelling")],
+        )
+        db = str(tmp_path / "hist.db")
+        study = build_study(cfg, db, "test_hist_bnd")
+
+        trial_dicts = [
+            {
+                "params": {"x": 0.3},
+                "values": [0.5],
+                "user_attrs": {},
+                "boundary_values": {"swelling": 0.02},
+            }
+        ]
+        added, skipped = load_historical_trials(study, trial_dicts, cfg)
+        assert added == 1
+        complete = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        assert len(complete) == 1
+        assert "bnd_swelling" in complete[0].user_attrs
+        assert complete[0].user_attrs["bnd_swelling"] == pytest.approx(0.02)
+
+
+class TestBuildStudyWithBoundaries:
+    """Tests for build_study() with objective_boundaries in config."""
+
+    def test_build_study_tpe_with_boundaries(self, tmp_path):
+        """build_study should succeed and return a study when boundaries are set."""
+        from parameter_config import StudyConfig, ObjectiveConfig, ParameterConfig, ParameterType
+        from optuna_builder import build_study
+
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("x", ParameterType.FLOAT, full_min=0, full_max=1)],
+            objectives=[ObjectiveConfig("y", "minimize")],
+            objective_boundaries=[ObjectiveBoundary("sw", "swelling", "<=", 0.05)],
+            boundary_variables=[BoundaryVariableConfig("swelling")],
+            sampler_name="TPE",
+        )
+        db = str(tmp_path / "bnd_study.db")
+        import optuna
+        study = build_study(cfg, db, "test_bnd_build")
+        assert isinstance(study, optuna.Study)
+
+    def test_build_study_no_boundaries_unchanged(self, tmp_path):
+        """build_study with no boundaries should behave exactly as before."""
+        from parameter_config import StudyConfig, ObjectiveConfig, ParameterConfig, ParameterType
+        from optuna_builder import build_study, ask_batch
+        import optuna
+
+        cfg = StudyConfig(
+            parameters=[ParameterConfig("x", ParameterType.FLOAT, full_min=0, full_max=1)],
+            objectives=[ObjectiveConfig("y", "minimize")],
+            sampler_name="TPE",
+        )
+        db = str(tmp_path / "no_bnd.db")
+        study = build_study(cfg, db, "test_no_bnd")
+        assert isinstance(study, optuna.Study)
+        trials = ask_batch(study, cfg, batch_size=1)
+        assert len(trials) == 1
