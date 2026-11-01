@@ -176,11 +176,18 @@ def load_trials_from_csv(df: pd.DataFrame, config: StudyConfig) -> List[dict]:
     Returns
     -------
     list of {"params": {col: val, ...}, "values": [float, ...],
-             "user_attrs": {"ctx_<name>": float, ...}}
+             "user_attrs": {"ctx_<name>": float, ...},
+             "boundary_values": {"bv_col": float, ...}}
 
     Context variable values (from config.context_variables) are stored with
     the ``ctx_`` prefix in ``user_attrs`` so the surrogate can learn from them
     without them entering the Optuna search space.
+
+    Boundary variable values (from config.boundary_variables) are returned
+    in a separate ``boundary_values`` dict so that ``load_historical_trials``
+    can store them as ``user_attrs["bnd_<col>"]`` on each Optuna trial.
+    This makes historical feasibility information available to ``constraints_func``
+    from the very first ``ask()`` call.
 
     Values list order matches config.objectives order.
     Safe to call multiple times — the caller deduplicates before adding.
@@ -188,6 +195,7 @@ def load_trials_from_csv(df: pd.DataFrame, config: StudyConfig) -> List[dict]:
     obj_cols = [o.column_name for o in config.objectives]
     param_names = [p.name for p in config.parameters if p.enabled]
     ctx_cols = [c.column_name for c in getattr(config, "context_variables", [])]
+    bnd_cols = [bv.column_name for bv in getattr(config, "boundary_variables", [])]
 
     results: List[dict] = []
     for _, row in df.iterrows():
@@ -210,7 +218,24 @@ def load_trials_from_csv(df: pd.DataFrame, config: StudyConfig) -> List[dict]:
             if col in row.index and not pd.isna(row[col]):
                 ctx_attrs[f"ctx_{col}"] = float(row[col])
 
-        results.append({"params": params, "values": values, "user_attrs": ctx_attrs})
+        # Collect boundary variable values for historical feasibility signals
+        bnd_vals: dict = {}
+        for col in bnd_cols:
+            if col in row.index and not pd.isna(row[col]):
+                try:
+                    bnd_vals[col] = float(row[col])
+                except (TypeError, ValueError):
+                    pass
+
+        trial_dict: dict = {
+            "params": params,
+            "values": values,
+            "user_attrs": ctx_attrs,
+        }
+        if bnd_vals:
+            trial_dict["boundary_values"] = bnd_vals
+
+        results.append(trial_dict)
 
     return results
 

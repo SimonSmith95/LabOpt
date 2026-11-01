@@ -87,6 +87,10 @@ class OptimizationWorker(QThread):
         # from BatchResultsDialog.get_context_corrections(), before submit_results() unblocks
         # the worker).  List of dicts, one per submitted trial, or None.
         self.pending_context_values: Optional[List[dict]] = None
+        # Boundary variable measurements per trial (set by main_window in
+        # _on_results_submitted from BatchResultsDialog.get_boundary_values()).
+        # List of dicts mapping boundary column names to float values, or None.
+        self.pending_boundary_values: Optional[List[dict]] = None
 
     # ── QThread entry point ────────────────────────────────────────────────
 
@@ -158,8 +162,10 @@ class OptimizationWorker(QThread):
 
                 tell_batch(self._study, trial_numbers, values_list,
                            constrained, self._config,
-                           context_values=self.pending_context_values)
-                self.pending_context_values = None   # reset for next batch
+                           context_values=self.pending_context_values,
+                           boundary_values=self.pending_boundary_values)
+                self.pending_context_values = None    # reset for next batch
+                self.pending_boundary_values = None   # reset for next batch
                 SessionManager.clear_pending_batch(self._session_state)
 
                 self.batch_complete.emit(batch_idx + 1, n_batches)

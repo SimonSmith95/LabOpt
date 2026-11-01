@@ -146,7 +146,7 @@ class NewSessionDialog(QDialog):
         self._owner_le.setText(get_default_owner())
         self._owner_le.setPlaceholderText("e.g. Alice Smith")
         self._owner_le.setMaxLength(60)
-        form.addRow("Researcher:", self._owner_le)
+        form.addRow("User:", self._owner_le)
 
         owner_hint = QLabel(
             "<i>Pre-filled from LABOPT_USER env var if set.  "

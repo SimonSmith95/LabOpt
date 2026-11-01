@@ -297,6 +297,143 @@ class ParameterConstraint:
 
 
 @dataclass
+class ObjectiveBoundary:
+    """
+    A hard feasibility limit on a measured (non-objective) output column.
+
+    Unlike ParameterConstraint (which restricts the INPUT search space),
+    ObjectiveBoundary acts on MEASURED OUTPUTS: after each experiment the
+    user enters the boundary variable value and LabOpt checks whether it
+    satisfies the threshold.  Violated trials are marked infeasible in
+    Optuna's constraints_func so the surrogate learns to avoid parameter
+    regions that historically produced violations.
+
+    Examples
+    --------
+    Purity must stay above 95 %:
+        name       = "Purity specification"
+        expression = "purity"
+        operator   = ">="
+        target     = 95.0
+
+    A combined sum of two measured impurity components:
+        name       = "Total impurity limit"
+        expression = "impurity_A + impurity_B"
+        operator   = "<="
+        target     = 2.0
+
+    Expressions may reference any measured output column name.
+    Allowed operators: +  -  *  /  **  ( )  and numeric literals.
+    Only inequality operators (<= / >=) are supported — equalities on
+    measured outputs do not make physical sense as hard limits.
+    """
+    name: str                           # human-readable label
+    expression: str                     # formula over measured column names
+    operator: Literal["<=", ">="]       # only inequalities make sense here
+    target: float = 0.0                 # right-hand-side threshold
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "expression": self.expression,
+            "operator": self.operator,
+            "target": self.target,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ObjectiveBoundary":
+        return cls(
+            name=d["name"],
+            expression=d["expression"],
+            operator=d.get("operator", "<="),
+            target=float(d.get("target", 0.0)),
+        )
+
+    def validate_expression(self, column_names: List[str]) -> List[str]:
+        """
+        Return a list of error strings (empty = valid).
+        Reuses the same safe-AST logic as ParameterConstraint.
+        """
+        import ast
+        errors: List[str] = []
+        if not self.expression.strip():
+            errors.append("Expression is empty.")
+            return errors
+        try:
+            tree = ast.parse(self.expression.strip(), mode="eval")
+        except SyntaxError as exc:
+            errors.append(f"Syntax error: {exc}")
+            return errors
+        allowed = (
+            ast.Expression, ast.BinOp, ast.UnaryOp,
+            ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow,
+            ast.USub, ast.UAdd, ast.Constant, ast.Name, ast.Load,
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed):
+                errors.append(
+                    f"Unsupported operation: {type(node).__name__}. "
+                    "Only +  -  *  /  ** and column names are allowed."
+                )
+                return errors
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id not in column_names:
+                errors.append(
+                    f"Unknown column '{node.id}'. "
+                    f"Known measured columns: {column_names}"
+                )
+        return errors
+
+    def is_satisfied(self, col_values: dict) -> Tuple[bool, float]:
+        """
+        Evaluate the boundary against measured column values.
+
+        Returns
+        -------
+        (satisfied, violation)
+            satisfied  : True if the boundary holds.
+            violation  : signed amount; positive means infeasible.
+                         Fed as a positive value to Optuna's constraints_func.
+        """
+        try:
+            actual = ParameterConstraint.eval_expr(self.expression, col_values)
+        except ValueError:
+            return False, float("inf")
+        if self.operator == "<=":
+            v = actual - self.target
+            return v <= 0, v
+        else:  # ">="
+            v = self.target - actual
+            return v <= 0, v
+
+
+@dataclass
+class BoundaryVariableConfig:
+    """
+    A measured output column that participates in at least one ObjectiveBoundary
+    expression.
+
+    The user enters its value in the Batch Results Dialog alongside the primary
+    objective.  The value is stored as ``user_attrs["bnd_<column_name>"]`` on
+    each Optuna trial so that constraints_func can read it when planning the
+    next batch.
+
+    It is NOT an Optuna objective (no direction, no search space) and NOT a
+    context variable (it IS affected by the controllable parameters).  Its sole
+    purpose is to carry the per-trial measurement into the surrogate's
+    feasibility signal.
+    """
+    column_name: str   # must match the CSV column header exactly
+
+    def to_dict(self) -> dict:
+        return {"column_name": self.column_name}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BoundaryVariableConfig":
+        return cls(column_name=d["column_name"])
+
+
+@dataclass
 class StudyConfig:
     """Full configuration for an Optuna study session."""
     parameters: List[ParameterConfig] = field(default_factory=list)
@@ -304,6 +441,9 @@ class StudyConfig:
     constraints: List[ParameterConstraint] = field(default_factory=list)
     # ── Context variables (uncontrollable environmental conditions) ────────────
     context_variables: List[ContextConfig] = field(default_factory=list)
+    # ── Objective boundaries (hard feasibility limits on measured outputs) ─────
+    objective_boundaries: List[ObjectiveBoundary] = field(default_factory=list)
+    boundary_variables: List[BoundaryVariableConfig] = field(default_factory=list)
     batch_size: int = 1
     n_batches: int = 10
     sampler_name: Literal["TPE", "NSGAII", "Random", "GP"] = "TPE"
@@ -321,6 +461,8 @@ class StudyConfig:
             "objectives": [o.to_dict() for o in self.objectives],
             "constraints": [c.to_dict() for c in self.constraints],
             "context_variables": [c.to_dict() for c in self.context_variables],
+            "objective_boundaries": [b.to_dict() for b in self.objective_boundaries],
+            "boundary_variables": [v.to_dict() for v in self.boundary_variables],
             "batch_size": self.batch_size,
             "n_batches": self.n_batches,
             "sampler_name": self.sampler_name,
@@ -339,6 +481,14 @@ class StudyConfig:
             constraints=[ParameterConstraint.from_dict(c) for c in d.get("constraints", [])],
             context_variables=[
                 ContextConfig.from_dict(c) for c in d.get("context_variables", [])
+            ],
+            objective_boundaries=[
+                ObjectiveBoundary.from_dict(b)
+                for b in d.get("objective_boundaries", [])
+            ],
+            boundary_variables=[
+                BoundaryVariableConfig.from_dict(v)
+                for v in d.get("boundary_variables", [])
             ],
             batch_size=d.get("batch_size", 1),
             n_batches=d.get("n_batches", 10),

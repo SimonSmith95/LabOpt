@@ -66,7 +66,9 @@ from optuna_builder import (
 )
 from param_card_widget import ParamCardWidget
 from constraint_dialog import ConstraintDialog
+from objective_boundary_dialog import ObjectiveBoundaryDialog
 from parameter_config import (
+    BoundaryVariableConfig, ObjectiveBoundary,
     ObjectiveConfig, ParameterConfig, ParameterConstraint, ParameterType, StudyConfig,
 )
 from session_manager import SessionManager, SessionState
@@ -583,6 +585,9 @@ class MainWindow(QMainWindow):
         self._obj_col_rows: List[tuple] = []  # (col, QCheckBox, QComboBox)
         # User-defined parameter constraints (equality / inequality rules)
         self._constraints: List[ParameterConstraint] = []
+        # Objective boundary conditions (feasibility limits on measured outputs)
+        self._objective_boundaries: List[ObjectiveBoundary] = []
+        self._boundary_variables: List[BoundaryVariableConfig] = []
         # Replicate aggregation UI widgets (rebuilt when a CSV is loaded)
         self._repl_cb: Optional[QCheckBox] = None
         self._repl_tol_le: Optional[QLineEdit] = None
@@ -1670,6 +1675,17 @@ class MainWindow(QMainWindow):
         constraint_btn.clicked.connect(self._action_open_constraints)
         self._obj_inner_layout.addWidget(constraint_btn)
 
+        obj_boundary_btn = QPushButton("🚧  Objective Boundaries…")
+        obj_boundary_btn.setToolTip(
+            "Define hard feasibility limits on measured output columns.\n"
+            "Example: purity >= 95.0\n\n"
+            "Unlike objectives, boundaries are pass/fail gates — the surrogate\n"
+            "learns to avoid parameter regions that historically violated them.\n"
+            "All data is kept; violations guide learning, not deletion."
+        )
+        obj_boundary_btn.clicked.connect(self._action_open_obj_boundaries)
+        self._obj_inner_layout.addWidget(obj_boundary_btn)
+
     # ══════════════════════════════════════════════════════════════════════
     # Apply objectives → build param cards + study
     # ══════════════════════════════════════════════════════════════════════
@@ -1884,6 +1900,55 @@ class MainWindow(QMainWindow):
             self._set_status(
                 f"{n} constraint(s) defined. "
                 "Click 'Apply Objectives' to rebuild the study with these constraints."
+            )
+
+    def _action_open_obj_boundaries(self) -> None:
+        """Open ObjectiveBoundaryDialog to manage feasibility gates on measured outputs."""
+        import ast as _ast
+        all_result_cols: List[str] = []
+        if self._df is not None and self._session_state is not None:
+            param_names = {p.name for p in self._session_state.study_config.parameters}
+            ctx_names   = {
+                cv.column_name
+                for cv in getattr(self._session_state.study_config, "context_variables", [])
+            }
+            all_result_cols = [
+                c for c in self._df.columns
+                if c not in param_names and c not in ctx_names
+            ]
+        elif self._df is not None:
+            all_result_cols = list(self._df.columns)
+
+        dlg = ObjectiveBoundaryDialog(
+            column_names=all_result_cols,
+            boundaries=list(self._objective_boundaries),
+            parent=self,
+        )
+        if dlg.exec() == QDialog.Accepted:
+            self._objective_boundaries = dlg.boundaries
+            referenced: set = set()
+            for b in self._objective_boundaries:
+                try:
+                    tree = _ast.parse(b.expression.strip(), mode="eval")
+                    for node in _ast.walk(tree):
+                        if isinstance(node, _ast.Name):
+                            referenced.add(node.id)
+                except SyntaxError:
+                    pass
+            self._boundary_variables = [
+                BoundaryVariableConfig(col) for col in referenced
+                if col in all_result_cols
+            ]
+            if self._session_state:
+                self._session_state.study_config.objective_boundaries = list(self._objective_boundaries)
+                self._session_state.study_config.boundary_variables   = list(self._boundary_variables)
+                SessionManager.save(self._session_state)
+            n = len(self._objective_boundaries)
+            cols_str = ", ".join(bv.column_name for bv in self._boundary_variables)
+            self._set_status(
+                f"{n} objective boundary condition(s) defined"
+                + (f" — measuring: {cols_str}" if cols_str else "")
+                + ". Click 'Apply Objectives' to activate."
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -2186,6 +2251,12 @@ class MainWindow(QMainWindow):
                     self._worker.pending_context_values = ctx_corrections
                 except Exception:
                     self._worker.pending_context_values = None
+                # Collect boundary variable measurements (feasibility gates)
+                try:
+                    bnd_values = self._active_batch_dlg.get_boundary_values()
+                    self._worker.pending_boundary_values = bnd_values
+                except Exception:
+                    self._worker.pending_boundary_values = None
             self._worker.submit_results(results)
         self._active_batch_dlg = None
         self._update_pending_btn_state()

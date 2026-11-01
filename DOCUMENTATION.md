@@ -18,9 +18,10 @@
    - 3.8 [Saving and Resuming Sessions](#38-saving-and-resuming-sessions)
    - 3.9 [Design Space Visualisation](#39-design-space-visualisation)
    - 3.10 [Defining Parameter Constraints](#310-defining-parameter-constraints)
-   - 3.11 [Context Variables (Uncontrollable Environmental Conditions)](#311-context-variables-uncontrollable-environmental-conditions)
-   - 3.12 [Power Analysis — Sample Size Calculator](#312-power-analysis--sample-size-calculator)
-   - 3.13 [Surrogate Validation](#313-surrogate-validation)
+   - 3.11 [Objective Boundaries (Feasibility Filters on Measured Results)](#311-objective-boundaries-feasibility-filters-on-measured-results)
+   - 3.12 [Context Variables (Uncontrollable Environmental Conditions)](#312-context-variables-uncontrollable-environmental-conditions)
+   - 3.13 [Power Analysis — Sample Size Calculator](#313-power-analysis--sample-size-calculator)
+   - 3.14 [Surrogate Validation](#314-surrogate-validation)
 4. [Headless / Scripting Mode](#4-headless--scripting-mode)
 5. [Codebase Architecture](#5-codebase-architecture)
    - 5.1 [File Map](#51-file-map)
@@ -608,7 +609,157 @@ Parameter names must **exactly match** your CSV column names (case-sensitive).
 
 ---
 
-### 3.11 Context Variables (Uncontrollable Environmental Conditions)
+### 3.11 Objective Boundaries (Feasibility Filters on Measured Results)
+
+Objective boundaries let you declare a **hard physical limit on any measured
+output** — a threshold that, if exceeded, makes an experiment unacceptable
+regardless of how well the primary objective performed.
+
+#### The difference between an objective and a boundary
+
+| | Primary objective | Objective boundary |
+|---|---|---|
+| Purpose | Maximise or minimise a measured quantity | Declare a hard pass/fail limit |
+| Effect on study | Drives the surrogate's search direction | Steers the surrogate away from infeasible regions |
+| How it is set | Minimize / Maximize in the Objectives panel | Expression + operator + threshold in the Boundaries dialog |
+| Number needed | Usually 1 (single-objective studies converge fastest) | As many as needed — each adds one feasibility signal |
+
+**Example situation:** You are optimising reaction `yield` (%) in a chemical
+synthesis. You also measure `purity` (%) for every batch. Any batch with
+`purity < 95 %` fails the product specification and cannot be used — even if
+its `yield` is excellent.
+
+With objective boundaries you keep **one primary objective** (`yield`) and add
+one boundary (`purity >= 95.0`). The optimiser converges as fast as a
+single-objective study, but it automatically learns to avoid parameter
+combinations that historically produced low-purity batches.
+
+> **Why not add purity as a second objective?**
+> Adding a second objective switches the study into multi-objective mode
+> (Pareto optimisation), which typically needs 5–10× more experiments to trace
+> the trade-off front. Objective boundaries are the correct tool when you know
+> the limit in advance and just want to exclude everything below it — not trade
+> off against it.
+
+#### Opening the dialog
+
+After loading a CSV and applying objectives, click **🚧 Objective Boundaries…**
+in the Objectives panel (next to the **📐 Constraints…** button).
+
+The dialog lists all currently defined boundaries and provides **Add**, **Edit**,
+and **Remove** buttons.
+
+#### Adding a boundary
+
+1. Click **＋ Add Boundary**.
+2. Enter a **Name** (e.g. `"Purity specification"`).
+3. Enter the **Expression** — a formula using the names of your measured output
+   columns:
+   ```
+   purity
+   ```
+   or a combination of measured columns:
+   ```
+   impurity_A + impurity_B
+   ```
+4. Choose the **Operator**: `<=` (must stay below) or `>=` (must stay above).
+5. Enter the **Target value** — the numeric threshold (e.g. `95.0`).
+6. Click **OK**. The dialog shows which columns will be required as measurements.
+7. Click **OK** on the main dialog to save.
+
+> **Tip:** Scientific notation is accepted in the target field — for example
+> `9.5e1` is identical to `95.0`. The expression field on the left only
+> accepts column names and arithmetic operators, not mathematical functions.
+
+#### Expression syntax
+
+Objective boundary expressions follow the same rules as parameter constraint
+expressions. Allowed operators: `+`, `-`, `*`, `/`, `**`, `(`, `)`.
+
+Column names must **exactly match** your CSV headers (case-sensitive). Any
+column in your CSV that is not a controlled parameter can be referenced.
+
+**Examples:**
+
+| Expression | Op | Target | Meaning |
+|---|---|---|---|
+| `purity` | `>=` | `95.0` | Purity must stay above 95% |
+| `impurity_A + impurity_B` | `<=` | `2.0` | Total impurities must stay below 2% |
+| `roughness` | `<=` | `5.0` | Surface roughness below 5 nm |
+| `crystallinity` | `>=` | `0.85` | Crystallinity must exceed 85% |
+| `defect_density * thickness` | `<=` | `1e-4` | Combined defect metric |
+
+#### How LabOpt enforces objective boundaries
+
+Objective boundaries work through **feasibility-aware surrogate training**:
+
+1. **You measure** the boundary variable (e.g. `purity`) after each experiment
+   and enter its value in the Batch Results Dialog alongside your primary
+   objective value.
+
+2. **LabOpt stores** the measured purity as hidden metadata on each experiment
+   record (a `user_attr` with the prefix `bnd_`). It is **not** stored as an
+   additional Optuna objective — the study remains single-objective.
+
+3. **The sampler reads** this metadata when planning the next batch. Each past
+   experiment is labelled either *feasible* (boundary satisfied) or *infeasible*
+   (boundary violated). The Bayesian optimisation surrogate (TPE or NSGAII)
+   treats infeasible trials differently — it learns which regions of the
+   parameter space historically produced infeasible outcomes and actively steers
+   future suggestions away from those regions.
+
+4. **Violated experiments are kept** in the database. Their data is never
+   discarded. The boundary violation is a signal to the sampler, not a reason
+   to hide the measurement.
+
+5. **The violation amount is quantitative.** A batch with `purity = 91 %`
+   (4 points below the limit of 95 %) generates a larger infeasibility signal
+   than one with `purity = 94 %` (only 1 point below). This allows the sampler
+   to learn a graded sense of how far a region is from feasibility.
+
+6. **The effect grows with data.** In the first few batches the surrogate has no
+   boundary data and makes no feasibility assumptions. After 10–20 experiments
+   with some violations, the sampler will clearly favour feasible regions.
+
+#### What you see in the Batch Results Dialog
+
+After defining an objective boundary, the **Batch Results Dialog** gains
+additional measurement rows, one per boundary variable:
+
+```
+──── Objectives ────────────────────
+  yield:    [ 87.3 ]                ← primary objective (white background)
+
+──── Boundary Measurements ─────────
+  purity:   [ 92.1 ] ← VIOLATION    (red background — below 95.0)
+```
+
+The row turns **red** in real time as you type if the entered value violates
+the boundary. Violations are noted in the pre-submit confirmation and recorded
+so the surrogate can learn from them.
+
+#### How boundaries interact with the sampler
+
+| Sampler | Boundary enforcement |
+|---|---|
+| **TPE** (recommended) | Full constraint-aware training. ✅ |
+| **NSGAII** | Full constraint-aware training. ✅ |
+| **Random** | Boundaries are checked and flagged but do not steer suggestions. ⚠ |
+| **GP** | Boundaries are checked and flagged, but the GP surrogate does not support constraint-aware training. Switch to TPE for boundary-aware optimisation. ⚠ |
+
+#### Boundaries vs. parameter constraints — which to use?
+
+| Situation | Use |
+|---|---|
+| Fractions of components must sum to 1 | Parameter constraint (equality) |
+| Total processing time × temperature must not exceed a budget | Parameter constraint (inequality) |
+| Measured product purity must stay above a specification threshold | **Objective boundary** |
+| Measured crystallinity must exceed a threshold | **Objective boundary** |
+| Humidity (uncontrollable) should be recorded for model training | Context variable |
+
+---
+
+### 3.12 Context Variables (Uncontrollable Environmental Conditions)
 
 Context variables allow the surrogate model to account for **environmental
 conditions that affect your experiment but cannot be controlled** — ambient
@@ -735,7 +886,7 @@ trial's metadata for surrogate training.
 
 ---
 
-### 3.12 Power Analysis — Sample Size Calculator
+### 3.13 Power Analysis — Sample Size Calculator
 
 The **🔬 Power** tab in the left dock is a standalone statistical sample-size
 calculator. It answers the question:
@@ -847,7 +998,7 @@ relative to the noise*.
 
 ---
 
-### 3.13 Surrogate Validation
+### 3.14 Surrogate Validation
 
 The **🔬 Surrogate Validation** checkbox (in the Results tab, next to the
 Export Report button) runs a rigorous five-section validation of the surrogate

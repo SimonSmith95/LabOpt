@@ -18,7 +18,14 @@ from optuna.distributions import (
 )
 from optuna.trial import FrozenTrial, TrialState
 
-from parameter_config import ParameterConfig, ParameterConstraint, ParameterType, StudyConfig
+from parameter_config import (
+    BoundaryVariableConfig,
+    ObjectiveBoundary,
+    ParameterConfig,
+    ParameterConstraint,
+    ParameterType,
+    StudyConfig,
+)
 from sampler_utils import (
     _build_weighted_list,
     subrange_suggest_float,
@@ -208,21 +215,40 @@ def build_study(
     """
     storage = optuna.storages.RDBStorage(f"sqlite:///{storage_path}")
 
-    # Build constraints_func for inequality constraints
+    # Build constraints_func for parameter inequality constraints + objective boundaries
     ineq_constraints = [c for c in config.constraints if c.operator in ("<=", ">=")]
+    obj_boundaries   = list(getattr(config, "objective_boundaries", []))
 
     def _constraints_fn(trial: FrozenTrial) -> List[float]:
-        ext = _extract_external_params(trial.params, config)
         violations: List[float] = []
+
+        # --- parameter inequality constraints (existing) ---
+        ext = _extract_external_params(trial.params, config)
         for c in ineq_constraints:
             _, v = c.is_satisfied(ext)
             # Optuna convention: positive = infeasible
             violations.append(max(0.0, v))
+
+        # --- objective boundaries: read bnd_ user_attrs stored by tell_batch ---
+        if obj_boundaries:
+            bnd_dict: dict = {}
+            for k, val in trial.user_attrs.items():
+                if k.startswith("bnd_"):
+                    col_name = k[4:]   # strip "bnd_" prefix
+                    try:
+                        bnd_dict[col_name] = float(val)
+                    except (TypeError, ValueError):
+                        pass
+            if bnd_dict:
+                for b in obj_boundaries:
+                    _, v = b.is_satisfied(bnd_dict)
+                    violations.append(max(0.0, v))
+
         return violations
 
     # GP is handled first because GPSampler does not accept constraints_func.
     # It is therefore always built without constraint awareness regardless of
-    # whether inequality constraints are present in the config.
+    # whether inequality constraints or objective boundaries are present.
     if config.sampler_name == "GP":
         try:
             from optuna.samplers import GPSampler  # requires optuna >= 3.6
@@ -235,7 +261,7 @@ def build_study(
                 stacklevel=2,
             )
             sampler = optuna.samplers.TPESampler(seed=42, multivariate=True)
-    elif ineq_constraints:
+    elif ineq_constraints or obj_boundaries:
         sampler_map: Dict[str, optuna.samplers.BaseSampler] = {
             "TPE":    optuna.samplers.TPESampler(
                           seed=42, multivariate=True,
@@ -489,10 +515,18 @@ def load_historical_trials(
         trial_number = len(study.trials)
 
         # Optuna 4.x FrozenTrial requires trial_id; pass -1 so storage assigns one.
-        # Carry forward any user_attrs supplied in the trial dict (e.g. n_replicates).
+        # Carry forward user_attrs (ctx_ context values, etc.) and also any
+        # boundary variable values from the CSV (stored as bnd_ attrs so that
+        # constraints_func can use them as feasibility signals from history).
         user_attrs = {
             str(k): v for k, v in data.get("user_attrs", {}).items()
         }
+        raw_bnd = data.get("boundary_values", {})
+        for bnd_col, bnd_val in raw_bnd.items():
+            try:
+                user_attrs[f"bnd_{bnd_col}"] = float(bnd_val)
+            except (TypeError, ValueError):
+                pass
         if len(values) == 1:
             frozen = FrozenTrial(
                 number=trial_number,
@@ -698,6 +732,7 @@ def tell_batch(
     constrained_params: Optional[List[dict]] = None,
     config: Optional[StudyConfig] = None,
     context_values: Optional[List[dict]] = None,
+    boundary_values: Optional[List[dict]] = None,
 ) -> None:
     """
     Report measured lab results back to Optuna for the given trial numbers.
@@ -725,11 +760,20 @@ def tell_batch(
     prefix.  Keys are raw column names (without the prefix); this function
     adds the prefix automatically.
 
+    Boundary values
+    ---------------
+    When *boundary_values* is supplied (a list of dicts, one per trial), the
+    measured boundary variable values (e.g. ``{"purity": 97.5}``) are
+    stored as ``user_attrs["bnd_<col_name>"]`` on each COMPLETE trial.
+    The ``constraints_func`` in ``build_study()`` reads these attrs on
+    subsequent ``ask()`` calls to steer the surrogate away from infeasible
+    parameter regions.
+
     Legacy mode
     -----------
-    When *constrained_params* / *config* / *context_values* are omitted the
-    function falls back to the simple ``study.tell(trial_number, values)``
-    behaviour.
+    When *constrained_params* / *config* / *context_values* / *boundary_values*
+    are omitted the function falls back to the simple
+    ``study.tell(trial_number, values)`` behaviour.
     """
     for i, (trial_number, values) in enumerate(zip(trial_numbers, results)):
         try:
@@ -742,15 +786,25 @@ def tell_batch(
                     except (TypeError, ValueError):
                         pass
 
+            # Build bnd_ user_attrs from boundary_values (measured feasibility cols)
+            bnd: dict = {}
+            if boundary_values is not None and i < len(boundary_values) and boundary_values[i]:
+                for k, v in boundary_values[i].items():
+                    try:
+                        bnd[f"bnd_{k}"] = float(v)
+                    except (TypeError, ValueError):
+                        pass
+
             # Determine whether to use the constraint-correct path.
-            # We also force this path when context values need to be attached,
-            # because study.tell() doesn't support adding user_attrs directly.
+            # We also force this path when context/boundary values need to be
+            # attached, because study.tell() doesn't support user_attrs directly.
             use_corrected_path = (
                 (constrained_params is not None
                  and config is not None
                  and i < len(constrained_params)
                  and constrained_params[i])
                 or (ctx and config is not None)
+                or (bnd and config is not None)
             )
 
             if use_corrected_path and config is not None:
@@ -793,8 +847,10 @@ def tell_batch(
                         pass
                     continue
 
-                # Step 3: add a corrected COMPLETE trial with constrained params
-                #         and ctx_ user_attrs for context variables.
+                # Step 3: add a corrected COMPLETE trial with constrained params,
+                #         ctx_ user_attrs for context variables, and bnd_ user_attrs
+                #         for objective boundary measurements.
+                all_user_attrs = {str(k): v for k, v in {**ctx, **bnd}.items()}
                 frozen = FrozenTrial(
                     number=len(study.trials),
                     trial_id=-1,
@@ -805,7 +861,7 @@ def tell_batch(
                     datetime_complete=datetime.now(),
                     params=trial_params,
                     distributions=trial_dists,
-                    user_attrs={str(k): v for k, v in ctx.items()},
+                    user_attrs=all_user_attrs,
                     system_attrs={},
                     intermediate_values={},
                 )

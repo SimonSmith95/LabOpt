@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from parameter_config import ContextConfig, ObjectiveConfig
+from parameter_config import BoundaryVariableConfig, ContextConfig, ObjectiveConfig, ObjectiveBoundary
 from sampler_utils import find_near_duplicates
 from session_manager import SessionManager, SessionState
 
@@ -108,6 +108,16 @@ class BatchResultsDialog(QDialog):
             self._ctx_vars = list(getattr(session_state.study_config, "context_variables", []))
         # Per-row context spinboxes: _ctx_spins[row][ctx_idx]
         self._ctx_spins: List[List[QDoubleSpinBox]] = []
+        # Boundary variable definitions (from objective boundaries)
+        self._bnd_vars: List[BoundaryVariableConfig] = []
+        if session_state and session_state.study_config:
+            self._bnd_vars = list(getattr(session_state.study_config, "boundary_variables", []))
+        # Objective boundaries (for real-time violation checks)
+        self._obj_boundaries: List[ObjectiveBoundary] = []
+        if session_state and session_state.study_config:
+            self._obj_boundaries = list(getattr(session_state.study_config, "objective_boundaries", []))
+        # Per-row boundary spinboxes: _bnd_spins[row][bnd_idx]
+        self._bnd_spins: List[List[QDoubleSpinBox]] = []
         # Set of trial numbers the user has chosen to skip (purge)
         self._skipped_trials: set[int] = set()
         # Near-duplicate hits (list of dicts from find_near_duplicates)
@@ -204,10 +214,15 @@ class BatchResultsDialog(QDialog):
             [f"{cv.column_name} (context)" for cv in self._ctx_vars]
             if self._ctx_vars else []
         )
+        # Boundary variable columns — measurements required for feasibility gates
+        _bnd_col_labels = (
+            [f"{bv.column_name} ⚠boundary" for bv in self._bnd_vars]
+            if self._bnd_vars else []
+        )
         # "Action" column (Skip button) is always the last column
         all_cols = (
             ["Trial #"] + param_names + obj_names + _pred_col_labels
-            + _ctx_col_labels + ["Action"]
+            + _ctx_col_labels + _bnd_col_labels + ["Action"]
         )
 
         self._table = QTableWidget(len(self._pending_batch), len(all_cols))
@@ -357,6 +372,70 @@ class BatchResultsDialog(QDialog):
                 row_ctx_spins.append(ctx_spin)
                 col += 1
             self._ctx_spins.append(row_ctx_spins)
+
+            # ── Boundary variable spinboxes (feasibility gate measurements) ─
+            _BND_SPIN_STYLE_OK = (
+                "QDoubleSpinBox {"
+                "  background-color: #d4f5e2;"   # light green — within limit
+                "  color: #1a1a2e;"
+                "  border: 2px solid #4ade80;"
+                "  border-radius: 4px;"
+                "  padding: 6px 8px;"
+                "  font-size: 13px;"
+                "  min-height: 32px;"
+                "}"
+                "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; }"
+            )
+            _BND_SPIN_STYLE_NEUTRAL = (
+                "QDoubleSpinBox {"
+                "  background-color: #fef9c3;"   # light yellow — not yet checked
+                "  color: #1a1a2e;"
+                "  border: 2px solid #f9e2af;"
+                "  border-radius: 4px;"
+                "  padding: 6px 8px;"
+                "  font-size: 13px;"
+                "  min-height: 32px;"
+                "}"
+                "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; }"
+            )
+            _BND_SPIN_STYLE_FAIL = (
+                "QDoubleSpinBox {"
+                "  background-color: #fee2e2;"   # light red — boundary violated
+                "  color: #1a1a2e;"
+                "  border: 2px solid #f38ba8;"
+                "  border-radius: 4px;"
+                "  padding: 6px 8px;"
+                "  font-size: 13px;"
+                "  min-height: 32px;"
+                "}"
+                "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; }"
+            )
+
+            row_bnd_spins: List[QDoubleSpinBox] = []
+            for bv in self._bnd_vars:
+                bnd_spin = QDoubleSpinBox()
+                bnd_spin.setRange(-1e12, 1e12)
+                bnd_spin.setDecimals(8)
+                bnd_spin.setSingleStep(0.001)
+                bnd_spin.setStyleSheet(_BND_SPIN_STYLE_NEUTRAL)
+                bnd_spin.setMinimumHeight(34)
+                bnd_spin.setToolTip(
+                    f"Boundary measurement: '{bv.column_name}'\n"
+                    "Enter the measured value.  The cell turns green if the\n"
+                    "objective boundary is satisfied, red if violated.\n"
+                    "Violations are recorded but do not block submission."
+                )
+                # Connect real-time violation feedback
+                bnd_spin.valueChanged.connect(
+                    lambda _v, r=row_idx: self._check_bnd_violations(r)
+                )
+                self._table.setCellWidget(row_idx, col, bnd_spin)
+                row_bnd_spins.append(bnd_spin)
+                col += 1
+            if not hasattr(self, "_bnd_spins") or len(self._bnd_spins) <= row_idx:
+                self._bnd_spins.append(row_bnd_spins)
+            else:
+                self._bnd_spins[row_idx] = row_bnd_spins
 
             # ── Skip (Purge) button ────────────────────────────────────────
             skip_label = "⚠  Skip (Duplicate)" if is_dup else "Skip Trial"
@@ -1018,3 +1097,115 @@ class BatchResultsDialog(QDialog):
         else:
             spin.setStyleSheet(self._SPIN_STYLE)
             spin.setToolTip("")
+
+    # ── Objective boundary violation feedback ───────────────────────────────
+
+    def _check_bnd_violations(self, row_idx: int) -> None:
+        """
+        Re-evaluate all objective boundaries against the currently entered
+        boundary spinbox values for *row_idx* and update cell colours.
+
+        Green  = all boundaries satisfied.
+        Red    = at least one boundary violated.
+        Yellow = initial / neutral state (never been changed by the user).
+
+        This method is silent on any error — the dialog always works
+        normally even if the check fails.
+        """
+        if not self._obj_boundaries or not self._bnd_vars:
+            return
+        if row_idx >= len(self._bnd_spins):
+            return
+
+        row_bnd_spins = self._bnd_spins[row_idx]
+
+        # Build a dict of current boundary variable values from the spinboxes
+        bnd_vals: dict = {}
+        for bnd_idx, bv in enumerate(self._bnd_vars):
+            if bnd_idx < len(row_bnd_spins):
+                try:
+                    bnd_vals[bv.column_name] = float(row_bnd_spins[bnd_idx].value())
+                except Exception:
+                    pass
+
+        _STYLE_OK = (
+            "QDoubleSpinBox {"
+            "  background-color: #d4f5e2; color: #1a1a2e;"
+            "  border: 2px solid #4ade80; border-radius: 4px;"
+            "  padding: 6px 8px; font-size: 13px; min-height: 32px; }"
+            "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; }"
+        )
+        _STYLE_FAIL = (
+            "QDoubleSpinBox {"
+            "  background-color: #fee2e2; color: #1a1a2e;"
+            "  border: 2px solid #f38ba8; border-radius: 4px;"
+            "  padding: 6px 8px; font-size: 13px; min-height: 32px; }"
+            "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; }"
+        )
+
+        # Check each boundary and update each relevant spinbox
+        for bnd_idx, bv in enumerate(self._bnd_vars):
+            if bnd_idx >= len(row_bnd_spins):
+                continue
+            spin = row_bnd_spins[bnd_idx]
+            # Find all boundaries that reference this column
+            col_violated = False
+            for b in self._obj_boundaries:
+                try:
+                    satisfied, _ = b.is_satisfied(bnd_vals)
+                    if not satisfied:
+                        col_violated = True
+                        break
+                except Exception:
+                    pass
+            if col_violated:
+                spin.setStyleSheet(_STYLE_FAIL)
+                spin.setToolTip(
+                    f"⚠ '{bv.column_name}' violates an objective boundary.\n"
+                    "This experiment will be recorded as infeasible.\n"
+                    "You can still submit — data is always kept."
+                )
+            else:
+                spin.setStyleSheet(_STYLE_OK)
+                spin.setToolTip(
+                    f"✓ '{bv.column_name}' is within the boundary limit."
+                )
+
+    def get_boundary_values(self) -> List[dict]:
+        """
+        Return the boundary variable measurements entered by the user for each
+        trial row.
+
+        Returns
+        -------
+        List of dicts, one per pending trial (in order), mapping boundary
+        variable column names to their float values.
+        Skipped trials get an empty dict ``{}``.
+
+        Example output (2 rows, boundary variable "purity")::
+
+            [
+                {"purity": 97.2},   # trial 0 — within limit (>= 95.0)
+                {"purity": 92.8},   # trial 1 — violates (< 95.0)
+            ]
+
+        Called by the main window / worker after ``results_submitted`` is emitted.
+        """
+        bnd_values: List[dict] = []
+        for row_idx in range(len(self._pending_batch)):
+            trial_number = self._pending_batch[row_idx]["trial_number"]
+            if trial_number in self._skipped_trials:
+                bnd_values.append({})
+                continue
+            row_dict: dict = {}
+            if row_idx < len(self._bnd_spins):
+                for bnd_idx, bv in enumerate(self._bnd_vars):
+                    if bnd_idx < len(self._bnd_spins[row_idx]):
+                        try:
+                            row_dict[bv.column_name] = float(
+                                self._bnd_spins[row_idx][bnd_idx].value()
+                            )
+                        except Exception:
+                            pass
+            bnd_values.append(row_dict)
+        return bnd_values
