@@ -1727,7 +1727,33 @@ class MainWindow(QMainWindow):
                 ctx_configs.append(ContextConfig(column_name=col))
                 ctx_col_names.append(col)
 
-        params = extract_param_defaults(self._df, result_cols, context_columns=ctx_col_names)
+        # Auto-detect parameter types and ranges from the CSV.
+        # If param cards already exist (the user is re-applying after manually
+        # changing types or disabling columns), preserve those manual overrides
+        # rather than re-detecting everything from scratch.
+        auto_params = extract_param_defaults(self._df, result_cols, context_columns=ctx_col_names)
+
+        if self._param_cards:
+            # Build a lookup of current param card configurations keyed by column name.
+            # These reflect any manual type changes (e.g. CATEGORICAL → INT) or
+            # disabled columns the user made since the last Apply.
+            existing_configs = {
+                c.get_config().name: c.get_config()
+                for c in self._param_cards
+            }
+            params = []
+            for auto_p in auto_params:
+                if auto_p.name in existing_configs:
+                    # Preserve the user's manual settings entirely.
+                    # This means type overrides, dead regions, enabled state, etc.
+                    # are all kept across Apply Objectives clicks.
+                    params.append(existing_configs[auto_p.name])
+                else:
+                    # New column that wasn't a param before → use auto-detected config.
+                    params.append(auto_p)
+        else:
+            # First Apply — use purely auto-detected configs.
+            params = auto_params
 
         config = StudyConfig(
             parameters=params,
