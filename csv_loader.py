@@ -44,11 +44,14 @@ def infer_column_type(series: pd.Series, categorical_threshold: int = 8) -> Para
 
     Decision order
     --------------
-    1. BOOL   — dtype bool, or ≤ 2 unique values all in {0, 1, True, False}
+    1. BOOL        — dtype bool, or ≤ 2 unique values all in {0, 1, True, False}
     2. CATEGORICAL — object / string dtype
-    3. CATEGORICAL — numeric but n_unique ≤ categorical_threshold
-    4. INT    — numeric, all non-null values equal their integer cast
-    5. FLOAT  — everything else
+    3. INT         — all non-null values equal their integer cast
+                     (checked BEFORE categorical threshold so that INT columns
+                     with few distinct levels, e.g. [1, 2, 3, 4], are not
+                     wrongly promoted to CATEGORICAL)
+    4. CATEGORICAL — numeric, non-integer, n_unique ≤ categorical_threshold
+    5. FLOAT       — everything else
     """
     non_null = series.dropna()
     if len(non_null) == 0:
@@ -67,18 +70,20 @@ def infer_column_type(series: pd.Series, categorical_threshold: int = 8) -> Para
     if series.dtype == object or pd.api.types.is_string_dtype(series):
         return ParameterType.CATEGORICAL
 
-    # 3. Few unique numeric values → categorical
-    n_unique = non_null.nunique()
-    if n_unique <= categorical_threshold:
-        return ParameterType.CATEGORICAL
-
-    # 4. All values equal their int cast → INT
+    # 3. All values equal their int cast → INT (checked BEFORE categorical threshold)
+    #    This ensures integer columns with few unique levels (e.g. [1, 2, 3, 4])
+    #    are not mis-classified as CATEGORICAL.
     try:
         as_int = non_null.values.astype(int).astype(float)
         if np.allclose(non_null.values.astype(float), as_int, atol=0, rtol=0):
             return ParameterType.INT
     except (ValueError, TypeError, OverflowError):
         pass
+
+    # 4. Few unique non-integer numeric values → categorical
+    n_unique = non_null.nunique()
+    if n_unique <= categorical_threshold:
+        return ParameterType.CATEGORICAL
 
     # 5. Default float
     return ParameterType.FLOAT

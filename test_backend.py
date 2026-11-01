@@ -158,9 +158,17 @@ class TestInferColumnType:
         s = pd.Series(["THF", "DMF", "NMP", "THF"])
         assert infer_column_type(s) == ParameterType.CATEGORICAL
 
-    def test_categorical_few_numeric(self):
-        s = pd.Series([1, 2, 3, 1, 2])   # ≤ 8 unique → categorical
+    def test_categorical_few_numeric_floats(self):
+        # Non-integer floats with few unique values → CATEGORICAL
+        s = pd.Series([1.5, 2.5, 3.5, 1.5, 2.5])
         assert infer_column_type(s) == ParameterType.CATEGORICAL
+
+    def test_int_few_unique_not_categorical(self):
+        # Integer values with few unique levels must be INT, not CATEGORICAL.
+        # This was the original bug: the categorical threshold check fired before
+        # the INT check, causing e.g. [1, 2, 3, 4] to be mis-classified.
+        s = pd.Series([1, 2, 3, 1, 2, 3, 4, 2])
+        assert infer_column_type(s) == ParameterType.INT
 
     def test_int_many_unique(self):
         s = pd.Series(list(range(50, 150)))   # 100 unique integers
