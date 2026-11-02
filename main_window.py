@@ -1800,6 +1800,33 @@ class MainWindow(QMainWindow):
             self._session_state.study_name,
         )
 
+        # ── Detect distribution-kind conflicts ─────────────────────────────
+        # If a parameter's type was changed (e.g. CATEGORICAL → INT) the old
+        # Optuna study in the SQLite DB will have trials with the old distribution
+        # type.  Calling study.ask() with the new distribution would raise
+        # "Cannot set different distribution kind to the same parameter name."
+        # Detect this and rebuild the study from scratch so the CSV historical
+        # data is reloaded with the correct distributions.
+        from optuna_builder import build_distributions as _build_dists
+        _new_dists = _build_dists(config)
+        _has_dist_conflict = any(
+            type(_old_d) != type(_new_dists[_pname])
+            for _t in self._study.trials
+            for _pname, _old_d in _t.distributions.items()
+            if _pname in _new_dists
+        )
+        if _has_dist_conflict:
+            _log.info(
+                "Distribution-kind conflict detected after type change — "
+                "rebuilding study from scratch so the new parameter types apply cleanly."
+            )
+            self._study = rebuild_study_without_trials(
+                config,
+                self._session_state.storage_path,
+                self._session_state.study_name,
+                [],   # empty — CSV historical data is reloaded below
+            )
+
         # ── Replicate aggregation (Feature 8) ─────────────────────────────
         repl_enabled = (
             self._repl_cb is not None and self._repl_cb.isChecked()
@@ -1933,15 +1960,11 @@ class MainWindow(QMainWindow):
         import ast as _ast
         all_result_cols: List[str] = []
         if self._df is not None and self._session_state is not None:
-            param_names = {p.name for p in self._session_state.study_config.parameters}
-            ctx_names   = {
-                cv.column_name
-                for cv in getattr(self._session_state.study_config, "context_variables", [])
-            }
-            all_result_cols = [
-                c for c in self._df.columns
-                if c not in param_names and c not in ctx_names
-            ]
+            # Include ALL non-objective columns so users can define boundaries
+            # on measurement/calculation columns — including disabled parameter
+            # columns and any other derived values in the CSV.
+            obj_col_set = {o.column_name for o in self._session_state.study_config.objectives}
+            all_result_cols = [c for c in self._df.columns if c not in obj_col_set]
         elif self._df is not None:
             all_result_cols = list(self._df.columns)
 
@@ -2554,8 +2577,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Study Load Error", str(exc))
             return
 
-        # Restore UI from config (including constraints)
-        self._constraints = list(cfg.constraints)
+        # Restore UI from config (including constraints and objective boundaries)
+        self._constraints          = list(cfg.constraints)
+        self._objective_boundaries = list(getattr(cfg, 'objective_boundaries', []))
+        self._boundary_variables   = list(getattr(cfg, 'boundary_variables', []))
         self._sampler_combo.setCurrentText(cfg.sampler_name)
         self._batch_size_spin.setValue(cfg.batch_size)
         self._n_batches_spin.setValue(cfg.n_batches)
@@ -2566,6 +2591,9 @@ class MainWindow(QMainWindow):
         self._as_improve_spin.setEnabled(cfg.auto_stop)
         self._as_nbatches_spin.setEnabled(cfg.auto_stop)
         self._build_param_cards(cfg.parameters)
+        # Rebuild the "Current Conditions" spinboxes for context variables so they
+        # appear immediately on session load — without requiring a re-Apply.
+        self._rebuild_context_conditions_ui(list(getattr(cfg, 'context_variables', [])))
         self._refresh_results_tables()
         self._update_warnings()
         self._update_status_bar()
