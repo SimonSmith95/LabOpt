@@ -199,25 +199,40 @@ def generate_report(
     trials_df: pd.DataFrame,
     figures: Dict[str, object],   # {label: matplotlib.figure.Figure}
     best_rows: List[dict],
+    sections: Optional[set] = None,
+    health_report: Optional[dict] = None,
 ) -> str:
     """
     Build a self-contained HTML report of an optimisation session.
 
     Parameters
     ----------
-    metadata  : dict with keys:
-                    session_name, date, sampler, n_batches, objectives
-                    (all string-valued; objectives may be a list of str)
-    trials_df : DataFrame of all completed trials (may be empty).
-    figures   : Mapping of label → Matplotlib Figure.  Recognised keys:
-                    "convergence", "pareto", "design_space", "correlation",
-                    "importance"  (any others are included under their label).
-    best_rows : List of dicts for the Pareto / best-trial table.
+    metadata      : dict with keys:
+                        session_name, date, sampler, n_batches, objectives
+                        (all string-valued; objectives may be a list of str)
+    trials_df     : DataFrame of all completed trials (may be empty).
+    figures       : Mapping of label → Matplotlib Figure.  Recognised keys:
+                        "convergence", "pareto", "design_space", "correlation",
+                        "importance"  (any others are included under their label).
+    best_rows     : List of dicts for the Pareto / best-trial table.
+    sections      : Optional set of section keys to include.  When None all
+                    sections are included (backward-compatible).  Keys:
+                        "dataset_health", "all_trials", "best_pareto",
+                        "convergence", "pareto_front", "design_space",
+                        "validation", "doe_design"
+                    Figure keys "correlation" and "importance" are always
+                    included with "design_space" for convenience.
+    health_report : Optional dict as returned by dataset_health.analyze_dataset().
+                    Required for the "dataset_health" section.
 
     Returns
     -------
     str — complete HTML document.
     """
+    def _in(key: str) -> bool:
+        """Return True if the section should be included."""
+        return sections is None or key in sections
+
     session_name = metadata.get("session_name", "LabOpt Session")
     date_str     = metadata.get("date", datetime.date.today().isoformat())
     sampler      = metadata.get("sampler", "—")
@@ -254,6 +269,81 @@ def generate_report(
     if doe_strategy:
         meta_rows += f'<span class="meta-key">DoE strategy</span><span class="meta-val">{doe_strategy}</span>'
     meta_html = f'<div class="meta-grid">{meta_rows}</div>'
+
+    # ── Dataset health section ─────────────────────────────────────────────
+    health_html = ""
+    if _in("dataset_health") and health_report is not None:
+        def _fmt_val(v) -> str:
+            if v is None:
+                return "—"
+            if isinstance(v, float):
+                return f"{v:.4g}"
+            return str(v)
+
+        def _health_row(label: str, value: str, tooltip: str = "") -> str:
+            tt = f' title="{tooltip}"' if tooltip else ""
+            return (
+                f"<tr><td{tt} style='color:#89b4fa;font-weight:bold'>{label}</td>"
+                f"<td>{value}</td></tr>"
+            )
+
+        hp = health_report
+        overview_rows = "".join([
+            _health_row("Rows", _fmt_val(hp.get("n_rows")),
+                        "Total row count after cleaning."),
+            _health_row("Complete rows", _fmt_val(hp.get("n_complete")),
+                        "Rows with no missing values in parameter or objective columns."),
+            _health_row("Missing (%)", _fmt_val(hp.get("missing_pct")),
+                        "Percentage of missing cells across parameter and objective columns."),
+            _health_row("Parameters", _fmt_val(hp.get("n_params")),
+                        "Number of enabled parameter columns."),
+            _health_row("Objectives", _fmt_val(hp.get("n_objectives")),
+                        "Number of objective columns."),
+            _health_row("Rows per parameter", _fmt_val(hp.get("rows_per_param")),
+                        "Ratio of complete rows to number of parameters."),
+        ])
+        health_html = (
+            "<h2>Dataset Statistics</h2>"
+            "<p style='color:#6c6f85;font-size:12px;font-style:italic'>"
+            "These statistics describe the loaded dataset. "
+            "Hover column headers for metric definitions.</p>"
+            f"<table><thead><tr><th>Metric</th><th>Value</th></tr></thead>"
+            f"<tbody>{overview_rows}</tbody></table>"
+        )
+
+        for obj in hp.get("objectives", []):
+            col = obj.get("column", "?")
+            obj_rows = "".join([
+                _health_row("Valid rows", _fmt_val(obj.get("n_valid")),
+                            "Non-missing values in this objective column."),
+                _health_row("Mean", _fmt_val(obj.get("mean")),
+                            "Arithmetic mean of all non-missing values."),
+                _health_row("Std", _fmt_val(obj.get("std")),
+                            "Sample standard deviation."),
+                _health_row("Min / Max",
+                            f"{_fmt_val(obj.get('min'))} / {_fmt_val(obj.get('max'))}",
+                            "Minimum and maximum observed values."),
+                _health_row("Median", _fmt_val(obj.get("median")),
+                            "50th percentile."),
+                _health_row("IQR", _fmt_val(obj.get("iqr")),
+                            "Interquartile range: Q3 − Q1."),
+                _health_row("CV (%)", _fmt_val(obj.get("cv_pct")),
+                            "Coefficient of Variation: (std / |mean|) × 100 %."),
+                _health_row("Outliers (IQR)", _fmt_val(obj.get("outlier_count")),
+                            "Rows outside [Q1 − 1.5·IQR, Q3 + 1.5·IQR] (Tukey, 1977)."),
+                _health_row("Replicate groups", _fmt_val(obj.get("replicate_groups")),
+                            "Parameter combos with ≥ 2 runs — enables noise estimation."),
+                _health_row("Noise std (replicates)",
+                            _fmt_val(obj.get("noise_std_replicates")),
+                            "Pooled within-replicate std. Blank if < 2 replicate groups."),
+                _health_row("SNR", _fmt_val(obj.get("snr")),
+                            "Signal-to-Noise Ratio: (max − min) / noise_std. Blank if no noise estimate."),
+            ])
+            health_html += (
+                f"<h3>Objective: {col}</h3>"
+                f"<table><thead><tr><th>Metric</th><th>Value</th></tr></thead>"
+                f"<tbody>{obj_rows}</tbody></table>"
+            )
 
     # ── Best / Pareto table ────────────────────────────────────────────────
     if best_rows:
@@ -352,6 +442,11 @@ def generate_report(
         val_html = "\n".join(val_html_parts)
 
     # ── Assemble HTML ──────────────────────────────────────────────────────
+    _best_section   = f"<h2>Best / Pareto Results</h2>\n{best_html}"   if _in("best_pareto")  else ""
+    _trials_section = f"<h2>All Completed Trials</h2>\n{trials_html}"  if _in("all_trials")   else ""
+    _plots_section  = f"<h2>Plots</h2>\n{fig_rows_html}"               if _in("convergence") or _in("design_space") or _in("pareto_front") else ""
+    _val_section    = val_html                                           if _in("validation")   else ""
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -365,21 +460,20 @@ def generate_report(
 <body>
 <div class="page">
 
-<h1>🔬 LabOpt Optimisation Report</h1>
+<h1>LabOpt Optimisation Report</h1>
 
 <h2>Session Summary</h2>
 {meta_html}
 
-<h2>Best / Pareto Results</h2>
-{best_html}
+{health_html}
 
-<h2>Plots</h2>
-{fig_rows_html}
+{_best_section}
 
-{val_html}
+{_plots_section}
 
-<h2>All Completed Trials</h2>
-{trials_html}
+{_val_section}
+
+{_trials_section}
 
 <footer>
   Generated by LabOpt &mdash; {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -659,6 +753,274 @@ def write_report(html: str, directory: str) -> str:
     path = os.path.join(directory, f"labopt_report_{ts}.html")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(html)
+    return path
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CSV export
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_csv_report(
+    metadata: dict,
+    trials_df: pd.DataFrame,
+    best_rows: List[dict],
+    sections: Optional[set] = None,
+    health_report: Optional[dict] = None,
+) -> str:
+    """
+    Build a CSV text export containing the selected tabular sections.
+
+    Charts and surrogate validation figures are not included (use HTML for
+    those).  Each section is separated by a blank line and a ``##`` comment
+    header so the file remains human-readable when opened in a text editor,
+    and importable section-by-section in pandas or Excel.
+
+    Parameters
+    ----------
+    metadata      : Same dict passed to ``generate_report()``.
+    trials_df     : DataFrame of all completed trials.
+    best_rows     : List of dicts for the best / Pareto table.
+    sections      : Optional set of section keys to include.  ``None`` = all.
+    health_report : Optional dict from ``dataset_health.analyze_dataset()``.
+
+    Returns
+    -------
+    str — UTF-8 CSV text.
+    """
+    def _in(key: str) -> bool:
+        return sections is None or key in sections
+
+    lines: List[str] = []
+
+    # ── File header with session metadata ─────────────────────────────────
+    lines.append("## LabOpt Export Report")
+    lines.append(f"## Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    for k, v in metadata.items():
+        if v:
+            safe_v = str(v).replace("\n", " ")
+            lines.append(f"## {k}: {safe_v}")
+    lines.append("")
+
+    # ── Dataset health ─────────────────────────────────────────────────────
+    if _in("dataset_health") and health_report is not None:
+        lines.append("## --- Dataset Statistics ---")
+        health_rows = []
+        hp = health_report
+        for metric, val in [
+            ("Rows",             hp.get("n_rows")),
+            ("Complete rows",    hp.get("n_complete")),
+            ("Missing (%)",      hp.get("missing_pct")),
+            ("Parameters",       hp.get("n_params")),
+            ("Objectives",       hp.get("n_objectives")),
+            ("Rows per param",   hp.get("rows_per_param")),
+        ]:
+            health_rows.append({"Metric": metric, "Value": val})
+        for obj in hp.get("objectives", []):
+            col = obj.get("column", "?")
+            for metric, val in [
+                (f"[{col}] Valid rows",           obj.get("n_valid")),
+                (f"[{col}] Mean",                 obj.get("mean")),
+                (f"[{col}] Std",                  obj.get("std")),
+                (f"[{col}] Min",                  obj.get("min")),
+                (f"[{col}] Max",                  obj.get("max")),
+                (f"[{col}] Median",               obj.get("median")),
+                (f"[{col}] IQR",                  obj.get("iqr")),
+                (f"[{col}] CV (%)",               obj.get("cv_pct")),
+                (f"[{col}] Outliers (IQR)",       obj.get("outlier_count")),
+                (f"[{col}] Replicate groups",     obj.get("replicate_groups")),
+                (f"[{col}] Noise std (replicates)", obj.get("noise_std_replicates")),
+                (f"[{col}] SNR",                  obj.get("snr")),
+            ]:
+                health_rows.append({"Metric": metric, "Value": val})
+        health_df = pd.DataFrame(health_rows)
+        lines.append(health_df.to_csv(index=False))
+        lines.append("")
+
+    # ── Best / Pareto table ────────────────────────────────────────────────
+    if _in("best_pareto") and best_rows:
+        lines.append("## --- Best / Pareto Results ---")
+        lines.append(pd.DataFrame(best_rows).to_csv(index=False))
+        lines.append("")
+
+    # ── All trials table ───────────────────────────────────────────────────
+    if _in("all_trials") and not trials_df.empty:
+        lines.append("## --- All Completed Trials ---")
+        lines.append(trials_df.to_csv(index=False))
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def write_report_csv(csv_text: str, directory: str) -> str:
+    """
+    Write *csv_text* to a timestamped ``.csv`` file inside *directory*.
+
+    Returns
+    -------
+    str — Absolute path to the written file.
+    """
+    os.makedirs(directory, exist_ok=True)
+    ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(directory, f"labopt_report_{ts}.csv")
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(csv_text)
+    return path
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Excel export
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_excel_report(
+    metadata: dict,
+    trials_df: pd.DataFrame,
+    best_rows: List[dict],
+    sections: Optional[set] = None,
+    health_report: Optional[dict] = None,
+) -> bytes:
+    """
+    Build an Excel (``.xlsx``) workbook containing the selected tabular sections.
+
+    Each section is written to a separate worksheet.  Charts and surrogate
+    validation figures are not included.
+
+    Requires ``openpyxl``.  If it is not installed a ``ImportError`` is raised
+    with a user-friendly message.
+
+    Parameters
+    ----------
+    metadata      : Same dict passed to ``generate_report()``.
+    trials_df     : DataFrame of all completed trials.
+    best_rows     : List of dicts for the best / Pareto table.
+    sections      : Optional set of section keys to include.  ``None`` = all.
+    health_report : Optional dict from ``dataset_health.analyze_dataset()``.
+
+    Returns
+    -------
+    bytes — Raw ``.xlsx`` binary content, ready to write to disk.
+    """
+    try:
+        import openpyxl  # noqa: F401 — confirm it is available before we start
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils.dataframe import dataframe_to_rows
+    except ImportError:
+        raise ImportError(
+            "The 'openpyxl' package is required for Excel export but is not "
+            "installed.\n\nInstall it with:\n    pip install openpyxl\n\n"
+            "Or use HTML or CSV export instead."
+        )
+
+    def _in(key: str) -> bool:
+        return sections is None or key in sections
+
+    _HEADER_FILL  = PatternFill("solid", fgColor="2A2A3E")
+    _HEADER_FONT  = Font(bold=True, color="89B4FA")
+    _TITLE_FONT   = Font(bold=True, size=13, color="89DCEB")
+    _META_KEY_FONT = Font(bold=True, color="89B4FA")
+
+    def _write_df(ws, df: pd.DataFrame, start_row: int = 1) -> int:
+        """Write a DataFrame to *ws* starting at *start_row*; return next row."""
+        for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True)):
+            for c_idx, val in enumerate(row, start=1):
+                cell = ws.cell(row=start_row + r_idx, column=c_idx, value=val)
+                if r_idx == 0:
+                    cell.font = _HEADER_FONT
+                    cell.fill = _HEADER_FILL
+                    cell.alignment = Alignment(horizontal="left")
+        return start_row + len(df) + 2  # +1 header +1 blank gap
+
+    wb = openpyxl.Workbook()
+    # Remove the default empty sheet
+    wb.remove(wb.active)
+
+    # ── Sheet 1: Session Summary ───────────────────────────────────────────
+    ws_meta = wb.create_sheet("Session Summary")
+    ws_meta.column_dimensions["A"].width = 22
+    ws_meta.column_dimensions["B"].width = 50
+    ws_meta["A1"] = "LabOpt Export Report"
+    ws_meta["A1"].font = _TITLE_FONT
+    ws_meta["A2"] = f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    ws_meta["A2"].font = Font(italic=True, color="6C6F85")
+    row = 4
+    for k, v in metadata.items():
+        if v:
+            cell_k = ws_meta.cell(row=row, column=1, value=str(k))
+            cell_k.font = _META_KEY_FONT
+            ws_meta.cell(row=row, column=2, value=str(v))
+            row += 1
+
+    # ── Sheet 2: Dataset Statistics ────────────────────────────────────────
+    if _in("dataset_health") and health_report is not None:
+        ws_health = wb.create_sheet("Dataset Statistics")
+        ws_health.column_dimensions["A"].width = 30
+        ws_health.column_dimensions["B"].width = 20
+        hp = health_report
+        health_rows = []
+        for metric, val in [
+            ("Rows",             hp.get("n_rows")),
+            ("Complete rows",    hp.get("n_complete")),
+            ("Missing (%)",      hp.get("missing_pct")),
+            ("Parameters",       hp.get("n_params")),
+            ("Objectives",       hp.get("n_objectives")),
+            ("Rows per param",   hp.get("rows_per_param")),
+        ]:
+            health_rows.append({"Metric": metric, "Value": val})
+        for obj in hp.get("objectives", []):
+            col = obj.get("column", "?")
+            for metric, val in [
+                (f"[{col}] Valid rows",             obj.get("n_valid")),
+                (f"[{col}] Mean",                   obj.get("mean")),
+                (f"[{col}] Std",                    obj.get("std")),
+                (f"[{col}] Min",                    obj.get("min")),
+                (f"[{col}] Max",                    obj.get("max")),
+                (f"[{col}] Median",                 obj.get("median")),
+                (f"[{col}] IQR",                    obj.get("iqr")),
+                (f"[{col}] CV (%)",                 obj.get("cv_pct")),
+                (f"[{col}] Outliers (IQR)",         obj.get("outlier_count")),
+                (f"[{col}] Replicate groups",       obj.get("replicate_groups")),
+                (f"[{col}] Noise std (replicates)", obj.get("noise_std_replicates")),
+                (f"[{col}] SNR",                    obj.get("snr")),
+            ]:
+                health_rows.append({"Metric": metric, "Value": val})
+        _write_df(ws_health, pd.DataFrame(health_rows))
+
+    # ── Sheet 3: Best / Pareto ─────────────────────────────────────────────
+    if _in("best_pareto") and best_rows:
+        ws_best = wb.create_sheet("Best & Pareto")
+        _write_df(ws_best, pd.DataFrame(best_rows))
+        # Auto-width columns (heuristic)
+        for col in ws_best.columns:
+            max_len = max((len(str(c.value or "")) for c in col), default=8)
+            ws_best.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+    # ── Sheet 4: All Trials ────────────────────────────────────────────────
+    if _in("all_trials") and not trials_df.empty:
+        ws_trials = wb.create_sheet("All Trials")
+        _write_df(ws_trials, trials_df)
+        for col in ws_trials.columns:
+            max_len = max((len(str(c.value or "")) for c in col), default=8)
+            ws_trials.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+    # Serialise to bytes
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def write_report_excel(data: bytes, directory: str) -> str:
+    """
+    Write raw ``.xlsx`` *data* to a timestamped file inside *directory*.
+
+    Returns
+    -------
+    str — Absolute path to the written file.
+    """
+    os.makedirs(directory, exist_ok=True)
+    ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(directory, f"labopt_report_{ts}.xlsx")
+    with open(path, "wb") as fh:
+        fh.write(data)
     return path
 
 

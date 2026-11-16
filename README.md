@@ -45,6 +45,24 @@ python main.py
 
 ---
 
+## Three-tab Workbench Layout
+
+LabOpt is organised as a workbench with three outer tabs in the left dock:
+
+| Tab | Purpose |
+|-----|---------|
+| **Settings** | Configure parameters, objectives, batch settings — Ask Next Batch |
+| **Analysis** | Dataset Statistics · Trials · Best/Pareto · Power Analysis |
+| **DoE** | Generate initial experiment designs before BO starts |
+
+The **Analysis tab** is the analysis workbench. Its four inner sub-tabs:
+- **Dataset Health** — descriptive statistics for the loaded dataset, shown automatically when objectives are applied
+- **Trials** — full table of all completed experiments
+- **Best / Pareto** — optimal results (single-obj best or Pareto front)
+- **Power Analysis** — statistical sample-size calculator
+
+---
+
 ## Key Features
 
 | Feature | Details |
@@ -54,7 +72,9 @@ python main.py
 | **Parameter constraints** | Algebraic equality & inequality rules (e.g. fractions summing to 1) |
 | **Dead regions** | Forbidden parameter sub-ranges the model never suggests |
 | **Context variables** | Uncontrollable environmental conditions (humidity, pressure) that the surrogate learns from without being suggested — corrections allowed after the experiment |
-| **🧪 Design of Experiments** | 8 strategies (LHS, Sobol, Halton, Full Factorial, Plackett-Burman, Box-Behnken, CCD, Random) to seed the surrogate before BO starts. Formula-based readiness indicator shows when to hand off to BO. Integrated coverage metrics, pairplot, main effects plots. |
+| **Dataset Statistics** | Descriptive statistics for the loaded dataset: rows, missing data, CV, replicate-based noise estimation, SNR. Shown automatically when objectives are applied. Hover any metric to see its definition and formula. No verdicts — data only. |
+| **Design of Experiments** | 8 strategies (LHS, Sobol, Halton, Full Factorial, Plackett-Burman, Box-Behnken, CCD, Random) to seed the surrogate before BO starts. Formula-based readiness indicator shows when to hand off to BO. |
+| **Unified Report Export** | Select which sections to include (Dataset Stats, Trials, Convergence, Validation, etc.) from one dialog. Surrogate Validation can be triggered directly from the export dialog — no tab-switching needed. |
 | **Session naming** | Human-readable project names, researcher field, and description stored in every session. Title bar and menus show project name instead of timestamp. |
 | **Session Browser** | File → Browse All Sessions… lists all projects by researcher, date, trial count, and status. |
 | **Docker / multi-user** | `LABOPT_SESSION_DIR` and `LABOPT_USER` environment variables for shared lab deployments. Per-user directory isolation on disk. |
@@ -63,13 +83,13 @@ python main.py
 | **Correlation matrix** | Pearson or Spearman heatmap across all parameters and objectives |
 | **Feature importance** | Permutation importance from a Random Forest surrogate |
 | **What-if Profiler** | Real-time predicted objective as you slide parameter values — context variable sliders included |
-| **Surrogate quality badge** | Cross-validated R² with traffic-light rating (✅ ⚠ 🔴) |
+| **Surrogate quality badge** | Cross-validated R² rating |
 | **Outlier detection** | Flags implausible result entries before you submit them |
 | **Replicate aggregation** | Merge near-duplicate rows and average their objective values |
 | **Auto-stop** | Halt automatically when the best value has converged |
-| **Headless / scripting API** | Run the full loop from Python with no GUI — context values accepted from any source (database, sensor, CSV) |
+| **Headless / scripting API** | Run the full loop from Python with no GUI |
 | **Power Analysis** | Sample-size calculator: given measurement spread σ and minimum detectable effect Δ, compute required N — with live power-curve and N-vs-Δ plots |
-| **Surrogate Validation** | Rigorous §0–§5 checks: data quality, RF + GP hold-out and cross-validated accuracy, virtual BO benchmark (GP+EI vs RF+EI vs Greedy vs Random), Expected Improvement marginals, pass/fail summary. Triggered from the Results tab checkbox. Results embedded in the HTML report and shown as tabs in the Design Space dialog. Requires ≥ 30 unique rows. |
+| **Surrogate Validation** | Rigorous §0–§5 checks: data quality, RF + GP hold-out and cross-validated accuracy, virtual BO benchmark, Expected Improvement marginals, pass/fail summary. Can be triggered from the Export Report dialog. Requires ≥ 30 unique rows. |
 
 ---
 
@@ -168,7 +188,7 @@ The key relationship is **Cohen's d = Δ / σ** — the ratio of the effect you 
 
 Click **📊 From data** to auto-fill σ from your loaded objective column. The live plots update instantly as you adjust inputs.
 
-> 📖 Full guide → [§ 3.12 Power Analysis](DOCUMENTATION.md#312-power-analysis--sample-size-calculator)
+> 📖 Full guide → [§ 3.14 Power Analysis](DOCUMENTATION.md#314-power-analysis--sample-size-calculator)
 
 ---
 
@@ -234,12 +254,12 @@ for _ in range(config.n_batches):
 
 ## Surrogate Validation
 
-Before trusting the model's suggestions, verify that the surrogate is actually learning from your data. Tick **🔬 Surrogate Validation** in the Results tab (next to Export Report):
+Before trusting the model's suggestions, verify that the surrogate is actually learning from your data. Switch to the **Analysis** tab and tick **Surrogate Validation** (next to the Export Report button):
 
 ```
-📊 Results tab  →  [📄 Export Report…]  [🔬 Surrogate Validation  ☐]
-                   [████████████████░░░░]  45% — §2 BO Benchmark…
-                   ✅  6/8 checks passed  (YELLOW)
+Analysis tab  →  [Export Report…]  [Surrogate Validation  ☐]
+                 [████████████████░░░░]  45% — §2 BO Benchmark…
+                 ✅  6/8 checks passed  (YELLOW)
 ```
 
 The engine runs five sections:
@@ -260,19 +280,23 @@ The engine runs five sections:
 - 7 new tabs appear in the Design Space dialog automatically.
 - All 7 plots are embedded in the **📄 Export Report** HTML.
 
-> 📖 Full guide → [§ 3.13 Surrogate Validation](DOCUMENTATION.md#313-surrogate-validation)
+> 📖 Full guide → [§ 3.16 Surrogate Validation](DOCUMENTATION.md#316-surrogate-validation)
 
 ---
 
 ## Design Space Visualisation
 
-Open **📊 Design Space…** in the Results tab for:
+The Design Space is permanently embedded in the right-hand panel of the main
+window. Switch to **Analysis → Trials** or **Analysis → Best/Pareto** to see it.
+No button click needed — the panel is always live.
 
-- **Pairplot / parallel coordinates / marginals** — where your data lives in parameter space, coloured by objective value.
-- **Batch overlay** — suggested experiments shown as pink stars before the results dialog opens.
-- **Correlation matrix** — which parameters drive each objective.
-- **Importance chart** — Random Forest permutation importances.
-- **Profiler** — adjust sliders and see the predicted objective update in real time.
+| Panel | Contents |
+|-------|----------|
+| **Pairplot / parallel coordinates / marginals** | Historical data coloured by objective value |
+| **Batch overlay** | Suggested experiments as pink stars, automatically overlaid before the results dialog opens |
+| **Correlation matrix** | Which parameters drive each objective (Pearson or Spearman) |
+| **Importance chart** | Random Forest permutation importances |
+| **Profiler** | Adjust parameter sliders and see the predicted objective update in real time |
 
 > 📖 Design space guide → [§ 3.9 Design Space Visualisation](DOCUMENTATION.md#39-design-space-visualisation)
 
@@ -285,8 +309,8 @@ All details, module references, architecture diagrams, and troubleshooting are i
 | Section | Topic |
 |---|---|
 | [§ 3](DOCUMENTATION.md#3-how-to-use-the-application-gui-walkthrough) | Complete GUI walkthrough |
-| [§ 3.11](DOCUMENTATION.md#311-context-variables-uncontrollable-environmental-conditions) | Context variables — how the surrogate learns from uncontrollable conditions |
-| [§ 3.12](DOCUMENTATION.md#312-power-analysis--sample-size-calculator) | Power Analysis — sample size calculator |
+| [§ 3.12](DOCUMENTATION.md#312-context-variables-uncontrollable-environmental-conditions) | Context variables — how the surrogate learns from uncontrollable conditions |
+| [§ 3.14](DOCUMENTATION.md#314-power-analysis--sample-size-calculator) | Power Analysis — sample size calculator |
 | [§ 4](DOCUMENTATION.md#4-headless--scripting-mode) | Headless / scripting API |
 | [§ 5](DOCUMENTATION.md#5-codebase-architecture) | Architecture & module dependency diagram |
 | [§ 6](DOCUMENTATION.md#6-module-reference) | Module-level API reference |
