@@ -50,12 +50,29 @@ from PySide6.QtWidgets import (
 
 from app_logger import get_logger, log_path
 from batch_results_dialog import BatchResultsDialog
+from dataset_health_widget import DatasetHealthWidget
 from design_space_widget import ConvergenceWidget, DesignSpaceDialog, ParetoWidget
 
 _log = get_logger(__name__)
 from power_analysis_widget import PowerAnalysisCoordinator
-from csv_loader import aggregate_replicates, extract_param_defaults, infer_context_defaults, load_csv, load_trials_from_csv
-from report_generator import export_plots_as_png, generate_report, write_report
+from csv_loader import (
+    aggregate_replicates,
+    extract_param_defaults,
+    get_excel_sheet_names,
+    infer_context_defaults,
+    load_csv,
+    load_trials_from_csv,
+)
+from report_generator import (
+    export_plots_as_png,
+    generate_csv_report,
+    generate_excel_report,
+    generate_report,
+    write_report,
+    write_report_csv,
+    write_report_excel,
+)
+from report_export_dialog import ReportExportDialog
 from surrogate_quality import MIN_TRIALS, compute_surrogate_quality, predict_batch
 from optuna_builder import (
     build_study,
@@ -601,6 +618,9 @@ class MainWindow(QMainWindow):
         self._planned_context: Optional[dict] = None
         # Reference to results dialog so we can collect context corrections after submit
         self._active_batch_dlg: Optional[BatchResultsDialog] = None
+        # Skip log from the most recent load_trials_from_csv call.
+        # Stored so the user can open a detail dialog at any time.
+        self._last_skip_log: List[dict] = []
 
         # ── Pending project identity (set by NewSessionDialog, consumed by _action_apply_objectives) ──
         self._pending_project_name: str = ""
@@ -1108,35 +1128,53 @@ class MainWindow(QMainWindow):
         rbtn_row3.addWidget(self._restore_all_btn)
         rvbox.addLayout(rbtn_row3)
 
-        self._results_tabs = QTabWidget()
+        # ── Inner sub-tabs for the Analysis tab ───────────────────────
+        self._analysis_tabs = QTabWidget()
 
+        # Inner sub-tab 0 — Dataset Health
+        # The statistics content lives in the centre panel (DatasetHealthWidget).
+        # The left-panel inner tab just carries the label; a small note guides
+        # the user to look right.
+        _health_left = QWidget()
+        _health_left_vbox = QVBoxLayout(_health_left)
+        _health_left_vbox.setContentsMargins(6, 6, 6, 6)
+        _health_left_note = QLabel(
+            "Dataset statistics are displayed in the right panel."
+        )
+        _health_left_note.setAlignment(Qt.AlignCenter)
+        _health_left_note.setWordWrap(True)
+        _health_left_note.setStyleSheet(
+            "color: #6c6f85; font-style: italic; font-size: 11px; padding: 20px;"
+        )
+        _health_left_vbox.addWidget(_health_left_note)
+        self._analysis_tabs.addTab(_health_left, "Dataset Health")
+
+        # Inner sub-tab 1 — Trials
         self._trials_table = QTableWidget()
         self._trials_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._trials_table.horizontalHeader().setStretchLastSection(True)
         self._trials_table.setAlternatingRowColors(True)
-        self._results_tabs.addTab(self._trials_table, "All Trials")
+        self._analysis_tabs.addTab(self._trials_table, "Trials")
 
+        # Inner sub-tab 2 — Best / Pareto
         self._pareto_table = QTableWidget()
         self._pareto_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._pareto_table.horizontalHeader().setStretchLastSection(True)
         self._pareto_table.setAlternatingRowColors(True)
-        self._results_tabs.addTab(self._pareto_table, "Best / Pareto")
+        self._analysis_tabs.addTab(self._pareto_table, "Best / Pareto")
 
-        rvbox.addWidget(self._results_tabs, stretch=1)
-        self._left_tabs.addTab(results_widget, "Results")
-
-        # ══════════════════════════════════════════════════════════════
-        # Tab 3 — 🔬 Power Analysis
-        # Input form lives in the left dock; result panel + plots go in
-        # the centre QStackedWidget (page 1, added here so _build_left_dock
-        # and _build_centre can share self._centre_stack).
-        # ══════════════════════════════════════════════════════════════
+        # Inner sub-tab 3 — Power Analysis (input panel only;
+        # result panel lives in the centre stack)
         self._power = PowerAnalysisCoordinator()
-        self._left_tabs.addTab(self._power.input_panel, "Power Analysis")
-        self._centre_stack.addWidget(self._power.result_panel)  # index 1
+        self._analysis_tabs.addTab(self._power.input_panel, "Power Analysis")
+        self._centre_stack.addWidget(self._power.result_panel)
+
+        self._analysis_tabs.currentChanged.connect(self._on_analysis_inner_tab_changed)
+        rvbox.addWidget(self._analysis_tabs, stretch=1)
+        self._left_tabs.addTab(results_widget, "Analysis")
 
         # ══════════════════════════════════════════════════════════════
-        # Tab 4 — 🧪 DoE
+        # Tab 2 — DoE
         # ══════════════════════════════════════════════════════════════
         self._doe_widget = DoEWidget(parent=self)
         self._left_tabs.addTab(self._doe_widget, "DoE")
@@ -1203,15 +1241,21 @@ class MainWindow(QMainWindow):
         self._scroll.setWidget(self._cards_container)
         # Add scroll area as page 0 of the centre stacked widget.
         # Page 1 (power result panel) is added in _build_left_dock().
-        self._centre_stack.addWidget(self._scroll)   # index 0
-        # index 1: self._power.result_panel  (added in _build_left_dock)
+        self._centre_stack.addWidget(self._scroll)
+        # (self._power.result_panel added in _build_left_dock)
 
-        # ── Page 2: Embedded Design Space panel ──────────────────────────
+        # ── Dataset Health panel ─────────────────────────────────────────
+        # Shown when Analysis tab + "Dataset Health" inner sub-tab is active.
+        self._health_widget = DatasetHealthWidget(parent=self)
+        self._health_widget.refresh_requested.connect(self._on_health_refresh_requested)
+        self._centre_stack.addWidget(self._health_widget)
+
+        # ── Embedded Design Space panel ───────────────────────────────────
         # Full-featured tabbed analysis view (pairplot, correlation, importance,
         # profiler, convergence, Pareto, validation) embedded permanently.
-        # Shown whenever the 📊 Results tab is active.
+        # Shown when Analysis → Trials or Best / Pareto inner sub-tab is active.
         self._design_space_panel = DesignSpaceDialog(parent=self, embedded=True)
-        self._centre_stack.addWidget(self._design_space_panel)  # index 2
+        self._centre_stack.addWidget(self._design_space_panel)
 
         # Aliases so existing code continues to work without changes:
         self._design_space_dlg   = self._design_space_panel
@@ -1224,11 +1268,11 @@ class MainWindow(QMainWindow):
             self._on_sampler_switch_requested
         )
 
-        # ── Page 3: DoE visualisation panel ──────────────────────────────
+        # ── DoE visualisation panel ───────────────────────────────────────
         # Pairplot (left) + coverage metrics bar chart (right).
-        # Shown when the user switches to the 🧪 DoE tab.
+        # Shown when the user switches to the DoE tab (outer tab 2).
         self._doe_panel = self._build_doe_panel()
-        self._centre_stack.addWidget(self._doe_panel)      # index 3
+        self._centre_stack.addWidget(self._doe_panel)
 
         vbox.addWidget(self._centre_stack)
 
@@ -1510,8 +1554,39 @@ class MainWindow(QMainWindow):
             "CSV files (*.csv);;"
             "Excel files (*.xlsx *.xls)"
         )
-        if path:
-            self._do_load_csv(path)
+        if not path:
+            return
+
+        # For Excel workbooks with multiple sheets, ask the user which one to load.
+        sheet_name: Optional[str] = None
+        _ext = os.path.splitext(path)[1].lower()
+        if _ext in (".xlsx", ".xls"):
+            _sheets = get_excel_sheet_names(path)
+            if len(_sheets) > 1:
+                sheet_name = self._pick_excel_sheet(path, _sheets)
+                if sheet_name is None:
+                    return   # user cancelled the sheet picker
+
+        self._do_load_csv(path, sheet_name=sheet_name)
+
+    def _pick_excel_sheet(self, path: str, sheets: List[str]) -> Optional[str]:
+        """
+        Show a simple selection dialog when an Excel workbook has multiple sheets.
+
+        Returns the chosen sheet name, or None if the user cancelled.
+        """
+        from PySide6.QtWidgets import QInputDialog
+        filename = os.path.basename(path)
+        sheet, ok = QInputDialog.getItem(
+            self,
+            "Select Worksheet",
+            f"'{filename}' contains {len(sheets)} sheets.\n"
+            "Select the sheet that contains your experiment data:",
+            sheets,
+            0,       # pre-select the first sheet
+            False,   # not user-editable (must choose from list)
+        )
+        return sheet if ok else None
 
     def _action_define_study_manually(self) -> None:
         """
@@ -1562,9 +1637,9 @@ class MainWindow(QMainWindow):
         elif self._session_state and self._session_state.csv_path:
             self._do_load_csv(self._session_state.csv_path)
 
-    def _do_load_csv(self, path: str) -> None:
+    def _do_load_csv(self, path: str, sheet_name: Optional[str] = None) -> None:
         try:
-            df = load_csv(path)
+            df = load_csv(path, sheet_name=sheet_name)
         except ValueError as exc:
             _log.error("CSV load failed: %s  (%s)", path, exc)
             QMessageBox.critical(self, "CSV Error", str(exc))
@@ -1760,6 +1835,11 @@ class MainWindow(QMainWindow):
             objectives=objectives,
             constraints=list(self._constraints),
             context_variables=ctx_configs,
+            # Preserve any objective boundaries and boundary variables that were
+            # defined before this Apply click — without this they would be silently
+            # wiped from the saved session config every time Apply is pressed.
+            objective_boundaries=list(self._objective_boundaries),
+            boundary_variables=list(self._boundary_variables),
             batch_size=self._batch_size_spin.value(),
             n_batches=self._n_batches_spin.value(),
             sampler_name=self._sampler_combo.currentText(),
@@ -1859,8 +1939,13 @@ class MainWindow(QMainWindow):
 
         n_agg = len(df_to_load)
 
-        # Seed historical trials from (potentially aggregated) DataFrame
-        trial_dicts = load_trials_from_csv(df_to_load, config)
+        # Seed historical trials from (potentially aggregated) DataFrame.
+        # Collect per-row skip reasons so the user can understand why rows
+        # were not loaded (missing objective, missing parameter, duplicate).
+        self._last_skip_log.clear()
+        trial_dicts = load_trials_from_csv(
+            df_to_load, config, skip_log=self._last_skip_log
+        )
 
         # Inject n_replicates into each trial dict's user_attrs so the
         # All Trials table can display it.  The injection aligns trial_dicts
@@ -1911,16 +1996,57 @@ class MainWindow(QMainWindow):
         # Refresh Benchmark + Sampler Compare tabs with the new study
         self._design_space_panel.set_study(self._study, config)
 
-        # Status message describes whether aggregation occurred
+        # ── Status message with skip breakdown ────────────────────────────
+        # Build a brief human-readable summary of why rows were skipped.
+        skip_summary = ""
+        if self._last_skip_log:
+            from collections import Counter as _Counter
+            counts = _Counter(e["reason"] for e in self._last_skip_log)
+            parts = [f"{n} {r.lower()}" for r, n in sorted(counts.items())]
+            skip_summary = "  (" + ", ".join(parts) + ")"
+            # Log full details for the developer / power user
+            for entry in self._last_skip_log:
+                _log.debug(
+                    "Row %d skipped — %s: %s",
+                    entry["row"], entry["reason"], entry["detail"],
+                )
+
         if repl_enabled and n_agg < n_raw:
             self._set_status(
                 f"Ready — {n_agg} aggregated trials loaded from {n_raw} rows "
-                f"(tolerance ±{repl_tol}), {skipped} skipped."
+                f"(tolerance ±{repl_tol}), {skipped} skipped{skip_summary}."
             )
         else:
             self._set_status(
-                f"Ready — {added} historical trials loaded, {skipped} skipped."
+                f"Ready — {added} historical trials loaded, "
+                f"{skipped} skipped{skip_summary}."
             )
+
+        # If rows were skipped, offer to show the detail report
+        if self._last_skip_log and skipped > 0:
+            self._status_text.setToolTip(
+                f"{skipped} row(s) from your file were not loaded as historical trials.\n"
+                + skip_summary.strip(" ()")
+                + "\n\nCommon causes:\n"
+                "  - Rows without a result value yet (planned experiments)\n"
+                "  - Rows with a blank parameter column\n"
+                "  - Duplicate parameter combinations (only first loaded)\n\n"
+                "Click 'Data Loading Report…' in the status bar for row-by-row details."
+            )
+        else:
+            self._status_text.setToolTip("")
+
+        # ── Dataset Health: run analysis and show the panel ───────────────
+        # Runs after all study/session state is set so obj/param names are
+        # available. Switches Analysis tab to "Dataset Health" inner tab.
+        try:
+            from dataset_health import analyze_dataset as _analyze_ds
+            _health_report = _analyze_ds(self._df, obj_col_names, param_col_names)
+            self._health_widget.update(_health_report)
+        except Exception:
+            self._health_widget.update(None)
+        self._left_tabs.setCurrentIndex(1)         # Analysis tab
+        self._analysis_tabs.setCurrentIndex(0)     # Dataset Health inner tab
 
     # ══════════════════════════════════════════════════════════════════════
     # Constraint editor
@@ -2550,6 +2676,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # ── Clear session-specific study state ─────────────────────────────
+        # Reset these so no data from the previous session lingers in memory
+        # while the new session is being loaded.  They are immediately
+        # overwritten by the correct values from the new session config.
+        self._constraints          = []
+        self._objective_boundaries = []
+        self._boundary_variables   = []
+
         # ── Reset misc UI state ─────────────────────────────────────────────
         self._resume_banner.hide()
         self._batches_done = 0
@@ -2559,6 +2693,12 @@ class MainWindow(QMainWindow):
             "font-size: 10px; color: #6c6f85; padding: 2px 0;"
         )
         self._set_status("Loading session…")
+
+        # ── Reset Dataset Health widget to placeholder ──────────────────────
+        try:
+            self._health_widget.update(None)
+        except Exception:
+            pass
 
     def _load_session_from_path(self, path: str) -> None:
         self._reset_ui_for_new_session()
@@ -2846,23 +2986,57 @@ class MainWindow(QMainWindow):
         """
         Switch the centre panel to the view that makes sense for the active tab.
 
-          0 — ⚙ Settings  → param cards (scroll area)
-          1 — 📊 Results   → convergence plot + Pareto scatter (side by side)
-          2 — 🔬 Power     → power analysis result panel
-          3 — 🧪 DoE       → DoE pairplot + coverage metrics
+          0 — Settings  → param cards (scroll area)
+          1 — Analysis  → depends on active inner sub-tab (Dataset Health /
+                          Trials / Best-Pareto / Power Analysis)
+          2 — DoE       → DoE pairplot + coverage metrics
 
         Uses setCurrentWidget() so the correct page is shown regardless of the
         order widgets were inserted into the stack.
         """
-        if index == 1:    # 📊 Results → embedded Design Space panel
-            self._centre_stack.setCurrentWidget(self._design_space_panel)
-        elif index == 2:  # 🔬 Power
-            self._centre_stack.setCurrentWidget(self._power.result_panel)
-        elif index == 3:  # 🧪 DoE
+        if index == 1:    # Analysis — delegate to inner sub-tab
+            self._on_analysis_inner_tab_changed(self._analysis_tabs.currentIndex())
+        elif index == 2:  # DoE
             self._refresh_doe_panel()
             self._centre_stack.setCurrentWidget(self._doe_panel)
-        else:             # ⚙ Settings (index 0) or any other
+        else:             # Settings (index 0) or any other
             self._centre_stack.setCurrentWidget(self._scroll)
+
+    def _on_analysis_inner_tab_changed(self, inner_index: int) -> None:
+        """
+        Switch the centre panel based on the active Analysis inner sub-tab.
+
+          0 — Dataset Health  → DatasetHealthWidget (statistics in centre panel)
+          1 — Trials          → Design Space panel (convergence, Pareto, etc.)
+          2 — Best / Pareto   → Design Space panel
+          3 — Power Analysis  → Power Analysis result panel
+
+        Only switches the centre panel when the outer Analysis tab (index 1) is
+        currently active, to avoid interfering with other tabs.
+        """
+        if self._left_tabs.currentIndex() != 1:
+            return
+        if inner_index == 0:    # Dataset Health
+            self._centre_stack.setCurrentWidget(self._health_widget)
+        elif inner_index == 3:  # Power Analysis
+            self._centre_stack.setCurrentWidget(self._power.result_panel)
+        else:                   # Trials (1) or Best / Pareto (2)
+            self._centre_stack.setCurrentWidget(self._design_space_panel)
+
+    def _on_health_refresh_requested(self) -> None:
+        """Re-compute dataset statistics when the user clicks Refresh."""
+        if self._df is None or not self._session_state:
+            self._health_widget.update(None)
+            return
+        try:
+            from dataset_health import analyze_dataset as _analyze_ds
+            cfg        = self._session_state.study_config
+            obj_cols   = [o.column_name for o in cfg.objectives]
+            param_cols = [p.name for p in cfg.parameters if p.enabled]
+            report     = _analyze_ds(self._df, obj_cols, param_cols)
+            self._health_widget.update(report)
+        except Exception:
+            self._health_widget.update(None)
 
     def _update_quality_badge(self) -> None:
         """Recompute surrogate quality and update the badge label."""
@@ -3293,19 +3467,49 @@ class MainWindow(QMainWindow):
 
     def _action_export_report(self) -> None:
         """
-        Generate a self-contained HTML report and open it in the browser.
+        Open the Export Report dialog where the user selects which sections
+        to include.  The actual generation is handled by _do_generate_report()
+        which is passed as the dialog callback.
+        """
+        doe_state = (
+            getattr(self._session_state, 'doe_state', None)
+            if self._session_state else None
+        )
+        dlg = ReportExportDialog(
+            parent=self,
+            session_state=self._session_state,
+            study=self._study,
+            df=self._df,
+            validation_results=self._validation_results,
+            doe_state=doe_state,
+            export_callback=self._do_generate_report,
+        )
+        dlg.exec()
 
-        Collects:
-          - Session metadata from _session_state
-          - Completed trials as a DataFrame
-          - Best/Pareto trial rows
-          - Matplotlib figures from the Results tab widgets and (if open)
-            the Design Space dialog widgets
-        Then calls generate_report() → write_report() and offers to open
-        the result in the system browser.
+    def _do_generate_report(
+        self,
+        sections: set,
+        validation_results=None,
+        fmt: str = "html",
+    ) -> None:
+        """
+        Generate and save a report with the given sections.
+
+        Called by ReportExportDialog.  Collects metadata, figures, and trial
+        data, then dispatches to the appropriate generator based on *fmt*.
+
+        Parameters
+        ----------
+        sections           : Set of section keys selected in the dialog.
+        validation_results : ValidationResults from the dialog's worker run,
+                             or None (falls back to self._validation_results).
+        fmt                : ``"html"`` (default), ``"csv"``, or ``"excel"``.
         """
         import datetime
         import webbrowser
+
+        # Merge validation results: prefer freshly-run results from dialog
+        _val_res = validation_results or self._validation_results
 
         # ── Collect metadata ───────────────────────────────────────────────
         if self._session_state:
@@ -3438,18 +3642,58 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # ── Validation results (prefer Results-tab source; fall back to dialog) ──
-        _val_res = self._validation_results or (
-            self._design_space_dlg._validation_results
-            if self._design_space_dlg is not None else None
-        )
-        if _val_res is not None:
+        # ── Validation results ─────────────────────────────────────────────
+        # Priority: dialog-triggered results > existing results > design space dialog
+        if _val_res is None:
+            _val_res = (
+                self._design_space_dlg._validation_results
+                if self._design_space_dlg is not None else None
+            )
+        if _val_res is not None and "validation" in sections:
             for key, fig in _val_res.figures.items():
                 figures[f"validation_{key}"] = fig
 
-        # ── Generate and write ─────────────────────────────────────────────
+        # ── Dataset health (needed by all formats) ─────────────────────────
+        health_report = None
+        if "dataset_health" in sections and self._df is not None and self._session_state:
+            try:
+                from dataset_health import analyze_dataset as _analyze_ds
+                cfg        = self._session_state.study_config
+                obj_cols   = [o.column_name for o in cfg.objectives]
+                param_cols = [p.name for p in cfg.parameters if p.enabled]
+                health_report = _analyze_ds(self._df, obj_cols, param_cols)
+            except Exception:
+                health_report = None
+
+        # Determine where to save (session directory or cwd)
+        report_dir = (
+            os.path.dirname(self._session_state.storage_path)
+            if self._session_state
+            else (os.path.dirname(self._csv_path) if self._csv_path else os.getcwd())
+        )
+
+        # ── Dispatch to format-specific generator ──────────────────────────
+        if fmt == "csv":
+            self._export_report_csv(
+                metadata, trials_df, best_rows, sections,
+                health_report, report_dir,
+            )
+            return
+
+        if fmt == "excel":
+            self._export_report_excel(
+                metadata, trials_df, best_rows, sections,
+                health_report, report_dir,
+            )
+            return
+
+        # ── HTML (default) ─────────────────────────────────────────────────
         try:
-            html = generate_report(metadata, trials_df, figures, best_rows)
+            html = generate_report(
+                metadata, trials_df, figures, best_rows,
+                sections=sections,
+                health_report=health_report,
+            )
         except Exception as exc:
             QMessageBox.critical(
                 self, "Report Error",
@@ -3457,12 +3701,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Save to the session directory (same folder as the .db file)
-        report_dir = (
-            os.path.dirname(self._session_state.storage_path)
-            if self._session_state
-            else (os.path.dirname(self._csv_path) if self._csv_path else os.getcwd())
-        )
         try:
             report_path = write_report(html, report_dir)
         except Exception as exc:
@@ -3487,7 +3725,6 @@ class MainWindow(QMainWindow):
             + (f"  |  {n_pngs} PNG(s) in …_plots/" if n_pngs else "")
         )
 
-        # ── Offer to open in browser ───────────────────────────────────────
         png_note = (
             f"\n\n📁 Individual plots (200 dpi PNG) saved to:\n"
             f"  {os.path.basename(plots_dir)}/\n"
@@ -3513,6 +3750,121 @@ class MainWindow(QMainWindow):
                 webbrowser.open(report_path)
             except Exception:
                 pass   # non-fatal — user can open manually
+
+    # ── CSV / Excel report helpers ─────────────────────────────────────────
+
+    def _export_report_csv(
+        self,
+        metadata: dict,
+        trials_df,
+        best_rows: list,
+        sections: set,
+        health_report,
+        report_dir: str,
+    ) -> None:
+        """Generate and save a CSV report; show a success message."""
+        try:
+            csv_text = generate_csv_report(
+                metadata, trials_df, best_rows,
+                sections=sections,
+                health_report=health_report,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "CSV Report Error",
+                f"Failed to generate CSV report:\n{exc}"
+            )
+            return
+
+        try:
+            report_path = write_report_csv(csv_text, report_dir)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "CSV Save Error",
+                f"Failed to save CSV report:\n{exc}"
+            )
+            return
+
+        self._set_status(f"CSV report saved: {os.path.basename(report_path)}")
+        reply = QMessageBox.question(
+            self,
+            "CSV Report Exported",
+            f"CSV report saved to:\n{report_path}"
+            f"\n\nOpen containing folder now?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                import subprocess, sys as _sys
+                folder = os.path.dirname(report_path)
+                if _sys.platform == "win32":
+                    subprocess.Popen(["explorer", folder])
+                elif _sys.platform == "darwin":
+                    subprocess.Popen(["open", folder])
+                else:
+                    subprocess.Popen(["xdg-open", folder])
+            except Exception:
+                pass   # non-fatal
+
+    def _export_report_excel(
+        self,
+        metadata: dict,
+        trials_df,
+        best_rows: list,
+        sections: set,
+        health_report,
+        report_dir: str,
+    ) -> None:
+        """Generate and save an Excel (.xlsx) report; show a success message."""
+        try:
+            xlsx_data = generate_excel_report(
+                metadata, trials_df, best_rows,
+                sections=sections,
+                health_report=health_report,
+            )
+        except ImportError as exc:
+            # openpyxl not installed — show a friendly error with install instructions
+            QMessageBox.critical(
+                self, "Excel Export — Missing Dependency",
+                str(exc)
+            )
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Excel Report Error",
+                f"Failed to generate Excel report:\n{exc}"
+            )
+            return
+
+        try:
+            report_path = write_report_excel(xlsx_data, report_dir)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Excel Save Error",
+                f"Failed to save Excel report:\n{exc}"
+            )
+            return
+
+        self._set_status(f"Excel report saved: {os.path.basename(report_path)}")
+        reply = QMessageBox.question(
+            self,
+            "Excel Report Exported",
+            f"Excel report saved to:\n{report_path}"
+            f"\n\nOpen containing folder now?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                import subprocess, sys as _sys
+                folder = os.path.dirname(report_path)
+                if _sys.platform == "win32":
+                    subprocess.Popen(["explorer", folder])
+                elif _sys.platform == "darwin":
+                    subprocess.Popen(["open", folder])
+                else:
+                    subprocess.Popen(["xdg-open", folder])
+            except Exception:
+                pass   # non-fatal
 
     # ══════════════════════════════════════════════════════════════════════
     # Helpers

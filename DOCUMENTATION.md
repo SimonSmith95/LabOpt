@@ -20,8 +20,10 @@
    - 3.10 [Defining Parameter Constraints](#310-defining-parameter-constraints)
    - 3.11 [Objective Boundaries (Feasibility Filters on Measured Results)](#311-objective-boundaries-feasibility-filters-on-measured-results)
    - 3.12 [Context Variables (Uncontrollable Environmental Conditions)](#312-context-variables-uncontrollable-environmental-conditions)
-   - 3.13 [Power Analysis — Sample Size Calculator](#313-power-analysis--sample-size-calculator)
-   - 3.14 [Surrogate Validation](#314-surrogate-validation)
+   - 3.13 [Dataset Statistics (Analysis tab)](#313-dataset-statistics-analysis-tab--dataset-health-sub-tab)
+   - 3.14 [Power Analysis — Sample Size Calculator](#314-power-analysis--sample-size-calculator)
+   - 3.15 [Exporting Reports](#315-exporting-reports)
+   - 3.16 [Surrogate Validation](#316-surrogate-validation)
 4. [Headless / Scripting Mode](#4-headless--scripting-mode)
 5. [Codebase Architecture](#5-codebase-architecture)
    - 5.1 [File Map](#51-file-map)
@@ -148,10 +150,19 @@ python main.py
 ```
 
 The main window opens with an empty state. You will see:
-- **Left dock — ⚙ Settings tab** — Objectives selector, sampler, batch settings, warnings, Ask / Pause buttons
-- **Left dock — 📊 Results tab** — All Trials table, Best/Pareto table, Design Space button, Export button (auto-activated after each batch)
-- **Left dock — 🔬 Power tab** — Sample-size calculator; shows the input form on the left and the result/plots in the centre area (see §3.12)
-- **Centre panel** — scrollable parameter cards (one per input column in your CSV); replaced by the Power Analysis plots when the 🔬 Power tab is active
+The left dock has three outer tabs:
+
+| Tab | Purpose |
+|-----|---------|
+| **Settings** | Objectives selector, parameter cards, sampler, batch settings, Ask / Pause |
+| **Analysis** | Dataset Statistics, Trials table, Best / Pareto table, Power Analysis |
+| **DoE** | Design of Experiments: strategy selection, generation, readiness bar |
+
+The Analysis tab has four inner sub-tabs: **Dataset Health** | **Trials** | **Best / Pareto** | **Power Analysis**
+
+- **Left dock — Settings tab** — Objectives selector, sampler, batch settings, warnings, Ask / Pause buttons
+- **Left dock — Analysis tab** — Dataset Statistics panel, Trials table, Best/Pareto table, Power Analysis inputs
+- **Centre panel** — switches automatically based on the active tab; shows parameter cards (Settings), dataset statistics or design space (Analysis), or DoE coverage plots (DoE)
 - **Toolbar** — Load CSV, Reload CSV, 📋 Enter Pending Results…
 - **Status bar** — trial count, best value, current status
 
@@ -241,23 +252,26 @@ many raw measurements were combined.
 - `tolerance = 0.5` → merge rows within ±0.5 of every numeric parameter.
 - Categorical parameters always require an exact match regardless of tolerance.
 
-#### Results tab — live feedback after each batch
+#### Analysis tab — live feedback after each batch
 
-After each submitted batch the **📊 Results** tab automatically updates:
+After each submitted batch the app automatically switches to the **Analysis**
+tab so you can see the new data immediately.
 
-| Sub-tab | What it shows |
+The Analysis tab has four inner sub-tabs in the left dock:
+
+| Inner sub-tab | What it shows |
 |---|---|
-| **All Trials** | Every completed trial, colour-coded with an `n_replicates` column |
+| **Dataset Health** | Descriptive statistics for the loaded dataset (auto-populated on Apply Objectives) |
+| **Trials** | Full table of all completed trials, colour-coded with an `n_replicates` column |
 | **Best / Pareto** | Best trial (single-obj) or the full Pareto front (multi-obj) |
-| **📈 Convergence** | Step-line of best-value-so-far vs. trial number; one line per objective |
-| **📈 Pareto** | 2-D scatter of Objective A vs Objective B (multi-objective only) — Pareto-optimal points highlighted as green stars, dominated points in grey, connected by a dashed step-line |
+| **Power Analysis** | Sample-size calculator (see §3.14) |
+
+When either **Trials** or **Best / Pareto** is active, the right-hand panel
+shows the embedded **Design Space** view (see §3.9).
 
 A **Surrogate quality badge** below the export buttons shows the
-cross-validated R² of a Random Forest trained on all completed trials:
-- ✅ Green (R² > 0.85) — model predictions are reliable.
-- ⚠ Amber (0.60–0.85) — acceptable; more data will improve accuracy.
-- 🔴 Red (< 0.60) — model is unreliable; do not trust suggestions blindly.
-- Grey — insufficient data (< 15 completed rows).
+cross-validated R² of a Random Forest trained on all completed trials.
+Hover the badge for the methodology and tier definitions.
 
 ---
 
@@ -421,24 +435,25 @@ The app matches rows by parameter values and auto-fills the dialog.
 
 ### 3.9 Design Space Visualisation
 
-The **Design Space** window lets you inspect where the historical data
+The **Design Space** panel lets you inspect where the historical data
 lives in parameter space and — as soon as a batch is suggested — see
 whether the suggested experiments sit sensibly within that space or are
 dangerously far from any observed data.
 
-#### Opening the window
+#### Accessing the Design Space
 
-Switch to the **📊 Results** tab in the left dock, then click **📊 Design
-Space…** (top-left of the Results tab). The window opens as a separate,
-resizable, non-modal dialog — you can keep it open alongside LabOpt and switch
-between them.
+The Design Space is permanently embedded in the **right-hand panel** of the
+main window. It becomes visible automatically whenever you switch to the
+**Analysis** tab → **Trials** or **Best / Pareto** inner sub-tab. No button
+click is needed.
 
-The window remembers its size between uses within the same session and is
-capped to fit your screen on first open.
+Switching the Analysis tab to **Dataset Health** or **Power Analysis** replaces
+the right-hand panel with those views instead, and switching back to Trials or
+Best/Pareto brings the Design Space back.
 
-#### Four tabs inside the dialog
+#### Four tabs inside the Design Space panel
 
-The Design Space dialog has four tabs:
+The Design Space panel has four tabs:
 
 | Tab | Contents |
 |---|---|
@@ -447,7 +462,7 @@ The Design Space dialog has four tabs:
 | **📈 Importance** | Horizontal bar chart of permutation importances from a Random Forest; shows which parameters drive each objective. Requires ≥ 15 completed rows. |
 | **🔮 Profiler** | What-if / prediction profiler — adjust sliders for each numeric parameter and dropdowns for categoricals to see the surrogate's predicted objective value update in real-time. Requires ≥ 10 completed rows. |
 
-Switch between them freely while the dialog is open.
+Switch between them freely.
 
 #### Correlation Matrix tab
 
@@ -514,10 +529,11 @@ This lets you immediately judge:
 |---|---|
 | CSV loaded + objectives applied | Redraws with historical data, no suggestions |
 | "Ask Next Batch" completes | Suggestions overlaid in pink |
-| Window opened via button | Always redraws with the latest data |
+| Switching to Trials or Best/Pareto inner sub-tab | Shows the latest data immediately |
 
-The window is **not** automatically updated while it is closed. Opening it
-again after new batches are submitted will show the current state.
+The panel always shows the current state of the data. No manual refresh is
+needed after submitting new results — the next time you view it the plots
+will reflect the latest completed trials.
 
 ---
 
@@ -886,10 +902,56 @@ trial's metadata for surrogate training.
 
 ---
 
-### 3.13 Power Analysis — Sample Size Calculator
+### 3.13 Dataset Statistics (Analysis tab — Dataset Health sub-tab)
 
-The **🔬 Power** tab in the left dock is a standalone statistical sample-size
-calculator. It answers the question:
+The **Dataset Health** inner sub-tab of the Analysis tab opens automatically
+when you click **Apply Objectives →**.  It shows descriptive statistics for
+the loaded dataset so you can inspect the data before or during optimisation.
+
+LabOpt presents numbers only.  It does not interpret whether a dataset is
+suitable for Bayesian optimisation — that judgement belongs to the domain
+expert.  Hover any metric label to see its definition and formula.
+
+#### Metrics shown
+
+**Dataset Overview**
+
+| Metric | Definition |
+|--------|-----------|
+| Rows | Total row count after cleaning (empty rows removed) |
+| Complete rows | Rows with no missing values in parameter or objective columns |
+| Missing (%) | (n_missing_cells / (n_rows × n_columns)) × 100 % |
+| Parameters | Number of enabled parameter columns |
+| Objectives | Number of objective columns |
+| Rows per parameter | complete_rows / n_parameters |
+
+**Per-objective statistics** (one block per objective column)
+
+| Metric | Definition |
+|--------|-----------|
+| Mean | Arithmetic mean of all non-missing values |
+| Std | Sample standard deviation: sqrt(sum((x − mean)²) / (n − 1)) |
+| Min / Max | Minimum and maximum observed values |
+| Median | 50th percentile |
+| IQR | Interquartile range: Q3 − Q1 |
+| CV (%) | Coefficient of Variation: (std / \|mean\|) × 100 %. Blank when mean ≈ 0 |
+| Outliers (IQR) | Rows outside [Q1 − 1.5 × IQR, Q3 + 1.5 × IQR] (Tukey, 1977) |
+| Replicate groups | Distinct parameter combos with ≥ 2 runs — enables noise estimation |
+| Noise std (replicates) | sqrt(mean of within-group sample variances). Blank if < 2 replicate groups |
+| SNR | Signal-to-Noise Ratio: (max − min) / noise_std. Blank if no noise estimate |
+
+**Noise std** and **SNR** are blank (not zero) when no replicates are present.
+They become available once at least two distinct parameter combinations each
+have two or more experimental runs.  Consider including deliberate replicates
+in your design to obtain a direct noise estimate.
+
+Click **Refresh** to re-compute the statistics after reloading the CSV.
+
+
+### 3.14 Power Analysis — Sample Size Calculator
+
+The **Power Analysis** inner sub-tab (inside the Analysis tab) is a standalone
+statistical sample-size calculator. It answers the question:
 
 > *"Given that my measurements have a typical spread of σ and I need to detect
 > an improvement of at least Δ, how many experiments N do I need to be
@@ -899,12 +961,13 @@ This is independent of the Bayesian optimisation — you can use it at any time,
 before or during an optimisation campaign, to assess whether your experiment
 budget is sufficient.
 
-#### Accessing the Power tab
+#### Accessing Power Analysis
 
-Click the **🔬 Power** tab in the left dock. The input form appears in the
-left panel; the result and plots appear in the centre of the main window
-(replacing the parameter cards while the tab is active). Switching back to
-⚙ Settings or 📊 Results restores the parameter cards.
+Click the **Analysis** tab in the left dock, then select the **Power Analysis**
+inner sub-tab. The input form appears on the left; the result panel and plots
+appear in the right-hand panel. Switching to any other inner sub-tab (Dataset
+Health, Trials, Best/Pareto) or to a different outer tab (Settings, DoE)
+updates the right panel accordingly.
 
 #### Input parameters
 
@@ -998,9 +1061,40 @@ relative to the noise*.
 
 ---
 
-### 3.14 Surrogate Validation
+### 3.15 Exporting Reports
 
-The **🔬 Surrogate Validation** checkbox (in the Results tab, next to the
+Click **Export Report…** in the Analysis tab to open the **Export Report** dialog.
+
+The dialog shows a checklist of available sections.  Sections are pre-ticked where
+data is available; unavailable sections are greyed out with a tooltip explaining
+the prerequisite.
+
+| Section | Prerequisite |
+|---------|-------------|
+| Dataset Statistics | CSV loaded with objectives configured |
+| All Trials Table | ≥ 1 completed trial |
+| Best / Pareto Table | ≥ 1 completed trial |
+| Convergence Plot | ≥ 2 completed trials |
+| Pareto Front Plot | Multi-objective study + ≥ 2 trials |
+| Design Space Pairplot | ≥ 2 completed trials |
+| Surrogate Validation | ≥ 30 unique rows |
+| DoE Design | DoE generated in the DoE tab |
+
+If **Surrogate Validation** is selected and validation has not been run, it
+executes automatically before the report is generated (3–10 min depending on
+dataset size).  You do not need to visit the Analysis tab first.
+
+The report is saved as a self-contained HTML file (all images embedded as
+base64 PNG) that works offline.  Individual PNG plots (200 dpi) are also
+exported to a companion `_plots/` folder for use in presentations.
+
+To export as PDF: open the HTML file in your browser → File → Print →
+Save as PDF.
+
+
+### 3.16 Surrogate Validation
+
+The **Surrogate Validation** checkbox (in the Analysis tab, next to the
 Export Report button) runs a rigorous five-section validation of the surrogate
 model on the currently loaded dataset — without requiring you to open the
 Design Space dialog.
@@ -1017,8 +1111,8 @@ combinations after dropping NaNs.
 
 #### Starting a validation run
 
-1. Switch to the **📊 Results** tab.
-2. Tick **🔬  Surrogate Validation** (next to the Export Report button).
+1. Switch to the **Analysis** tab.
+2. Tick **Surrogate Validation** (next to the Export Report button).
 3. A progress bar and status label appear above the surrogate quality badge.
 4. Wait 3–10 minutes (depending on dataset size — see estimates below).
 
@@ -1057,7 +1151,7 @@ The overall rating is:
 
 When the run finishes:
 - The checkbox shows **✅** and a summary label (e.g. `✅ 6/8 checks passed (YELLOW)`).
-- **7 new tabs** appear in the Design Space dialog (opened automatically if you click 📊 Design Space… later):
+- **7 new tabs** appear in the embedded Design Space panel (switch to Analysis → Trials or Best/Pareto to see them):
   - 📊 Data Quality
   - 🎯 Surrogate Accuracy
   - 📉 Residuals
@@ -1065,7 +1159,7 @@ When the run finishes:
   - 📈 BO (Normalised)
   - 🔍 EI Marginals
   - ✅ Validation Summary
-- All 7 plots are embedded in the **📄 Export Report…** HTML output.
+- All 7 plots are embedded in the **Export Report** HTML output (see §3.15).
 
 #### Runtime estimates
 
@@ -1085,10 +1179,11 @@ The Design Space dialog also has a validation checkbox. Both checkboxes run
 the same engine (`validate_generic.py` / `ValidationWorker`) but are
 independent triggers — you can use either entry point:
 
-- **Results tab** (this section) — no need to open the Design Space dialog.
+- **Analysis tab** (this section) — no need to open the Design Space dialog.
+- **Export Report dialog** — validation can be triggered from the report export dialog without visiting the Analysis tab.
 - **Design Space dialog** — useful if you already have the dialog open.
 
-If you run validation from the Results tab and then open the Design Space
+If you run validation from the Analysis tab and then open the Design Space
 dialog, the 7 result tabs are automatically injected into the dialog —
 you do not need to re-run.
 
@@ -1602,17 +1697,18 @@ The top-level `QMainWindow`. Key responsibilities:
   auto-fill from the CSV via `SessionManager.match_pending_to_csv()`.
 - **`_on_results_submitted(results)`** — calls `worker.submit_results()`.
 - **`_on_batch_complete(done, total)`** — refreshes results tables and
-  auto-switches the left dock to the **📊 Results** tab so the user sees
+  auto-switches the left dock to the **Analysis** tab so the user sees
   the new data without any manual clicking.
 - **`_refresh_results_tables()`** — updates the two `QTableWidget`s in the
-  **📊 Results** tab of the left dock (All Trials + Best/Pareto).
+  Analysis tab's **Trials** and **Best/Pareto** inner sub-tabs.
 
-Left dock layout (two-tab `QTabWidget`):
+Left dock layout (three outer tabs via `QTabWidget`):
 
-| Tab | Contents |
+| Outer tab | Inner sub-tabs / Contents |
 |---|---|
-| **⚙ Settings** | Objectives group, Sampler group, Batch Settings group, warning label, Ask Next Batch button, Pause button |
-| **📊 Results** | Design Space button, Export CSV button, All Trials table, Best/Pareto table |
+| **Settings** | Objectives group, Sampler group, Batch Settings group, warning label, Ask Next Batch button, Pause button |
+| **Analysis** | Inner tabs: Dataset Health · Trials · Best/Pareto · Power Analysis. Right panel shows: Dataset Health widget / Design Space panel / Power Analysis result panel depending on active inner tab. |
+| **DoE** | DoE widget — strategy selection, N, generate, pairplot + coverage metrics in right panel |
 
 #### `design_space_widget.py — DesignSpaceWidget / CorrelationWidget / DesignSpaceDialog`
 
@@ -2426,8 +2522,9 @@ expected and resolves as more data accumulates.
 
 #### Power analysis and BO sample requirements
 
-The **🔬 Power Analysis** tab (§3.12) computes required sample sizes using the
-classical two-sided t-test formula.  This is a **useful planning tool** but
+The **Power Analysis** inner sub-tab (§3.14) computes required sample sizes
+using the classical two-sided t-test formula.  This is a **useful planning
+tool** but
 answers a fundamentally different question than Bayesian Optimisation:
 
 | Goal | Appropriate tool | Typical N |
